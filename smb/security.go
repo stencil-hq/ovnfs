@@ -9,7 +9,8 @@ import (
 )
 
 // unixMetadata extracts native stat fields without depending on an OS-specific stat type.
-func unixMetadata(info os.FileInfo) (uid, gid uint32, ino, dev, links uint64) {
+// ok reports whether the stat carries Unix IDs; on Windows it does not, and uid and gid are 0.
+func unixMetadata(info os.FileInfo) (uid, gid uint32, ino, dev, links uint64, ok bool) {
 	links = 1
 	v := reflect.ValueOf(info.Sys())
 	if v.Kind() == reflect.Pointer {
@@ -35,6 +36,7 @@ func unixMetadata(info os.FileInfo) (uid, gid uint32, ino, dev, links uint64) {
 		return 0
 	}
 	uid, gid = uint32(get("Uid")), uint32(get("Gid"))
+	ok = v.FieldByName("Uid").IsValid() && v.FieldByName("Gid").IsValid()
 	ino, dev = get("Ino"), get("Dev")
 	if n := get("Nlink"); n != 0 {
 		links = n
@@ -85,18 +87,28 @@ func appendSID(dst []byte, authority byte, sub ...uint32) []byte {
 }
 
 // securityDescriptor describes Unix ownership and mode using Samba's NFS interoperability ACEs.
-func securityDescriptor(info os.FileInfo, want uint32) []byte {
-	uid, gid, _, _, _ := unixMetadata(info)
+// A file without Unix IDs is owned by owner and group, binary SIDs, when they are
+// set, and otherwise by the Unix-ID SIDs of uid and gid 0.
+func securityDescriptor(info os.FileInfo, want uint32, owner, group []byte) []byte {
+	uid, gid, _, _, _, unix := unixMetadata(info)
 	sd := make([]byte, 20)
 	sd[0] = 1
 	binary.LittleEndian.PutUint16(sd[2:], 0x8000)
 	if want&1 != 0 {
 		binary.LittleEndian.PutUint32(sd[4:], uint32(len(sd)))
-		sd = appendSID(sd, 22, 1, uid)
+		if unix || owner == nil {
+			sd = appendSID(sd, 22, 1, uid)
+		} else {
+			sd = append(sd, owner...)
+		}
 	}
 	if want&2 != 0 {
 		binary.LittleEndian.PutUint32(sd[8:], uint32(len(sd)))
-		sd = appendSID(sd, 22, 2, gid)
+		if unix || group == nil {
+			sd = appendSID(sd, 22, 2, gid)
+		} else {
+			sd = append(sd, group...)
+		}
 	}
 	if want&4 != 0 {
 		binary.LittleEndian.PutUint16(sd[2:], 0x8004)

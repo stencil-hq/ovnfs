@@ -103,7 +103,7 @@ func TestNFSModeACEPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sd := securityDescriptor(info, 4)
+	sd := securityDescriptor(info, 4, nil, nil)
 	acl := int(binary.LittleEndian.Uint32(sd[16:]))
 	off := acl + 8
 	for range 3 {
@@ -158,7 +158,7 @@ func TestMacSymlinkModeACE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sd := securityDescriptor(info, 4)
+	sd := securityDescriptor(info, 4, nil, nil)
 	backend := &testBackend{FS: fs}
 	if st := applySecurity(backend, "link", sd); st != statusSuccess {
 		t.Fatalf("unchanged symlink mode: %#x", st)

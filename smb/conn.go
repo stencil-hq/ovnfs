@@ -39,6 +39,9 @@ type conn struct {
 	creditMu                    sync.Mutex
 	creditInitialized           bool
 	credits                     uint32
+	// owner and group are the binary SIDs that own files without Unix IDs;
+	// nil unless the client is the daemon's own user (see [Server.Serve]).
+	owner, group []byte
 }
 
 // session contains an authenticated identity and its independently locked trees.

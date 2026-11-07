@@ -86,6 +86,11 @@ open, as on Unix; because Windows never renames a directory while a file below
 it is open, `snap`, `fork` and `rm` first close the checkout's upper
 descriptors, which reopen in the next generation.
 
+Served on loopback, files are owned by the daemon's user and primary group,
+as on the WinFsp drive, so Git's ownership check accepts checkouts with no
+`safe.directory` entry. A share served on another address keeps reporting the
+Unix-ID owner `S-1-22-1-0`.
+
 ### WinFsp
 
 `serve -proto winfsp` mounts the drive through [WinFsp](https://winfsp.dev), a

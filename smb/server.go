@@ -4,6 +4,7 @@ package smb
 import (
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -79,6 +80,10 @@ func (s *Server) Retire(p string) {
 }
 
 // Serve accepts Direct TCP connections until the listener returns a fatal error.
+// On a loopback listener, whose clients are the daemon's own user, files without
+// Unix IDs are owned by the daemon's token user and primary group, so Windows
+// clients such as Git's ownership check see them as their own; elsewhere the
+// daemon's identity says nothing about the client's.
 func (s *Server) Serve(l net.Listener) error {
 	if s.FS == nil {
 		return errors.New("smb: filesystem is required")
@@ -88,6 +93,13 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 	if _, err := rand.Read(s.guid[:]); err != nil {
 		return err
+	}
+	var owner, group []byte
+	if a, ok := l.Addr().(*net.TCPAddr); ok && a.IP.IsLoopback() {
+		var err error
+		if owner, group, err = processSIDs(); err != nil {
+			return fmt.Errorf("smb: process owner: %w", err)
+		}
 	}
 	var delay time.Duration
 	for {
@@ -111,7 +123,7 @@ func (s *Server) Serve(l net.Listener) error {
 			return err
 		}
 		delay = 0
-		c := &conn{srv: s, nc: nc, maxRead: 8 << 20, maxWrite: 8 << 20, maxTrans: 1 << 20}
+		c := &conn{srv: s, nc: nc, owner: owner, group: group, maxRead: 8 << 20, maxWrite: 8 << 20, maxTrans: 1 << 20}
 		go c.serve()
 	}
 }

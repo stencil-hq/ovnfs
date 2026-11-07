@@ -26,7 +26,7 @@ func appendBasicInfo(c *conn, dst []byte, info os.FileInfo) []byte {
 
 // appendStandardInfo writes allocation, size, link count and deletion state.
 func appendStandardInfo(dst []byte, info os.FileInfo, pending bool) []byte {
-	_, _, _, _, links := unixMetadata(info)
+	_, _, _, _, links, _ := unixMetadata(info)
 	dst = binary.LittleEndian.AppendUint64(dst, ntinfo.AllocationSize(info))
 	dst = binary.LittleEndian.AppendUint64(dst, uint64(info.Size()))
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(links))
@@ -43,7 +43,7 @@ func appendStandardInfo(dst []byte, info os.FileInfo, pending bool) []byte {
 
 // appendPosixInfo writes SMB3 POSIX information shared by stat and readdir.
 func appendPosixInfo(dst []byte, p string, info os.FileInfo, id uint64) []byte {
-	uid, gid, _, dev, links := unixMetadata(info)
+	uid, gid, _, dev, links, _ := unixMetadata(info)
 	for _, t := range []uint64{ntinfo.Filetime(ntinfo.BirthTime(info)), ntinfo.Filetime(ntinfo.AccessTime(info)), ntinfo.Filetime(info.ModTime()), ntinfo.Filetime(ntinfo.ChangeTime(info)), uint64(info.Size()), ntinfo.AllocationSize(info)} {
 		dst = binary.LittleEndian.AppendUint64(dst, t)
 	}
@@ -280,7 +280,7 @@ func handleQueryInfo(r *request) ([]byte, uint32) {
 	case 2:
 		b, variable, st = queryFSInfo(r, q[3])
 	case 3:
-		b = securityDescriptor(info, binary.LittleEndian.Uint32(q[16:]))
+		b = securityDescriptor(info, binary.LittleEndian.Uint32(q[16:]), r.c.owner, r.c.group)
 		variable = true
 	case 4:
 		st = statusNotSupported
