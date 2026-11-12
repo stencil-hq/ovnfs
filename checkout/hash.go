@@ -219,14 +219,14 @@ type fold struct {
 	store *store.Store
 	view  source.View
 	set   leafSet
-	dirs  map[string]bool // source directories layers created, kept when empty
+	dirs  pathSet // source directories layers created, kept when empty
 	class map[string]rules.Class
 	kept  layerBlobs // with a store: blobs stored per raw layer
 }
 
 // newFold starts folding into set.
 func newFold(b *baseRecord, st *store.Store, view source.View, set leafSet) fold {
-	return fold{base: b, store: st, view: view, set: set, dirs: map[string]bool{}, class: map[string]rules.Class{"": rules.Source}, kept: layerBlobs{}}
+	return fold{base: b, store: st, view: view, set: set, class: map[string]rules.Class{"": rules.Source}, kept: layerBlobs{}}
 }
 
 // apply folds one layer's entries, visited parents first, into the leaves.
@@ -293,7 +293,7 @@ func (t *fold) apply(l *overlay.Layer) error {
 			if class != rules.Source {
 				return t.remove(p)
 			}
-			t.dirs[p] = true
+			t.dirs.add(p)
 		case overlay.KindFile, overlay.KindSymlink:
 			// A socket or FIFO has no content: like a source folder's, it
 			// stays out of the tree, hiding whatever p held before.
@@ -314,7 +314,7 @@ func (t *fold) apply(l *overlay.Layer) error {
 			if err := t.removeUnder(p); err != nil {
 				return err
 			}
-			delete(t.dirs, p)
+			t.dirs.remove(p)
 			f, err := t.hash(l, p, e, prev)
 			if err != nil {
 				return err
@@ -417,18 +417,13 @@ func (t *fold) remove(p string) error {
 	if err := t.set.drop(p); err != nil {
 		return err
 	}
-	delete(t.dirs, p)
+	t.dirs.remove(p)
 	return t.removeUnder(p)
 }
 
 // removeUnder drops everything strictly below p.
 func (t *fold) removeUnder(p string) error {
-	prefix := p + "/"
-	for d := range t.dirs {
-		if strings.HasPrefix(d, prefix) {
-			delete(t.dirs, d)
-		}
-	}
+	t.dirs.removeUnder(p, nil)
 	return t.set.dropUnder(p)
 }
 
@@ -438,7 +433,7 @@ type tree struct {
 	fold
 	files  map[string]store.File
 	sorted []string                  // parent paths, for prefix removal without full scans
-	added  map[string]bool           // paths set by layers
+	added  pathSet                   // paths set by layers
 	layers map[string]*overlay.Layer // path → layer whose file supplied its content
 }
 
@@ -448,7 +443,7 @@ func newTree(b *baseRecord, st *store.Store, parent store.OID, view source.View)
 	if err != nil {
 		return nil, err
 	}
-	t := &tree{files: files, sorted: source.SortedPaths(files), added: map[string]bool{}, layers: map[string]*overlay.Layer{}}
+	t := &tree{files: files, sorted: source.SortedPaths(files), layers: map[string]*overlay.Layer{}}
 	t.fold = newFold(b, st, view, t)
 	return t, nil
 }
@@ -461,14 +456,15 @@ func (t *tree) leaf(p string) (store.File, bool, error) {
 
 // put lists the leaf at p.
 func (t *tree) put(p string, f store.File, l *overlay.Layer) error {
-	t.files[p], t.added[p], t.layers[p] = f, true, l
+	t.files[p], t.layers[p] = f, l
+	t.added.add(p)
 	return nil
 }
 
 // drop unlists the leaf at p.
 func (t *tree) drop(p string) error {
 	delete(t.files, p)
-	delete(t.added, p)
+	t.added.remove(p)
 	delete(t.layers, p)
 	return nil
 }
@@ -479,13 +475,10 @@ func (t *tree) dropUnder(p string) error {
 	for i := sort.SearchStrings(t.sorted, prefix); i < len(t.sorted) && strings.HasPrefix(t.sorted[i], prefix); i++ {
 		delete(t.files, t.sorted[i])
 	}
-	for q := range t.added {
-		if strings.HasPrefix(q, prefix) {
-			delete(t.files, q)
-			delete(t.added, q)
-			delete(t.layers, q)
-		}
-	}
+	t.added.removeUnder(p, func(q string) {
+		delete(t.files, q)
+		delete(t.layers, q)
+	})
 	return nil
 }
 
@@ -501,7 +494,7 @@ func (t *tree) finish() map[string]store.File {
 			parents[d] = true
 		}
 	}
-	for d := range t.dirs {
+	for d := range t.dirs.all() {
 		if !parents[d] {
 			t.files[d] = store.File{Mode: store.ModeDir, ID: store.EmptyTree}
 			for q := path.Dir(d); q != "." && !parents[q]; q = path.Dir(q) {
@@ -666,7 +659,7 @@ func (t *snapTree) dropUnder(p string) error {
 // directories, and the changed directories are stored bottom-up. It returns the
 // root, which the caller registers through w.
 func (t *snapTree) write(w *store.TreeWriter) (store.OID, error) {
-	for d := range t.dirs {
+	for d := range t.dirs.all() {
 		dirs, k, err := t.find(d, true)
 		if err != nil {
 			return "", err
