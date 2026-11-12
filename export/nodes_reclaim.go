@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,28 +16,49 @@ import (
 	"github.com/stencil-hq/ovnfs/internal/durable"
 )
 
-// ownersName is the manifest a clean close leaves in the store once the index
-// holds every issued owner and retired hash: the size of the durable identity
-// log, the owner index instance and its pack, and the logged node index whose
-// slots locate each key's owner index.
+// ownersName is the manifest a clean close leaves in the store once the
+// logged node index holds every logged node as it was and every issued owner
+// and retired hash (ownersHeader).
 const ownersName = "owners"
 
-var ownersMagic = []byte("ovnfs owners 2\n")
+var ownersMagic = []byte("ovnfs owners 3\n")
 
-// openColdStore adopts the owner index a clean close completed for the log
-// of logSize bytes just replayed, returning the closed logged node index
-// that locates its owners, or else detaches the entire previous store
-// without visiting its files. The state lock excludes other users of
-// coldParent. The discard directory is separate: even a cleaner still
-// returning from I/O after close cannot reach the next instance's
-// authoritative owners. Windows never renames an open index: readers belong
-// to the previous, already closed export.
-func (t *nodeTable) openColdStore(logSize int64) (*priorIndex, error) {
+// takeOwners reads the manifest a clean close left and removes it durably
+// before the open changes anything, so that a crash from then on discards
+// the index. It returns the manifest when it describes the identity log of
+// logSize bytes, else nil.
+func (t *nodeTable) takeOwners(logSize int64) *ownersHeader {
+	manifest := filepath.Join(t.coldParent, ownersName)
+	data, err := os.ReadFile(manifest)
+	if err != nil {
+		return nil
+	}
+	if os.Remove(manifest) != nil || durable.Dir(t.coldParent) != nil {
+		return nil
+	}
+	head, ok := parseOwners(data)
+	if !ok || head.logSize != uint64(logSize) {
+		return nil
+	}
+	return &head
+}
+
+// openColdStore keeps the store a clean close left, as head describes it,
+// returning its closed logged node index, or else, without head, detaches
+// the entire previous store without visiting its files. The state lock
+// excludes other users of coldParent. The discard directory is separate:
+// even a cleaner still returning from I/O after close cannot reach the next
+// instance's authoritative owners. Windows never renames an open index:
+// readers belong to the previous, already closed export.
+func (t *nodeTable) openColdStore(head *ownersHeader) (*priorIndex, error) {
 	discard := t.coldParent + ".discard"
 	if err := os.MkdirAll(discard, 0700); err != nil {
 		return nil, err
 	}
-	prior := t.adoptColdStore(logSize, discard)
+	var prior *priorIndex
+	if head != nil {
+		prior = t.adoptColdStore(head, discard)
+	}
 	if prior == nil {
 		// Publish the detached tree with one rename. No empty container is
 		// exposed to an older cleaner still returning from a filesystem call.
@@ -57,33 +79,24 @@ func (t *nodeTable) openColdStore(logSize int64) (*priorIndex, error) {
 	return prior, nil
 }
 
-// adoptColdStore resumes the owner index instance named by a manifest that
-// matches the log, and detaches every other entry of the store but the
-// closed logged node index, which the next build reads and then detaches.
-// The manifest goes first, durably, so a crash before the next clean close
-// discards the index instead. It returns nil, changing nothing, when there
-// is nothing to adopt.
-func (t *nodeTable) adoptColdStore(logSize int64, discard string) *priorIndex {
-	manifest := filepath.Join(t.coldParent, ownersName)
-	data, err := os.ReadFile(manifest)
-	if err != nil {
+// adoptColdStore resumes the owner index instance the manifest head names,
+// and detaches every other entry of the store but the closed logged node
+// index, which the open adopts, or reads and detaches when it rebuilds. It
+// returns nil when the store does not hold what head names.
+func (t *nodeTable) adoptColdStore(head *ownersHeader, discard string) *priorIndex {
+	if !t.detachExcept(t.coldParent, discard, head.instance, head.nodes) {
 		return nil
 	}
-	if os.Remove(manifest) != nil || durable.Dir(t.coldParent) != nil {
-		return nil
-	}
-	head, ok := parseOwners(data)
-	if !ok || head.logSize != uint64(logSize) {
-		return nil
-	}
-	root := filepath.Join(t.coldParent, head.instance)
-	if !t.detachExcept(t.coldParent, discard, head.instance, head.nodes) || !t.detachExcept(root, discard, head.pack) {
-		return nil
-	}
-	t.coldRoot = root
 	prior := &priorIndex{nodes: filepath.Join(t.coldParent, head.nodes)}
-	if head.pack != "" {
-		prior.pack = filepath.Join(root, head.pack)
+	if head.instance != "" {
+		root := filepath.Join(t.coldParent, head.instance)
+		if !t.detachExcept(root, discard, head.pack) {
+			return nil
+		}
+		t.coldRoot = root
+		if head.pack != "" {
+			prior.pack = filepath.Join(root, head.pack)
+		}
 	}
 	return prior
 }
@@ -117,12 +130,28 @@ func (t *nodeTable) detachExcept(dir, discard string, keep ...string) bool {
 	return found == len(keep)
 }
 
-// ownersHeader is what a manifest records.
+// ownersHeader is what a manifest records: the store a clean close left, and
+// what a replay of the log would derive that the index does not hold.
 type ownersHeader struct {
-	logSize  uint64 // of the durable identity log the index was completed for
-	instance string // the owner index directory below the store
+	logSize   uint64 // of the durable identity log the index was completed for
+	compacted uint64 // the log's size when it was last compacted
+	next      uint64 // the counter watermark: the next counter id or key
+	epoch     uint64 // of the open that closed the index
+	records   uint64 // the size of the index's records file
+	built     uint64 // the size of its records file when it was built
+
+	// The index's accounting, as NodeIndexBytes reports it.
+	coldBytes, nodesBytes, runtimeBytes uint64
+
+	instance string // the owner index directory below the store, if any
 	pack     string // the pack file in instance, if any directory is packed
 	nodes    string // the logged node index below the store
+
+	// Garbage the closed open had yet to reclaim: retired cold keys, whose
+	// index files and those of their subtrees remain, and files, below the
+	// store.
+	dead    []uint64
+	garbage []string
 }
 
 // parseOwners decodes a manifest written by saveColdStore.
@@ -148,15 +177,62 @@ func parseOwners(data []byte) (h ownersHeader, ok bool) {
 		rest = rest[length:]
 		return s, true
 	}
-	if h.logSize, ok = next(); !ok {
-		return h, false
+	for _, field := range []*uint64{&h.logSize, &h.compacted, &h.next, &h.epoch, &h.records, &h.built, &h.coldBytes, &h.nodesBytes, &h.runtimeBytes} {
+		if *field, ok = next(); !ok {
+			return h, false
+		}
 	}
 	for _, field := range []*string{&h.instance, &h.pack, &h.nodes} {
 		if *field, ok = name(); !ok {
 			return h, false
 		}
 	}
-	return h, len(rest) == 0 && h.nodes != ""
+	count, ok := next()
+	if !ok || count > uint64(len(rest)) {
+		return h, false
+	}
+	h.dead = make([]uint64, count)
+	for i := range h.dead {
+		if h.dead[i], ok = next(); !ok {
+			return h, false
+		}
+	}
+	if count, ok = next(); !ok || count > uint64(len(rest)) {
+		return h, false
+	}
+	h.garbage = make([]string, count)
+	for i := range h.garbage {
+		if h.garbage[i], ok = name(); !ok || !filepath.IsLocal(h.garbage[i]) {
+			return h, false
+		}
+	}
+	return h, len(rest) == 0 && h.nodes != "" && (h.pack == "" || h.instance != "")
+}
+
+// growthSlack is the garbage an index may carry beyond its live size and
+// still be adopted: a log this small replays in milliseconds anyway.
+const growthSlack = 64 << 10
+
+// rebuildReason returns why the store head describes should be rebuilt from a
+// replay of the log rather than adopted as is, or "" to adopt it. A replay
+// compacts the log and rebuilds the index and pack from the live keys alone,
+// dropping what each adoption leaves behind: log records of moved and
+// retired keys, records clean closes superseded and slots of retired keys,
+// pack segments rewritten since. Each must stay within about twice its live
+// size, which bounds the work and disk a series of adoptions defers. pack is
+// the size of the pack head names.
+func (h *ownersHeader) rebuildReason(pack int64) string {
+	switch {
+	case h.logSize > 2*h.compacted+growthSlack:
+		return fmt.Sprintf("log grew from %d to %d bytes since its compaction", h.compacted, h.logSize)
+	case h.records > 2*h.built+growthSlack:
+		return fmt.Sprintf("index records grew from %d to %d bytes since the build", h.built, h.records)
+	case uint64(pack) > 2*h.coldBytes+growthSlack:
+		return fmt.Sprintf("owner pack holds %d bytes for %d live", pack, h.coldBytes)
+	case h.epoch >= maxEpoch:
+		return "index adopted too often"
+	}
+	return ""
 }
 
 // completeIndex writes every resident owner and retired hash the index lacks,
@@ -230,6 +306,7 @@ func (t *nodeTable) completeIndex() bool {
 		s := j.d.dir
 		t.coldBytes += int64(len(j.data)) - s.coldBytes
 		s.coldBytes, s.coldDirty, s.prior = int64(len(j.data)), false, false
+		t.ownerFiles[j.d.key] = struct{}{}
 		s.coldLoaded = s.coldLoaded || !j.read
 	}
 	if len(packs) == 0 {
@@ -298,47 +375,59 @@ func inParallel[T any](items []T, f func(T)) {
 	wg.Wait()
 }
 
-// saveOwners writes into the logged node index the owner index location of
-// every resident logged node whose slot differs, at close, so the index
-// locates every key's owners for the next open.
-func (t *nodeTable) saveOwners() error {
-	for key, d := range t.byKey {
-		if s := d.dir; s != nil {
-			if owner := ownerOf(s); owner != s.loaded {
-				if err := t.index.publish(key, nil, owner); err != nil {
-					return err
-				}
-				s.loaded = owner
-			}
-		}
-	}
-	return nil
-}
-
-// saveColdStore writes the manifest for an index completeIndex and saveOwners
-// completed and an identity log of logSize bytes made durable, then stops all
-// index writes: a request still running after close must not change what the
-// manifest describes. A failure leaves the index to be discarded by the next
-// open.
+// saveColdStore durably writes the manifest for an index completeIndex and
+// saveIndex completed and an identity log of logSize bytes made durable, then
+// stops all index writes: a request still running after close must not
+// change what the manifest describes. Garbage still queued for reclamation
+// passes to the next open in the manifest. A failure leaves the index to be
+// discarded by the next open.
 func (t *nodeTable) saveColdStore(logSize int64) error {
 	t.coldSaved = true
-	if t.coldRoot == "" || t.index == nil {
+	if t.index == nil {
 		return nil // nothing was ever indexed
 	}
-	b := binary.AppendUvarint(bytes.Clone(ownersMagic), uint64(logSize))
-	pack := ""
-	if t.coldPack != "" {
-		pack = filepath.Base(t.coldPack)
+	for _, g := range t.coldGarbage {
+		// Garbage the next open inherits is no longer counted.
+		if g.record {
+			t.nodesBytes -= g.dir.dir.recordSize
+		} else {
+			t.coldBytes -= g.dir.dir.coldBytes
+		}
+		t.deadFiles = append(t.deadFiles, g.path)
 	}
-	for _, name := range []string{filepath.Base(t.coldRoot), pack, filepath.Base(t.index.dir)} {
-		b = binary.AppendUvarint(b, uint64(len(name)))
-		b = append(b, name...)
+	t.coldGarbage = nil
+	h := ownersHeader{
+		logSize:      uint64(logSize),
+		compacted:    uint64(t.compacted),
+		next:         t.next,
+		epoch:        t.index.epoch,
+		records:      uint64(t.recordsEnd),
+		built:        uint64(t.built),
+		coldBytes:    uint64(max(t.coldBytes, 0)),
+		nodesBytes:   uint64(max(t.nodesBytes, 0)),
+		runtimeBytes: uint64(t.runtimeBytes),
+		nodes:        filepath.Base(t.index.dir),
+		dead:         t.deadKeys,
+	}
+	if t.coldRoot != "" {
+		h.instance = filepath.Base(t.coldRoot)
+	}
+	if t.coldPack != "" {
+		h.pack = filepath.Base(t.coldPack)
+	}
+	for _, file := range t.deadFiles {
+		if rel, err := filepath.Rel(t.coldParent, file); err == nil && filepath.IsLocal(rel) {
+			h.garbage = append(h.garbage, rel)
+		}
 	}
 	f, err := os.CreateTemp(t.coldParent, ".owners-*")
 	if err != nil {
 		return err
 	}
-	if _, err = f.Write(b); err == nil {
+	if _, err = f.Write(h.append(bytes.Clone(ownersMagic))); err == nil {
+		err = durable.Sync(f)
+	}
+	if err == nil {
 		err = f.Close()
 	} else {
 		f.Close()
@@ -348,8 +437,28 @@ func (t *nodeTable) saveColdStore(logSize int64) error {
 	}
 	if err != nil {
 		os.Remove(f.Name())
+		return err
 	}
-	return err
+	return durable.Dir(t.coldParent)
+}
+
+// append encodes h after the magic, as parseOwners decodes it.
+func (h *ownersHeader) append(b []byte) []byte {
+	for _, v := range []uint64{h.logSize, h.compacted, h.next, h.epoch, h.records, h.built, h.coldBytes, h.nodesBytes, h.runtimeBytes} {
+		b = binary.AppendUvarint(b, v)
+	}
+	for _, name := range []string{h.instance, h.pack, h.nodes} {
+		b = appendName(b, name)
+	}
+	b = binary.AppendUvarint(b, uint64(len(h.dead)))
+	for _, key := range h.dead {
+		b = binary.AppendUvarint(b, key)
+	}
+	b = binary.AppendUvarint(b, uint64(len(h.garbage)))
+	for _, name := range h.garbage {
+		b = appendName(b, name)
+	}
+	return b
 }
 
 // reclaimCold removes detached stores in bounded batches. It leaves its root

@@ -90,19 +90,28 @@ type nodeTable struct {
 	moveSerial   uint64           // monotonic stamp assigned to every relocation
 	index        *nodeIndex       // where logged nodes page out; nil keeps them resident
 	nodesBytes   int64            // size of the logged node index
-	runtimeBytes int64            // size of its slots for keys allocated since open
-	paging       map[uint64]chan struct{}
-	enumerations []*enumeration
-	deadKeys     []uint64 // retired cold keys whose index files remain
-	deadFiles    []string // owner index files of keys retired before this open
-	list         func(dir string) ([]os.FileInfo, error)
-	pending      []byte // records of the current operation, written by flush
-	log          *os.File
-	logErr       error
-	dirty        bool
-	stop         chan struct{}
-	done         chan struct{}
-	closeOnce    sync.Once
+	runtimeBytes int64            // size of its slots for keys allocated since the index was built
+	recordsEnd   int64            // size of the index's records file; close appends there
+	built        int64            // size of the records file when the index was built
+	compacted    int64            // size of the identity log when it was last compacted
+	indexWrites  int              // index writes and removals running outside the mutex; close leaves no manifest meanwhile
+	// Keys whose record file or owner index file of its own this open wrote,
+	// each once however often it was rewritten: close flushes them before the
+	// manifest makes them authoritative.
+	recordFiles, ownerFiles map[uint64]struct{}
+	opened                  nodeLoad // how open loaded the identities
+	paging                  map[uint64]chan struct{}
+	enumerations            []*enumeration
+	deadKeys                []uint64 // retired cold keys whose index files remain
+	deadFiles               []string // index files no live key's slot locates any longer
+	list                    func(dir string) ([]os.FileInfo, error)
+	pending                 []byte // records of the current operation, written by flush
+	log                     *os.File
+	logErr                  error
+	dirty                   bool
+	stop                    chan struct{}
+	done                    chan struct{}
+	closeOnce               sync.Once
 }
 
 // node links an identity to its current parent and basename.
@@ -159,6 +168,7 @@ type dirState struct {
 	stale      bool      // the logged record differs from the index
 	loaded     nodeOwner // the owner index location the index holds
 	recordSize int64     // size of the record file of its own, if any
+	slot       int64     // offset of the key's slot in the index table, once known
 	logged     int64     // estimated bytes that leave memory only with the node
 }
 
@@ -176,12 +186,14 @@ const (
 func newNodeTable(list func(dir string) ([]os.FileInfo, error)) *nodeTable {
 	root := &node{id: 1, key: 1}
 	return &nodeTable{
-		root:       root,
-		byID:       map[uint64]*node{root.id: root},
-		byKey:      map[uint64]*node{root.key: root},
-		next:       root.id + 1,
-		list:       list,
-		cacheLimit: DefaultNodeCache,
+		root:        root,
+		byID:        map[uint64]*node{root.id: root},
+		byKey:       map[uint64]*node{root.key: root},
+		next:        root.id + 1,
+		list:        list,
+		cacheLimit:  DefaultNodeCache,
+		recordFiles: map[uint64]struct{}{},
+		ownerFiles:  map[uint64]struct{}{},
 	}
 }
 
@@ -1238,7 +1250,8 @@ func (t *nodeTable) drop(n *node) {
 			if (s.cold || s.indexing != nil) && t.coldRoot != "" {
 				t.coldGarbage = append(t.coldGarbage, coldGarbage{path: t.coldPath(n), dir: n})
 			}
-			if (s.recordSize > 0 || s.indexing != nil) && t.index != nil {
+			if n.key != 0 && t.index != nil {
+				// Even a record file no slot locates any longer.
 				t.coldGarbage = append(t.coldGarbage, coldGarbage{path: coldIndexPath(t.index.dir, n.key), dir: n, record: true})
 			}
 			for _, st := range s.stubs {

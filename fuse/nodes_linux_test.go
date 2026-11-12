@@ -35,7 +35,7 @@ func rawNodes(t *testing.T) (*export.Export, *exportFS, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { reg.Close() })
-	e, err := export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state)
+	e, err := export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

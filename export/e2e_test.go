@@ -67,7 +67,7 @@ func newStackWithMemory(t *testing.T, files map[string]string, memory *overlay.M
 			t.Error(err)
 		}
 	})
-	e, err = exportfs.New(exportfs.NewRouter(reg), filepath.Join(state, "nodes.log"), state)
+	e, err = exportfs.New(exportfs.NewRouter(reg), filepath.Join(state, "nodes.log"), state, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

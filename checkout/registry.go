@@ -1,6 +1,7 @@
 package checkout
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -11,10 +12,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/api"
@@ -33,7 +37,11 @@ var namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 var objectPattern = regexp.MustCompile(`^[bl]_[0-9a-f]{12}$`)
 
 // stateDirs are the registry's subdirectories below State.
-var stateDirs = []string{"bases", "layers", "uppers", "snapshots", "git", "sources", "jj"}
+var stateDirs = []string{"bases", "layers", "uppers", "snapshots", "git", "sources", "jj", trashDir}
+
+// trashDir holds leftovers Open moved aside for a background removal, so a
+// start never waits for deleting them (see removeOrphansLocked).
+const trashDir = "trash"
 
 // lockFile holds a base's resolved manifest next to its capture.
 const lockFile = "lock.json"
@@ -54,6 +62,15 @@ func Open(c Config) (*Registry, error) {
 		if err := os.MkdirAll(filepath.Join(c.State, dir), 0o700); err != nil {
 			return nil, coded(err)
 		}
+	}
+	start := time.Now()
+	var phases []string
+	mark := start
+	// phase records how long the part of the state named what took to load.
+	phase := func(what string) {
+		now := time.Now()
+		phases = append(phases, what+" "+now.Sub(mark).Round(time.Millisecond).String())
+		mark = now
 	}
 	stateLock, err := lockState(c.State)
 	if err != nil {
@@ -109,27 +126,17 @@ func Open(c Config) (*Registry, error) {
 		}
 		r.mirror.close()
 	}
+	phase("state")
+	if err = r.openBases(d.Bases); err != nil {
+		cleanup()
+		return nil, coded(err)
+	}
 	for _, meta := range d.Bases {
-		config := r.baseConfig(meta.ID)
-		if meta.Remote != nil {
-			config = r.remoteConfig(meta.ID, meta.Remote)
-		}
-		view, openErr := base.Open(config, meta)
-		if openErr != nil {
-			cleanup()
-			return nil, coded(openErr)
-		}
-		b, openErr := loadBase(view, filepath.Join(c.State, "bases", meta.ID, lockFile))
-		if openErr != nil {
-			view.Close()
-			cleanup()
-			return nil, coded(openErr)
-		}
-		r.bases[meta.ID] = b
 		if meta.Remote != nil {
 			r.mirror.want(meta.Remote.Origins)
 		}
 	}
+	phase(fmt.Sprintf("%d bases", len(d.Bases)))
 	for _, disk := range d.Layers {
 		if r.bases[disk.Base] == nil && !disk.Portable {
 			cleanup()
@@ -151,6 +158,7 @@ func Open(c Config) (*Registry, error) {
 		embedded := len(disk.Metadata) != 0 || embeddable(layer)
 		r.layers[disk.ID] = &layerRecord{id: disk.ID, base: disk.Base, layer: layer, portable: disk.Portable, embedded: embedded}
 	}
+	phase(fmt.Sprintf("%d layers", len(d.Layers)))
 	for _, disk := range d.Checkouts {
 		b := r.bases[disk.Base]
 		if b == nil {
@@ -182,6 +190,7 @@ func Open(c Config) (*Registry, error) {
 		r.checkouts[disk.Name] = h
 		r.retainLocked(b, h.stack)
 	}
+	phase(fmt.Sprintf("%d checkouts", len(d.Checkouts)))
 	for _, disk := range d.Snapshots {
 		b := r.bases[disk.Base]
 		if b == nil {
@@ -208,6 +217,7 @@ func Open(c Config) (*Registry, error) {
 			r.nextSnapshot = n
 		}
 	}
+	phase(fmt.Sprintf("%d snapshots", len(d.Snapshots)))
 	if err = r.removeOrphansLocked(); err != nil {
 		cleanup()
 		return nil, coded(err)
@@ -224,10 +234,12 @@ func Open(c Config) (*Registry, error) {
 			}
 		}
 	}
+	phase("leftovers")
 	r.hasher = newHasher(r.storeLayers)
 	r.workers.Add(2)
 	go r.collectGarbage()
 	go r.processNotices()
+	go r.emptyTrash()
 	// Without folder events, live paths are simply never delegated (see Tracked).
 	if r.watcher, err = watch.New(r.folderChanged); err == nil {
 		r.watchWake = make(chan struct{}, 1)
@@ -239,6 +251,7 @@ func Open(c Config) (*Registry, error) {
 		r.enqueueNotice(baseNotice{fault: "watch source folders: " + err.Error()})
 	}
 	r.syncAllRemotes()
+	phase("git remotes")
 	r.mu.Lock()
 	r.scheduleHashesLocked()
 	r.storeHashedLayersLocked()
@@ -246,7 +259,59 @@ func Open(c Config) (*Registry, error) {
 	r.wakeGC()
 	r.wakeNotices()
 	opened = true
+	if c.Logf != nil {
+		c.Logf("state loaded in %v: %s", time.Since(start).Round(time.Millisecond), strings.Join(phases, ", "))
+	}
 	return r, nil
+}
+
+// openBases restores the persisted bases into r.bases, several at a time:
+// each reads its capture and flattens its tree, which dominates restoring a
+// registry of many large bases. On failure it closes the bases it opened and
+// returns the first error in metas' order.
+func (r *Registry) openBases(metas []base.Meta) error {
+	records := make([]*baseRecord, len(metas))
+	errs := make([]error, len(metas))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range min(len(metas), runtime.GOMAXPROCS(0)) {
+		wg.Go(func() {
+			for i := next.Add(1) - 1; i < int64(len(metas)); i = next.Add(1) - 1 {
+				records[i], errs[i] = r.openBase(metas[i])
+			}
+		})
+	}
+	wg.Wait()
+	if err := cmp.Or(errs...); err != nil {
+		for _, b := range records {
+			if b != nil {
+				b.view.Close()
+			}
+		}
+		return err
+	}
+	for i, meta := range metas {
+		r.bases[meta.ID] = records[i]
+	}
+	return nil
+}
+
+// openBase opens one persisted base with its resolved lock.
+func (r *Registry) openBase(meta base.Meta) (*baseRecord, error) {
+	config := r.baseConfig(meta.ID)
+	if meta.Remote != nil {
+		config = r.remoteConfig(meta.ID, meta.Remote)
+	}
+	view, err := base.Open(config, meta)
+	if err != nil {
+		return nil, err
+	}
+	b, err := loadBase(view, filepath.Join(r.config.State, "bases", meta.ID, lockFile))
+	if err != nil {
+		view.Close()
+		return nil, err
+	}
+	return b, nil
 }
 
 // storeHashedLayersLocked hashes again, in the background, the hashed
@@ -923,11 +988,12 @@ func (r *Registry) emit(event Event) {
 	}
 }
 
-// removeOrphansLocked reclaims filesystem leftovers not named by the recovered manifest.
-// A leftover that cannot be removed is reported as a fault and kept for the next
-// open: it is no reason to keep every other checkout down. As after a failed Rm,
-// a kept upper or git directory keeps its name reserved, so no new checkout
-// inherits its files.
+// removeOrphansLocked reclaims filesystem leftovers not named by the recovered
+// manifest: it moves each into the trash for emptyTrash, and removes it in place
+// only when it cannot be moved. A leftover that cannot be removed either is
+// reported as a fault and kept for the next open: it is no reason to keep every
+// other checkout down. As after a failed Rm, a kept upper or git directory keeps
+// its name reserved, so no new checkout inherits its files.
 func (r *Registry) removeOrphansLocked() error {
 	dirs := make(map[string]bool, len(r.checkouts))
 	for _, h := range r.checkouts {
@@ -952,10 +1018,16 @@ func (r *Registry) removeOrphansLocked() error {
 				retained = dirs[name]
 			}
 			if !retained {
+				leftover := filepath.Join(r.config.State, kind, name)
 				if kind == "uppers" || kind == "jj" {
-					r.forgetWorkspace(filepath.Join(r.config.State, kind, name))
+					r.forgetWorkspace(leftover)
 				}
-				if err = removeTree(filepath.Join(r.config.State, kind, name)); err != nil {
+				// Moved aside, a leftover costs the start one rename however
+				// many files it holds; emptyTrash deletes it while serving.
+				if os.Rename(leftover, filepath.Join(r.config.State, trashDir, kind+"-"+name+"-"+rand.Text())) == nil {
+					continue
+				}
+				if err = removeTree(leftover); err != nil {
 					if kind == "uppers" || kind == "git" {
 						r.reserved[name] = true
 					}
@@ -965,4 +1037,20 @@ func (r *Registry) removeOrphansLocked() error {
 		}
 	}
 	return nil
+}
+
+// emptyTrash deletes the leftovers removeOrphansLocked moved aside, this
+// open's and any an earlier daemon stopped before deleting. Close does not
+// wait for it: what remains when the daemon exits is deleted at the next open.
+func (r *Registry) emptyTrash() {
+	dir := filepath.Join(r.config.State, trashDir)
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		select {
+		case <-r.stop:
+			return
+		default:
+		}
+		removeTree(filepath.Join(dir, entry.Name()))
+	}
 }

@@ -66,7 +66,7 @@ func TestEvictedHandlesAndReaddir(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	e, err := export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state)
+	e, err := export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

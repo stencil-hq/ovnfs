@@ -133,6 +133,9 @@ type Config struct {
 	// GitRemotes gives a source repository a git remote ovnfs/<name> for each
 	// live checkout of it (see Registry.syncRemotes); off, ovnfs removes them.
 	GitRemotes bool
+	// Logf reports how long Open spent on each part of the state, so a slow
+	// start names its cause; nil is silent.
+	Logf func(format string, args ...any)
 }
 
 // Registry owns the live checkout namespace and all retained snapshot objects.

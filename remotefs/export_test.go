@@ -52,7 +52,7 @@ func exportFixture(t *testing.T) (*export.Export, string, string) {
 			}
 		}
 	})
-	exported, err = export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state)
+	exported, err = export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -57,7 +57,7 @@ func routerFixture(t *testing.T, names ...string) (*checkout.Registry, *export.R
 		}
 	})
 	rt := export.NewRouter(reg)
-	exported, err = export.New(rt, filepath.Join(dir, "state", "nodes.log"), repo)
+	exported, err = export.New(rt, filepath.Join(dir, "state", "nodes.log"), repo, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

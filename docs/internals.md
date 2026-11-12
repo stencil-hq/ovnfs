@@ -95,8 +95,9 @@ a crash forgets the writes since.
 | `jj/` | jj workspaces made for checkouts being created, until their `.jj` moves into the checkout's upper |
 | `store/` | git-format objects in append-only `packs/<n>.pack` (a full pack also gets `<n>.idx`); large blobs use content-defined chunks, or plain files under `objects/` when reflinks work |
 | `sources/` | each source folder's stat cache: which files still match the blob ids of its last capture's tree |
+| `trash/` | leftovers a start found no checkout, snapshot or base naming (a removal a crash interrupted, a create it rolled back): each is moved here with one rename and deleted while the daemon serves, so a start never waits on deleting files |
 | `nodes.log` | stable node ids (NFS handles, inode numbers); survive restarts and follow renames. A file's id is derived from its directory and name, so reading a tree logs only its directories; moved files and the rare name-hash collision are logged too. Ids stay below 2^53 so JavaScript runtimes see exact inode numbers |
-| `nodes.log.cache/` | the index logged ids page out to, rebuilt from `nodes.log` at each start, and the names behind derived ids and the hashes of removed ones, by directory (see [memory tiers](#memory-tiers)); a clean stop completes the names for the next start, a crash discards them |
+| `nodes.log.cache/` | the index logged ids page out to, and the names behind derived ids and the hashes of removed ones, by directory (see [memory tiers](#memory-tiers)); a clean stop completes both, so the next start adopts them without replaying `nodes.log`; a crash discards them, and the next start rebuilds the index from the log |
 | `mirror.git/` | shallow commits fetched from git upstreams of attached checkouts (see [remote](remote.md#committed-content-from-the-git-upstream)) |
 | `node_id` | this daemon's random id; attach offers carry it so the remote tells this daemon's folders apart from other machines' |
 
@@ -174,7 +175,10 @@ auto-starting clients wait for the new daemon rather than failing on the state
 lock. A starting daemon opens its admin socket before it loads its state, which
 takes minutes on a large state, and holds each hello until it has mounted: a
 client that arrives during the load waits for it, up to five minutes, rather
-than starting a second daemon. Shell completion gives up after a second.
+than starting a second daemon. Bases load several at a time, since each
+flattens its captured tree, and the daemon logs how long each part of the
+state took (`state loaded in 5.2s: state 3ms, 199 bases 4.1s, …`).
+Shell completion gives up after a second.
 Daemons starting together take turns replacing a stale socket, so only one
 listens, and a client whose daemon fails its load quotes the daemon's log.
 Metadata uses `fsync(2)`, not `F_FULLFSYNC`: it survives server crashes, not
@@ -296,12 +300,15 @@ behind the export with the same 22-bit hash can take them over. Listing I/O neve
 node-table mutex; recovery reads stay resident until their I/O returns and reject
 results read across a directory relocation.
 
-Logged ids page out too. A start replays the log into a compact table (about a
-hundred bytes per logged node, freed before serving), compacts the log, and
-writes from it an index `nodes.log.cache/nodes-*`: a record per logged key with
-its id, parent key and name, its logged children and the logged holders of its
-derived ids elsewhere, and a table of fixed-size slots, sorted by key, locating
-each record and the key's owner index. Only the root is resident after a start.
+Logged ids page out too, to an index `nodes.log.cache/nodes-*`: a record per
+logged key with its id, parent key and name, its logged children and the logged
+holders of its derived ids elsewhere, and fixed-size slots locating each record
+and the key's owner index, sorted by key for the keys the index was built with
+and at their key for keys allocated since. A start after a clean stop adopts
+the index that stop left (below); any other start replays the log into a compact
+table (about a hundred bytes per logged node, freed before serving), compacts
+the log, and builds the index from it afresh. Only the root is resident after a
+start.
 An operation pages a logged node in when it reaches it: a path walk reads a cold
 directory's record through its parent's entry, and a handle walks up parent keys
 to a resident ancestor. A resident directory keeps the names, keys and ids of
@@ -314,31 +321,57 @@ rewritten as a record file of its own when it leaves; eviction never renames,
 reuses or retires an id. Removing a directory logs the removal without paging
 in its cold subtree: a record is only paged in under a parent that still names
 it, so its descendants stop resolving at once, and their index files are
-reclaimed a batch per operation. The index is never trusted across starts: a
-clean stop writes where each key's owner index lives into its slot, and that is
-all the next start reads of it; a crash discards it. A record that cannot be
-read or contradicts its parent latches the identity fault below; a failed
-record write backs off like a failed spill.
+reclaimed a batch per operation. A record that cannot be read or contradicts
+its parent latches the identity fault below; a failed record write backs off
+like a failed spill.
 
 The index lives in an instance directory below `STATE/nodes.log.cache`, on
 its state volume, rather than `$TMPDIR`: system temporary storage may be tmpfs
 and consume RAM, or be removed by temporary-file cleaners during a long run.
 Keep the state directory on a disk-backed filesystem to bound memory use.
 
-A clean close completes the index under the node mutex, writes each resident
-logged node's owner index location into its slot, then writes the manifest
-`nodes.log.cache/owners`: the identity log's size, the instance, its pack and
-the logged node index. Directories whose names were only in memory are appended
-to the instance's one `pack-*` file rather than written to a file each;
-directories evicted and changed since have their own file rewritten in place.
-Closing thus writes one file plus the changed evicted directories: a million
-names in 20,000 directories take about 0.1 s on APFS. The next open adopts the
-instance only when the manifest matches the replayed log, copies the pack
+A clean close completes the index under the node mutex. Directories whose
+names were only in memory are appended to the instance's one `pack-*` file
+rather than written to a file each; directories evicted and changed since have
+their own file rewritten in place. The record of every resident logged node
+that changed since it paged in, the root's included, is appended to the index's
+`records` file, and its slot, like that of every node whose owner index moved,
+is rewritten in place. A record file of its own that this supersedes stays
+where it is, unread, until the key's next eviction overwrites it, its
+retirement removes it or a rebuild drops the index. Closing
+thus writes two files plus the changed evicted directories: a million names in
+20,000 directories take about 0.1 s on APFS, and a million changed resident
+logged directories add about half a second. Close then flushes everything the
+manifest will vouch for: the index files, the pack, every record and owner
+index file of its own written since the open (earlier ones were flushed by
+earlier closes), and the directories naming them, in parallel: about 0.4 s
+on APFS for the 40,000 files 20,000 evictions write. Only then is the manifest
+`nodes.log.cache/owners` written durably: the identity log's size, its size
+when last compacted, the counter watermark, the open's epoch, the index's
+sizes, the instance, its pack, the logged node index, and the garbage still to
+reclaim (retired keys and the files of dropped nodes), which the next open
+resumes. A close that finds an index write or reclamation still running, or a
+failed index or flush, leaves no manifest, and nothing is reclaimed after
+close.
+
+The next open removes the manifest durably before changing anything, so a
+crash from then on discards the index, and keeps the store only when the
+manifest matches the log's size. It then adopts the index as it is, reading
+neither the log nor any record but the root's, while the log is at most twice
+its compacted size, the records at most twice their size when built, and the
+pack at most twice its live owners (each plus 64 KiB): 10 million logged
+directories with a 186 MB log open in under a millisecond instead of about six
+seconds. Past those bounds it replays, compacts and rebuilds, copying the pack
 segments the slots of live keys locate into a new pack, merged with any hashes
-the log retired since, and removes the manifest durably before serving, so a
-crash discards the index. An adopted index that cannot be read counts as
-missing for its directory, which then resolves by listing as after a crash,
-instead of latching the fault below.
+the log retired since; this drops the garbage adoptions accumulate (log records
+of moved and retired keys, superseded records, slots of retired keys, rewritten
+pack segments). Each adopting open advances an epoch that slots record with
+every owner index location they are given: one written by an earlier open, like
+one carried into a rebuilt index, is prior. A prior owner index that cannot be
+read counts as missing for its directory, which then resolves by listing as
+after a crash, instead of latching the fault below. The startup log reports
+which path the open took and its timings, for example `node ids: adopted
+clean-stop index (10000200 keys issued, log 185.7 MB) in 211µs`.
 
 The registry's state lock excludes other daemons before startup moves the rest
 of the store, or all of it without a matching manifest, into

@@ -90,7 +90,7 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 // open (re)opens the export over the fixture's persistent node log.
 func (f *fixture) open(t *testing.T) {
 	t.Helper()
-	e, err := export.New(export.NewRouter(f.reg), filepath.Join(f.state, "nodes.log"), f.state)
+	e, err := export.New(export.NewRouter(f.reg), filepath.Join(f.state, "nodes.log"), f.state, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

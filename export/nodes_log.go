@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,56 +34,149 @@ const (
 // errNodeLog reports a log that is inconsistent rather than torn.
 var errNodeLog = errors.New("invalid node identity log")
 
-// openNodeTable replays complete records, atomically compacts the logged
-// identities and builds the index they page out to, leaving only the root
-// resident. A log of the earlier JSON format contributes only its counter
-// watermark: its ids go stale rather than ever naming another file.
+// openNodeTable loads the logged identities, leaving only the root resident.
+// After a clean close it adopts the index the close left, reading neither
+// the log nor the index beyond the root, unless the garbage they accumulated
+// warrants a rebuild (rebuildReason). Otherwise it replays complete records,
+// atomically compacts the logged identities and builds the index they page
+// out to, carrying over the owner indexes a clean close left. A log of the
+// earlier JSON format contributes only its counter watermark: its ids go
+// stale rather than ever naming another file.
 func openNodeTable(name string, list func(dir string) ([]os.FileInfo, error)) (*nodeTable, error) {
+	start := time.Now()
 	t := newNodeTable(list)
 	if err := os.MkdirAll(filepath.Dir(name), 0o700); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(name)
-	r := newReplayTable()
-	switch {
-	case errors.Is(err, os.ErrNotExist), err == nil && len(data) == 0:
-	case err != nil:
-		return nil, err
-	case bytes.HasPrefix(data, nodeLogMagic):
-		if err := r.replay(data[len(nodeLogMagic):]); err != nil {
-			return nil, err
-		}
-	case data[0] == '{':
-		r.next = max(r.next, legacyWatermark(data))
-	default:
-		return nil, errNodeLog
-	}
-	logSize := int64(len(data))
-	data = nil // the replayed names are copies
-	t.next = r.next
-	if err := r.compact(name); err != nil {
-		return nil, err
-	}
-	t.log, err = os.OpenFile(name, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
+	var logSize int64
+	switch info, err := os.Stat(name); {
+	case err == nil:
+		logSize = info.Size()
+	case !errors.Is(err, os.ErrNotExist):
 		return nil, err
 	}
 	// The registry owns the state lock before opening the export. Distinct
-	// logs use distinct stores; only owner indexes a clean close completed
-	// for exactly this log are adopted.
+	// logs use distinct stores; only a store a clean close left for exactly
+	// this log is kept, and its manifest goes before anything changes.
 	t.coldParent = name + ".cache"
-	prior, err := t.openColdStore(logSize)
-	if err == nil {
-		err = t.buildIndex(r, prior)
-	}
+	head := t.takeOwners(logSize)
+	prior, err := t.openColdStore(head)
 	if err != nil {
-		t.log.Close()
+		return nil, err
+	}
+	t.opened = nodeLoad{logBytes: logSize, why: "no clean-stop index"}
+	if prior != nil {
+		var pack int64
+		if info, err := os.Stat(prior.pack); err == nil {
+			pack = info.Size()
+		}
+		if t.opened.why = head.rebuildReason(pack); t.opened.why == "" {
+			if err := t.adoptIndex(head, prior); err != nil {
+				t.opened.why = fmt.Sprintf("clean-stop index unusable: %v", err)
+			} else {
+				t.opened.adopted, t.opened.keys = true, t.next-2
+			}
+		}
+	}
+	if !t.opened.adopted {
+		if err := t.replay(name, prior); err != nil {
+			return nil, err
+		}
+		t.deadFiles = append(t.deadFiles, garbageFiles(t.coldParent, head)...)
+	}
+	t.log, err = os.OpenFile(name, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.index.close()
 		return nil, err
 	}
 	t.stop = make(chan struct{})
 	t.done = make(chan struct{})
 	go t.syncLoop()
+	t.opened.total = time.Since(start)
 	return t, nil
+}
+
+// garbageFiles returns the files below the store at parent that the manifest
+// head, if any, left to reclaim.
+func garbageFiles(parent string, head *ownersHeader) []string {
+	if head == nil {
+		return nil
+	}
+	files := make([]string, len(head.garbage))
+	for i, name := range head.garbage {
+		files[i] = filepath.Join(parent, name)
+	}
+	return files
+}
+
+// replay loads the identity log name into t, compacts it and builds the
+// index, carrying over the owner indexes prior locates, recording each
+// phase's duration in t.opened.
+func (t *nodeTable) replay(name string, prior *priorIndex) error {
+	start := time.Now()
+	data, err := os.ReadFile(name)
+	r := newReplayTable(0)
+	if bytes.HasPrefix(data, nodeLogMagic) {
+		r = newReplayTable(len(data))
+	}
+	switch {
+	case errors.Is(err, os.ErrNotExist), err == nil && len(data) == 0:
+	case err != nil:
+		return err
+	case bytes.HasPrefix(data, nodeLogMagic):
+		if err := r.replay(data[len(nodeLogMagic):]); err != nil {
+			return err
+		}
+	case data[0] == '{':
+		r.next = max(r.next, legacyWatermark(data))
+	default:
+		return errNodeLog
+	}
+	t.opened.logBytes, t.opened.keys = int64(len(data)), uint64(len(r.keys)-1)
+	data = nil // the replayed names are copies
+	t.next = r.next
+	t.opened.replay = time.Since(start)
+	start = time.Now()
+	if t.compacted, err = r.compact(name); err != nil {
+		return err
+	}
+	t.opened.compact = time.Since(start)
+	start = time.Now()
+	if err := t.buildIndex(r, prior); err != nil {
+		return err
+	}
+	t.opened.index = time.Since(start)
+	return nil
+}
+
+// nodeLoad describes how openNodeTable loaded the identities, for the
+// startup log.
+type nodeLoad struct {
+	adopted  bool   // the index a clean close left, without replaying the log
+	why      string // the log was replayed instead
+	logBytes int64
+	keys     uint64 // live keys replayed, or every key issued when adopted, but the root's
+	// Durations of the replay phases and of the whole open.
+	replay, compact, index, total time.Duration
+}
+
+// String is the startup log line.
+func (l nodeLoad) String() string {
+	mb := float64(l.logBytes) / 1e6
+	if l.adopted {
+		return fmt.Sprintf("node ids: adopted clean-stop index (%d keys issued, log %.1f MB) in %v", l.keys, mb, roundDuration(l.total))
+	}
+	return fmt.Sprintf("node ids: replayed %.1f MB (%d live keys; %s) in %v, compacted in %v, indexed in %v",
+		mb, l.keys, l.why, roundDuration(l.replay), roundDuration(l.compact), roundDuration(l.index))
+}
+
+// roundDuration rounds d to about three significant digits.
+func roundDuration(d time.Duration) time.Duration {
+	unit := time.Nanosecond
+	for d >= 1000*unit && unit < time.Millisecond {
+		unit *= 10
+	}
+	return d.Round(unit)
 }
 
 // legacyWatermark returns the counter after every id a JSON-format log issued.
@@ -130,15 +224,26 @@ type replayTable struct {
 	next    uint64
 }
 
-func newReplayTable() *replayTable {
-	return &replayTable{
-		nodes:   []replayed{{id: 1, key: 1, parent: -1, child: -1, next: -1, prev: -1, same: -1}},
-		keys:    map[uint64]int32{1: 0},
-		names:   map[uint64]int32{},
+// newReplayTable returns an empty logged tree sized for a log of logSize
+// bytes.
+func newReplayTable(logSize int) *replayTable {
+	n := logSize/placeBytes + 1
+	r := &replayTable{
+		nodes:   make([]replayed, 1, n),
+		keys:    make(map[uint64]int32, n),
+		names:   make(map[uint64]int32, n),
 		retired: map[int32][]uint32{},
 		next:    2,
 	}
+	r.nodes[0] = replayed{id: 1, key: 1, parent: -1, child: -1, next: -1, prev: -1, same: -1}
+	r.keys[1] = 0
+	return r
 }
+
+// placeBytes is a little less than a record placing a node takes in a
+// large compacted log, so that its replay never grows the tables, which
+// would otherwise dominate it.
+const placeBytes = 16
 
 // replay applies records up to a torn tail: a record cut short by a crash,
 // or the zeros a filesystem may leave after one. A derived id placed twice
@@ -402,15 +507,16 @@ func (r *replayTable) drop(i int32) {
 }
 
 // compact atomically replaces the log with the logged nodes, parents first,
-// and the counter watermark.
-func (r *replayTable) compact(name string) error {
+// and the counter watermark, returning the new log's size.
+func (r *replayTable) compact(name string) (int64, error) {
 	tmp, err := os.CreateTemp(filepath.Dir(name), ".nodes-*")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer os.Remove(tmp.Name())
 	w := bufio.NewWriterSize(tmp, 1<<20)
 	b := append([]byte(nil), nodeLogMagic...)
+	var size int64
 	queue := []int32{0}
 	for len(queue) > 0 {
 		p := queue[0]
@@ -423,12 +529,14 @@ func (r *replayTable) compact(name string) error {
 		if len(b) >= 1<<16 {
 			if _, err := w.Write(b); err != nil {
 				tmp.Close()
-				return err
+				return 0, err
 			}
+			size += int64(len(b))
 			b = b[:0]
 		}
 	}
 	b = binary.AppendUvarint(append(b, opNext), r.next)
+	size += int64(len(b))
 	_, err = w.Write(b)
 	if err == nil {
 		err = w.Flush()
@@ -438,15 +546,15 @@ func (r *replayTable) compact(name string) error {
 	}
 	if err != nil {
 		tmp.Close()
-		return err
+		return 0, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return 0, err
 	}
 	if err := os.Rename(tmp.Name(), name); err != nil {
-		return err
+		return 0, err
 	}
-	return syncNodeDirectory(filepath.Dir(name))
+	return size, syncNodeDirectory(filepath.Dir(name))
 }
 
 // appendNode encodes the record that places logged node k at its position.
@@ -560,9 +668,11 @@ func (t *nodeTable) close() error {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		if t.log != nil {
-			complete := t.completeIndex()
+			// A write still running would change the index after the
+			// manifest describes it.
+			complete := t.indexWrites == 0 && t.completeIndex()
 			if complete && t.index != nil {
-				complete = t.saveOwners() == nil
+				complete = t.saveIndex() == nil && t.syncIndex() == nil
 			}
 			if err := durable.Sync(t.log); err != nil && t.logErr == nil {
 				t.logErr = err

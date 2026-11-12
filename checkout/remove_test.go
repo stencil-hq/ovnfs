@@ -104,7 +104,8 @@ func TestRmRemovesUnwritableDirs(t *testing.T) {
 }
 
 // TestOpenReclaimsOrphanWithUnwritableDir checks that an orphaned upper holding
-// an unwritable directory is reclaimed at open, and the checkouts kept.
+// an unwritable directory leaves its place at open and is deleted while the
+// registry serves, and the checkouts kept.
 func TestOpenReclaimsOrphanWithUnwritableDir(t *testing.T) {
 	enforcedPerms(t)
 	f := newFixture(t)
@@ -114,14 +115,14 @@ func TestOpenReclaimsOrphanWithUnwritableDir(t *testing.T) {
 	}
 	orphan := filepath.Join(f.state, "uppers", "gone")
 	lockedDir(t, orphan)
-	t.Cleanup(func() {
-		os.Chmod(filepath.Join(orphan, "locked", "sub"), 0o700)
-		os.Chmod(filepath.Join(orphan, "locked"), 0o700)
-	})
 	f.open()
 	if _, err := os.Lstat(orphan); !os.IsNotExist(err) {
 		t.Fatalf("orphan upper survived open: %v", err)
 	}
+	eventually(t, "the orphan upper was never deleted", func() bool {
+		entries, err := os.ReadDir(filepath.Join(f.state, trashDir))
+		return err == nil && len(entries) == 0
+	})
 	if ls := f.ls(); len(ls.Checkouts) != 1 || ls.Checkouts[0].Name != "live" {
 		t.Fatalf("checkouts after open = %+v", ls.Checkouts)
 	}

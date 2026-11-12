@@ -225,6 +225,7 @@ func (t *nodeTable) spillNames(d *node) (bool, error) {
 	gone := maps.Clone(s.retired)
 	s.indexing = &coldOperation{done: make(chan struct{})}
 	s.reading++
+	t.indexWrites++
 	t.mu.Unlock()
 	// Only this operation owns the temporary file. Publish it after revalidation.
 	if t.indexIO != nil {
@@ -237,6 +238,7 @@ func (t *nodeTable) spillNames(d *node) (bool, error) {
 		file, size, err = writeColdNames(filepath.Dir(target), names, gone)
 	}
 	t.mu.Lock()
+	t.indexWrites--
 	s.reading--
 	close(s.indexing.done)
 	s.indexing = nil
@@ -255,12 +257,14 @@ func (t *nodeTable) spillNames(d *node) (bool, error) {
 	// use resident owners, and leave coldDirty set if anything changes meanwhile.
 	s.indexing = &coldOperation{done: make(chan struct{})}
 	s.reading++
+	t.indexWrites++
 	t.mu.Unlock()
 	err = os.Rename(file, target)
 	if err != nil {
 		os.Remove(file)
 	}
 	t.mu.Lock()
+	t.indexWrites--
 	s.reading--
 	close(s.indexing.done)
 	s.indexing = nil
@@ -269,6 +273,7 @@ func (t *nodeTable) spillNames(d *node) (bool, error) {
 	}
 	t.coldBytes += size - s.coldBytes
 	s.coldBytes, s.cold, s.prior, s.packed = size, true, false, false
+	t.ownerFiles[d.key] = struct{}{}
 	// Publishing the first index does not discard its resident owners. A
 	// guard acquired during the write must still finish without recovery.
 	s.coldLoaded = s.coldLoaded || resident
@@ -745,7 +750,9 @@ func (t *nodeTable) issuedID(p string, admit bool) (uint64, bool) {
 
 // Retired directory keys are never reused. Delete their indexes, and the
 // records of retired logged nodes, after any in-flight replacement has
-// finished, outside the node mutex.
+// finished, outside the node mutex. Nothing is deleted after close, which
+// leaves the remaining garbage to the next open: a request still running
+// must not change the store the manifest describes.
 type coldGarbage struct {
 	path   string
 	dir    *node
@@ -753,13 +760,15 @@ type coldGarbage struct {
 }
 
 func (t *nodeTable) cleanCold() {
-	for len(t.coldGarbage) > 0 {
+	for !t.coldSaved && len(t.coldGarbage) > 0 {
 		old := t.coldGarbage[0]
 		t.coldGarbage[0] = coldGarbage{}
 		t.coldGarbage = t.coldGarbage[1:]
 		if len(t.coldGarbage) == 0 {
 			t.coldGarbage = nil
 		}
+		// In flight from here: close must not write a manifest without it.
+		t.indexWrites++
 		s := old.dir.dir
 		for s.indexing != nil {
 			done := s.indexing.done
@@ -774,6 +783,7 @@ func (t *nodeTable) cleanCold() {
 		t.mu.Unlock()
 		err := os.Remove(old.path)
 		t.mu.Lock()
+		t.indexWrites--
 		if err != nil && !os.IsNotExist(err) {
 			t.coldGarbage = append(t.coldGarbage, old)
 			return
