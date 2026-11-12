@@ -230,19 +230,18 @@ func (r *Repo) FetchBranch(ctx context.Context, gitdir, branch string, dryRun bo
 			return "", nil, err
 		}
 	}
-	// Remove changed entries first so file/directory replacements do not
-	// depend on the lexical ordering of the tree diff.
-	for _, update := range updates {
-		if _, err := idx.Remove(update.Path); err != nil {
-			return "", nil, err
+	// Remove changed entries before adding any so file/directory replacements
+	// do not depend on the lexical ordering of the tree diff.
+	paths := make([]string, len(updates))
+	var adds []index.Entry
+	for i, update := range updates {
+		paths[i] = update.Path
+		if update.next.Mode != 0 {
+			adds = append(adds, index.Entry{Path: update.Path, ID: update.next.ID, Mode: update.next.Mode})
 		}
 	}
-	for _, update := range updates {
-		if update.next.Mode != 0 {
-			if err := idx.Add(index.Entry{Path: update.Path, ID: update.next.ID, Mode: update.next.Mode}); err != nil {
-				return "", nil, err
-			}
-		}
+	if err := idx.Replace(paths, adds); err != nil {
+		return "", nil, err
 	}
 	opts, err := r.indexWriteOptions(stamp)
 	if err != nil {

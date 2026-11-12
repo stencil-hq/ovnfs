@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -190,4 +193,116 @@ func TestEditInsideSparseDirectory(t *testing.T) {
 	if err := idx.Add(Entry{Path: "c/d/new", Mode: object.ModeFile, ID: id}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestReplaceMatchesSequentialEdits checks Replace against the Remove and Add
+// sequence it stands for, including the edits that displace entries
+// (conflict stages, file/directory swaps, duplicates) and sparse directories.
+func TestReplaceMatchesSequentialEdits(t *testing.T) {
+	names := []string{"a", "b", "a b", "a.b"}
+	ids := []object.ID{object.Hash(object.SHA1, object.Blob, []byte("1")), object.Hash(object.SHA1, object.Blob, []byte("2"))}
+	r := rand.New(rand.NewPCG(3, 4))
+	randPath := func() string {
+		parts := make([]string, 1+r.IntN(3))
+		for i := range parts {
+			parts[i] = names[r.IntN(len(names))]
+		}
+		return strings.Join(parts, "/")
+	}
+	randEntry := func() Entry {
+		e := Entry{Path: randPath(), Mode: object.ModeFile, ID: ids[r.IntN(2)]}
+		if r.IntN(8) == 0 {
+			e.Stage = uint8(1 + r.IntN(3))
+		}
+		if r.IntN(10) == 0 {
+			e.Mode = 0o100700 // canonicalized to 100755
+		}
+		return e
+	}
+	var cacheTree func(depth int) *CacheTree
+	cacheTree = func(depth int) *CacheTree {
+		t := &CacheTree{Entries: 1, ID: ids[0]}
+		if depth < 3 {
+			for _, n := range names {
+				c := cacheTree(depth + 1)
+				c.Name = n
+				t.Children = append(t.Children, c)
+			}
+			slices.SortFunc(t.Children, func(a, b *CacheTree) int { return compareChildName(a.Name, b.Name) })
+		}
+		return t
+	}
+	for round := range 3000 {
+		base := New(object.SHA1)
+		for range r.IntN(40) {
+			e := randEntry()
+			if r.IntN(20) == 0 {
+				e = Entry{Path: randPath() + "/", Mode: object.ModeTree, ID: ids[0], SkipWorktree: true}
+			}
+			if _, ok := base.Find(e.Path, e.Stage); !ok {
+				i, _ := base.Find(e.Path, e.Stage)
+				base.Entries = slices.Insert(base.Entries, i, e)
+			}
+		}
+		if r.IntN(2) == 0 {
+			base.CacheTree = cacheTree(0)
+		}
+		var remove []string
+		for range r.IntN(10) {
+			remove = append(remove, randPath())
+		}
+		var add []Entry
+		for range r.IntN(10) {
+			add = append(add, randEntry())
+		}
+		if r.IntN(2) == 0 {
+			// The FetchBranch shape: re-add paths just removed.
+			for _, p := range remove {
+				if r.IntN(2) == 0 {
+					add = append(add, Entry{Path: p, Mode: object.ModeFile, ID: ids[1]})
+				}
+			}
+		}
+
+		want, got := clone(base), clone(base)
+		var wantErr error
+		for _, p := range remove {
+			if _, wantErr = want.Remove(p); wantErr != nil {
+				break
+			}
+		}
+		for _, e := range add {
+			if wantErr != nil {
+				break
+			}
+			wantErr = want.Add(e)
+		}
+		gotErr := got.Replace(remove, add)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("round %d: Replace error %v, sequential error %v", round, gotErr, wantErr)
+		}
+		if wantErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("round %d: remove %q add %v:\n got %+v\nwant %+v", round, remove, add, got.Entries, want.Entries)
+		}
+	}
+}
+
+func clone(idx *Index) *Index {
+	c := *idx
+	c.Entries = slices.Clone(idx.Entries)
+	c.ResolveUndo = slices.Clone(idx.ResolveUndo)
+	var cloneTree func(*CacheTree) *CacheTree
+	cloneTree = func(t *CacheTree) *CacheTree {
+		if t == nil {
+			return nil
+		}
+		n := *t
+		n.Children = make([]*CacheTree, len(t.Children))
+		for i, k := range t.Children {
+			n.Children[i] = cloneTree(k)
+		}
+		return &n
+	}
+	c.CacheTree = cloneTree(idx.CacheTree)
+	return &c
 }
