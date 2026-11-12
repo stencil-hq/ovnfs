@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/overlay"
@@ -182,5 +183,67 @@ func TestOpenSurvivesUndeletableOrphan(t *testing.T) {
 	_, err = f.reg.New(context.Background(), api.NewArgs{Dir: folder(t, map[string]string{"a": "base"}), Name: "stuck"})
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("new checkout over the kept orphan's name = %v; want already exists", err)
+	}
+}
+
+// TestRemoveReleasesFreezeBeforeChanged checks that a file call that found a
+// checkout just before its removal froze it fails as soon as the removal has
+// retired it, not only once the file server has been told. The SMB server's
+// retire waits for clients to acknowledge cache breaks; a client request
+// waiting here while holding a handle lock kept those acknowledgements from
+// ever arriving, and the whole share hung.
+func TestRemoveReleasesFreezeBeforeChanged(t *testing.T) {
+	f := newFixture(t)
+	f.newCheckout(folder(t, map[string]string{"a": "base"}), "busy")
+	if err := f.reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	late := make(chan error, 1)
+	verdict := make(chan error, 1)
+	reg, err := Open(Config{State: f.state, Mount: f.mount, Node: "n_freeze", Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20,
+		Changed: func(name string, added bool) {
+			if added || name != "busy" {
+				return
+			}
+			// As the file server does, wait on the call queued behind the freeze.
+			select {
+			case err := <-late:
+				verdict <- err
+			case <-time.After(5 * time.Second):
+				verdict <- nil
+			}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.reg = reg
+	var inFlight Session
+	if err := reg.Enter("busy", &inFlight); err != nil {
+		t.Fatal(err)
+	}
+	removed := make(chan error, 1)
+	go func() { removed <- reg.Rm(context.Background(), api.RmArgs{Checkout: "busy"}) }()
+	// Rm now waits for the in-flight call; a second call finds the checkout and
+	// queues on the freeze behind it.
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		var s Session
+		err := reg.Enter("busy", &s)
+		if err == nil {
+			s.Done()
+		}
+		late <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	inFlight.Done()
+	if err := <-removed; err != nil {
+		t.Fatal(err)
+	}
+	err = <-verdict
+	if err == nil {
+		t.Fatal("a file call queued on the removed checkout stayed blocked while the file server retired it")
+	}
+	if public, ok := err.(*Error); !ok || public.Code != "not_found" {
+		t.Fatalf("file call on the removed checkout = %v; want not_found", err)
 	}
 }
