@@ -1353,10 +1353,10 @@ func (r *Registry) remove(ctx context.Context, name string, picked time.Time, st
 	if err := r.freezeAndLock(h); err != nil {
 		return false, err
 	}
-	defer h.freeze.Unlock()
 	// The freeze lock waits out file calls in flight, so none touches it from here.
 	if !picked.IsZero() && !r.touched(h).Equal(picked) {
 		r.mu.Unlock()
+		h.freeze.Unlock()
 		return false, nil
 	}
 	h.retired.Store(true)
@@ -1373,6 +1373,9 @@ func (r *Registry) remove(ctx context.Context, name string, picked time.Time, st
 	r.moveRootLocked()
 	seq := r.requestCommitLocked()
 	r.mu.Unlock()
+	// Retired and gone from the registry, so no file call reaches h: release the
+	// freeze before the file server's retire, which waits on clients.
+	h.freeze.Unlock()
 	err := r.commitState(seq)
 	if err != nil {
 		// The state on disk still names the checkout: record its removal for the
