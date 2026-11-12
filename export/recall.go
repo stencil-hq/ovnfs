@@ -140,24 +140,29 @@ func (e *Export) Invalidate(checkout string, paths, trees []string) {
 			}
 		}
 	}
-	var gone []string
+	gone := map[string]bool{}
 	for _, p := range issued {
 		if under(p, gone) {
 			continue
 		}
 		if _, err := e.fs.Filesystem.Lstat(p); errors.Is(err, fs.ErrNotExist) {
 			e.fs.nodes.remove(p)
-			gone = append(gone, p)
+			gone[p] = true
 		}
 	}
 }
 
-// under reports whether p is one of roots or lies below one.
-func under(p string, roots []string) bool {
-	for _, r := range roots {
-		if p == r || strings.HasPrefix(p, r+"/") {
+// under reports whether p is one of roots or lies below one, looking up p and
+// each of its parents rather than every root.
+func under(p string, roots map[string]bool) bool {
+	for {
+		if roots[p] {
 			return true
 		}
+		i := strings.LastIndexByte(p, '/')
+		if i < 0 {
+			return false
+		}
+		p = p[:i]
 	}
-	return false
 }
