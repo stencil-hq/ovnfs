@@ -221,11 +221,24 @@ func TestRemoveReleasesFreezeBeforeChanged(t *testing.T) {
 	if err := reg.Enter("busy", &inFlight); err != nil {
 		t.Fatal(err)
 	}
+	reg.mu.RLock()
+	h := reg.checkouts["busy"]
+	reg.mu.RUnlock()
 	removed := make(chan error, 1)
 	go func() { removed <- reg.Rm(context.Background(), api.RmArgs{Checkout: "busy"}) }()
-	// Rm now waits for the in-flight call; a second call finds the checkout and
-	// queues on the freeze behind it.
-	time.Sleep(100 * time.Millisecond)
+	// A writer queued for the freeze lock makes TryRLock fail: Rm now waits for
+	// the in-flight call.
+	for deadline := time.Now().Add(5 * time.Second); h.freeze.TryRLock(); {
+		h.freeze.RUnlock()
+		if time.Now().After(deadline) {
+			inFlight.Done()
+			t.Fatal("rm never waited for the file call")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A second call finds the checkout and queues on the freeze behind it. The
+	// pause only lets it find the checkout first; one that finds it already gone
+	// fails at once, so a late call cannot fail the test.
 	go func() {
 		var s Session
 		err := reg.Enter("busy", &s)
