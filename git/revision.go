@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/stencil-hq/ovnfs/git/internal/index"
 	"github.com/stencil-hq/ovnfs/git/internal/object"
@@ -47,9 +48,20 @@ func (r *Repo) ResolveRevision(ctx context.Context, spec string) (*Revision, err
 	return v, nil
 }
 
+// IndexStat is the stat data a work tree presents for one file: what git
+// compares under core.checkStat=minimal before trusting an entry unread.
+type IndexStat struct {
+	Size  int64
+	Mtime time.Time
+}
+
 // WriteIndex writes the index `git read-tree` makes of the revision to the file
-// name, a private index; it never checks out or copies files.
-func (v *Revision) WriteIndex(ctx context.Context, name string) error {
+// name, a private index; it never checks out or copies files. An entry whose
+// path is in stat records that stat data, so git's first refresh trusts the file
+// instead of reading it; the caller must present exactly the revision's blob and
+// mode there. Other entries keep zero stat data, which git always reads. Entries
+// whose mtime is in or after the second of the write are smudged as racily clean.
+func (v *Revision) WriteIndex(ctx context.Context, name string, stat map[string]IndexStat) error {
 	objects, err := v.repo.repo.OpenObjects()
 	if err != nil {
 		return err
@@ -67,7 +79,16 @@ func (v *Revision) WriteIndex(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	return index.Write(name, idx, index.WriteOptions{})
+	for i := range idx.Entries {
+		e := &idx.Entries[i]
+		if s, ok := stat[e.Path]; ok {
+			mtime := index.Time{Sec: uint32(s.Mtime.Unix()), Nsec: uint32(s.Mtime.Nanosecond())}
+			e.Stat = index.Stat{MTime: mtime, Size: uint32(s.Size)}
+		}
+	}
+	// A fresh index is its own racy-git reference: a file presented with an
+	// mtime in this second could still change without its stat data changing.
+	return index.Write(name, idx, index.WriteOptions{RacyTime: time.Now()})
 }
 
 // SetHEAD attaches a private git directory to a local branch, or detaches it at

@@ -117,7 +117,9 @@ func Create(ctx context.Context, c Config, o source.Options) (*Base, []string, e
 // CreateRevision captures a folder but, when revision is set, serves the
 // revision's tracked tree and index instead. Only metadata changes: unchanged
 // paths still read the folder and other tracked content comes from git lazily.
-// Ordered takes replace only source paths and leave the captured index unchanged.
+// Ordered takes replace only source paths and leave the captured index's
+// entries unchanged; a revision index carries stat data only where content is
+// still REV's.
 func CreateRevision(ctx context.Context, c Config, o source.Options, revision *git.Revision, takes ...Take) (*Base, []string, error) {
 	fork := time.Now().UTC()
 	res, warnings, err := Capture(ctx, c, o)
@@ -132,6 +134,11 @@ func CreateRevision(ctx context.Context, c Config, o source.Options, revision *g
 	}
 	if err := takeCapture(ctx, c, o.Rules, &res, work, takes); err != nil {
 		return nil, nil, err
+	}
+	if revision != nil {
+		if err := seedRevisionIndex(ctx, c, res, revision, fork); err != nil {
+			return nil, nil, err
+		}
 	}
 	key := ""
 	if revision == nil && len(takes) == 0 {

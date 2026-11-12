@@ -266,11 +266,16 @@ func (b *Base) sourceInfo(p string, e entry, current os.FileInfo) (os.FileInfo, 
 	if current != nil && b.unchanged(p, current, e, captured) {
 		return current, true
 	}
-	mtime := captured.Mtime
-	if mtime.IsZero() {
-		mtime = b.meta.ForkTime
+	return capturedInfo{name: path.Base(p), mode: e.mode, size: captured.Size, mtime: presentedMtime(captured, b.meta.ForkTime)}, false
+}
+
+// presentedMtime is the mtime of a source file served from its capture: the
+// captured one, or the fork time for content the folder never held.
+func presentedMtime(captured source.Info, fork time.Time) time.Time {
+	if captured.Mtime.IsZero() {
+		return fork
 	}
-	return capturedInfo{name: path.Base(p), mode: e.mode, size: captured.Size, mtime: mtime}, false
+	return captured.Mtime
 }
 
 // unchanged reports a folder entry that still is the captured file: same type,

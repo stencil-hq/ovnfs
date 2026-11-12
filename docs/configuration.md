@@ -59,6 +59,12 @@ now. Writes in the checkout copy up into its own upper, so the folder is never
 written: a cache or local path the checkout wrote or deleted is its own from
 then on, no longer follows the folder, and is ignored by `diff` and `apply`.
 
+Ignored directories (build output, scratch copies of repositories) are cache
+or local, so every checkout inherits them live, and each whole-tree walk
+(`rsync`, `find`, `rg --no-ignore`) in each checkout repeats their metadata
+work. A `hidden DIR/` rule in `.o2/ovnfs.yml` leaves such a directory out of
+checkouts, `--rev` ones included.
+
 ## Rules
 
 Only `source` bytes ever leave the machine. Rules are lines of

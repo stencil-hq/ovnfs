@@ -106,6 +106,7 @@ workspace, with a warning. Checkouts attached on another machine get none.
 branch name (including `refs/heads/NAME`) attaches HEAD to that branch; a
 commit, tag or `HEAD` detaches it. Untracked nonignored files disappear from
 the checkout, while ignored files and build directories remain available.
+Hidden paths stay absent, except files REV tracks.
 Ignore rules come from REV, not the folder's dirty `.gitignore` files. The
 source folder and its git state are never changed. `--rev` cannot be combined
 with `--from SNAP`; it requires a repository and a revision resolving to a
@@ -115,6 +116,10 @@ The revision is the checkout's base for `diff`, `snap` and `apply`: an
 immediate diff is empty, and applying later work does not undo dirty edits
 still in the source folder. Revision checkouts substitute tree metadata and
 read git blobs lazily, rather than copying or checking out the whole tree.
+The private index records the size and mtime the checkout shows for each file
+holding REV's content, so the first `git status` trusts those files instead of
+reading them; other files, and any shown with an mtime within the second the
+index was written, are read.
 
 ## Taking paths: `--take`
 
