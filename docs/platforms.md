@@ -53,6 +53,11 @@ instead of keeping the daemon running. Where fusectl was not mounted when the
 daemon mounted (some unprivileged containers), the forced `stop` cannot abort
 and fails while the mount stays busy, like the first.
 
+A daemon not running as root reports every file as owned by its own user,
+with the source's mode bits, so a checkout of another user's folder is
+writable wherever the source is readable. A root daemon reports real owners
+and gives new files to the user creating them.
+
 ## SMB
 
 `serve --proto smb` serves the `ovnfs` share, to guests on macOS and Linux and

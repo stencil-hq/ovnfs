@@ -64,8 +64,12 @@ type dirEntry struct {
 	mode uint32
 }
 
-// newExportFS serves nodes with the daemon's credentials; a root daemon gives
-// new entries to the calling user, as a local filesystem would.
+// newExportFS serves nodes with the daemon's credentials. A root daemon
+// reports real owners and gives new entries to the calling user, as a local
+// filesystem would. Any other daemon reports every node as its own user's,
+// mode bits kept: only that user reaches the mount (no allow_other), and a
+// write copies up into a layer it owns whoever owns the source, so the
+// source's owner must not make default_permissions refuse it.
 func newExportFS(nodes *export.Nodes) *exportFS {
 	return &exportFS{
 		RawFileSystem: gofuse.NewDefaultRawFileSystem(),
@@ -134,8 +138,9 @@ func attrTTL(a *gofuse.Attr) time.Duration {
 	return TTL
 }
 
-// fill converts export attributes to kernel attributes for node ino.
-// ctime and atime report mtime, as the NFS frontend does.
+// fill converts export attributes to kernel attributes for node ino, with
+// the owners newExportFS describes. ctime and atime report mtime, as the NFS
+// frontend does.
 func (x *exportFS) fill(a *gofuse.Attr, ino uint64, info os.FileInfo) {
 	*a = gofuse.Attr{Ino: ino, Mode: unixMode(info.Mode()), Nlink: 1, Blksize: 4096}
 	if size := info.Size(); size > 0 {
@@ -151,7 +156,7 @@ func (x *exportFS) fill(a *gofuse.Attr, ino uint64, info os.FileInfo) {
 		a.Uid, a.Gid = st.UID, st.GID
 		a.Rdev = uint32(unix.Mkdev(st.Major, st.Minor))
 	}
-	if ino == rootID {
+	if ino == rootID || !x.chown {
 		a.Uid, a.Gid = x.uid, x.gid
 	}
 }

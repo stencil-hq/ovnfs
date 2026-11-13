@@ -14,6 +14,7 @@ import (
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/checkout"
 	"github.com/stencil-hq/ovnfs/export"
+	"github.com/stencil-hq/ovnfs/internal/unixstat"
 )
 
 // rawNodes uses the real export without a kernel mount or its attribute cache.
@@ -120,6 +121,47 @@ func TestLookupColdFaultInsideOperation(t *testing.T) {
 	var out gofuse.EntryOut
 	if st := x.entry("co/a/file", &out); st != gofuse.EIO || out.NodeId != 0 {
 		t.Fatalf("LOOKUP %v inode %x", st, out.NodeId)
+	}
+}
+
+// TestNonRootDaemonOwnsEveryNode checks the owners LOOKUP reports. A daemon
+// not running as root reports every node, source files and new entries alike,
+// as its own user's with the source's mode bits, so default_permissions lets
+// it write a checkout of another user's folder (#57); a root daemon reports
+// the real owners. The daemon's ids differ from the test's, which own the
+// source, to stand for a source owned by another user.
+func TestNonRootDaemonOwnsEveryNode(t *testing.T) {
+	_, x, _ := rawNodes(t)
+	x.uid, x.gid = uint32(os.Geteuid())+1, uint32(os.Getegid())+1
+	var created gofuse.CreateOut
+	var dir gofuse.EntryOut
+	if st := x.entry("co/a", &dir); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if st := x.Create(nil, &gofuse.CreateIn{InHeader: gofuse.InHeader{NodeId: dir.NodeId}, Flags: syscall.O_RDWR, Mode: 0o640}, "new", &created); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	x.Release(nil, &gofuse.ReleaseIn{Fh: created.Fh})
+	for _, root := range []bool{false, true} {
+		x.chown = root
+		for p, mode := range map[string]uint32{"co/a": syscall.S_IFDIR | 0o755, "co/a/file": syscall.S_IFREG | 0o644, "co/a/new": syscall.S_IFREG | 0o640} {
+			info, err := x.nodes.Lstat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner, _ := unixstat.Of(info)
+			uid, gid := x.uid, x.gid
+			if root {
+				uid, gid = owner.UID, owner.GID
+			}
+			var out gofuse.EntryOut
+			if st := x.entry(p, &out); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			if out.Uid != uid || out.Gid != gid || out.Mode != mode {
+				t.Errorf("root daemon %v: %s is %d:%d %o, want %d:%d %o", root, p, out.Uid, out.Gid, out.Mode, uid, gid, mode)
+			}
+		}
 	}
 }
 
