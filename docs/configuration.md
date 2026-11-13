@@ -65,6 +65,11 @@ or local, so every checkout inherits them live, and each whole-tree walk
 work. A `hidden DIR/` rule in `.o2/ovnfs.yml` leaves such a directory out of
 checkouts, `--rev` ones included.
 
+Python environments are hidden instead: their scripts and editable installs
+name the folder by absolute path, so a live one would run the folder's
+interpreter and code. A checkout starts without them and creates its own
+(`uv sync`, or `uv run` on first use).
+
 ## Rules
 
 Only `source` bytes ever leave the machine. Rules are lines of
@@ -74,7 +79,8 @@ non-source class is decided as one unit. The built-ins come last:
 ```
 hidden   .DS_Store | ._* | Thumbs.db | desktop.ini
 local    secret
-cache    cachedir | dir & (node_modules | .venv | __pycache__ | .next | .nuxt | .turbo | .gradle | .pytest_cache | .mypy_cache | .ruff_cache | .tox)
+hidden   !tracked & (venvdir | dir & (.venv | .tox | .nox))
+cache    cachedir | dir & (node_modules | __pycache__ | .next | .nuxt | .turbo | .gradle | .pytest_cache | .mypy_cache | .ruff_cache)
 cache    ignored & dir
 local    ignored
 local    size > 100MB
@@ -99,7 +105,7 @@ with each checkout (`lock.json` in its base).
 | `out/` | a trailing `/`: directories only |
 | `**` | zero or more path components; one or more at the end of a glob |
 | `tracked`, `untracked`, `ignored` | in a git index; neither tracked nor ignored; excluded by gitignore rules |
-| `dir`, `cachedir` | a directory; a directory holding `CACHEDIR.TAG` |
+| `dir`, `cachedir`, `venvdir` | a directory; a directory holding `CACHEDIR.TAG`; a directory holding `pyvenv.cfg` (a Python virtual environment) |
 | `secret` | credential names: `.env`, `.env.*` (not `.example`, `.sample`, `.template`, `.dist`), `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `credentials`, `credentials.json`, `credentials.toml`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `*.pem`, `*.key`, `*.p12`, `*.pfx`; directories `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker` |
 | `size > 100MB` | a file (never a directory) compared with `>`, `>=`, `<` or `<=` against an integer in `B`, `KB`, `MB`, `GB`, `TB` (powers of 1000) or `KiB`, `MiB`, `GiB`, `TiB`, any case |
 

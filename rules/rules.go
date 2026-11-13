@@ -46,6 +46,9 @@ type Facts interface {
 	Ignored() bool
 	// CacheDir reports whether the path is a directory containing CACHEDIR.TAG.
 	CacheDir() bool
+	// VenvDir reports whether the path is a directory containing pyvenv.cfg:
+	// a Python virtual environment.
+	VenvDir() bool
 }
 
 // Rule assigns Class to every path its predicate matches.
@@ -122,9 +125,13 @@ func Parse(text, origin string, firstLine int) ([]Rule, error) {
 }
 
 // builtinText is the default rule list every manifest ends with; line n is Origin "builtin:n".
+// Python environments are hidden rather than cache: their scripts and editable
+// installs name the folder by absolute path, so a live one would run the
+// folder's interpreter and code from inside a checkout.
 const builtinText = `hidden   .DS_Store | ._* | Thumbs.db | desktop.ini
 local    secret
-cache    cachedir | dir & (node_modules | .venv | __pycache__ | .next | .nuxt | .turbo | .gradle | .pytest_cache | .mypy_cache | .ruff_cache | .tox)
+hidden   !tracked & (venvdir | dir & (.venv | .tox | .nox))
+cache    cachedir | dir & (node_modules | __pycache__ | .next | .nuxt | .turbo | .gradle | .pytest_cache | .mypy_cache | .ruff_cache)
 cache    ignored & dir
 local    ignored
 local    size > 100MB

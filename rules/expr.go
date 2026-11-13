@@ -40,6 +40,7 @@ const (
 	kwTracked   factNode = "tracked"
 	kwUntracked factNode = "untracked"
 	kwCacheDir  factNode = "cachedir"
+	kwVenvDir   factNode = "venvdir"
 	kwDir       factNode = "dir"
 )
 
@@ -54,6 +55,8 @@ func (n factNode) eval(_ string, f Facts) bool {
 		return !f.Tracked() && !f.Ignored()
 	case kwCacheDir:
 		return f.CacheDir()
+	case kwVenvDir:
+		return f.VenvDir()
 	case kwDir:
 		return f.Dir()
 	}
@@ -66,6 +69,7 @@ var keywords = map[string]node{
 	"tracked":   kwTracked,
 	"untracked": kwUntracked,
 	"cachedir":  kwCacheDir,
+	"venvdir":   kwVenvDir,
 	"dir":       kwDir,
 	"secret":    secretNode{},
 }

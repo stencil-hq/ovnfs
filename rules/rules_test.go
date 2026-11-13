@@ -7,9 +7,9 @@ import (
 
 // facts is a static Facts for tests; asked records which questions were evaluated.
 type facts struct {
-	dir, tracked, ignored, cachedir bool
-	size                            int64
-	asked                           map[string]bool
+	dir, tracked, ignored, cachedir, venvdir bool
+	size                                     int64
+	asked                                    map[string]bool
 }
 
 func (f *facts) note(q string) {
@@ -22,6 +22,7 @@ func (f *facts) Size() int64    { f.note("size"); return f.size }
 func (f *facts) Tracked() bool  { f.note("tracked"); return f.tracked }
 func (f *facts) Ignored() bool  { f.note("ignored"); return f.ignored }
 func (f *facts) CacheDir() bool { f.note("cachedir"); return f.cachedir }
+func (f *facts) VenvDir() bool  { f.note("venvdir"); return f.venvdir }
 
 func mustRule(t *testing.T, line string) Rule {
 	t.Helper()
@@ -53,6 +54,7 @@ func TestPredicates(t *testing.T) {
 		{"untracked", "a", &facts{ignored: true}, false},
 		{"untracked", "a", &facts{tracked: true}, false},
 		{"cachedir", "a", &facts{dir: true, cachedir: true}, true},
+		{"venvdir", "a", &facts{dir: true, venvdir: true}, true},
 		{"secret", "x/.env", file, true},
 		{"secret", "x/.env", dir, false},
 		{"secret", "x/.ssh", dir, true},
@@ -204,7 +206,7 @@ func TestParseOrigins(t *testing.T) {
 
 func TestBuiltins(t *testing.T) {
 	bs := Builtins()
-	if len(bs) != 7 || bs[0].Origin != "builtin:1" || bs[6].Origin != "builtin:7" || bs[6].String() != "source *" {
+	if len(bs) != 8 || bs[0].Origin != "builtin:1" || bs[7].Origin != "builtin:8" || bs[7].String() != "source *" {
 		t.Fatalf("builtins = %v", bs)
 	}
 	set := Set{Rules: bs}
@@ -217,14 +219,20 @@ func TestBuiltins(t *testing.T) {
 		{".DS_Store", facts{}, Hidden, "builtin:1"},
 		{"a/._foo", facts{}, Hidden, "builtin:1"},
 		{".env", facts{tracked: true}, Local, "builtin:2"},
-		{".env.example", facts{tracked: true}, Source, "builtin:7"},
-		{"node_modules", facts{dir: true}, Cache, "builtin:3"},
-		{"node_modules", facts{}, Source, "builtin:7"},
-		{"x", facts{dir: true, cachedir: true}, Cache, "builtin:3"},
-		{"build", facts{dir: true, ignored: true}, Cache, "builtin:4"},
-		{"app.log", facts{ignored: true}, Local, "builtin:5"},
-		{"big.bin", facts{size: 200_000_000}, Local, "builtin:6"},
-		{"src/a.go", facts{tracked: true}, Source, "builtin:7"},
+		{".env.example", facts{tracked: true}, Source, "builtin:8"},
+		// Python environments: any name when it holds pyvenv.cfg, even ignored;
+		// tool directories of environments by name; never tracked content.
+		{".venv", facts{dir: true, venvdir: true}, Hidden, "builtin:3"},
+		{"env", facts{dir: true, ignored: true, venvdir: true}, Hidden, "builtin:3"},
+		{".tox", facts{dir: true, ignored: true}, Hidden, "builtin:3"},
+		{"env", facts{dir: true, tracked: true, venvdir: true}, Source, "builtin:8"},
+		{"node_modules", facts{dir: true}, Cache, "builtin:4"},
+		{"node_modules", facts{}, Source, "builtin:8"},
+		{"x", facts{dir: true, cachedir: true}, Cache, "builtin:4"},
+		{"build", facts{dir: true, ignored: true}, Cache, "builtin:5"},
+		{"app.log", facts{ignored: true}, Local, "builtin:6"},
+		{"big.bin", facts{size: 200_000_000}, Local, "builtin:7"},
+		{"src/a.go", facts{tracked: true}, Source, "builtin:8"},
 	}
 	for _, tt := range tests {
 		f := tt.f

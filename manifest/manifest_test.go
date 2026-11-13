@@ -31,6 +31,7 @@ func (file) Size() int64    { return 1 }
 func (file) Tracked() bool  { return false }
 func (file) Ignored() bool  { return false }
 func (file) CacheDir() bool { return false }
+func (file) VenvDir() bool  { return false }
 
 const projectYAML = `# project manifest
 rules: |   # rule lines

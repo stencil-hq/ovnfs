@@ -290,11 +290,17 @@ func (f *facts) Ignored() bool {
 }
 
 // CacheDir reports a directory tagged as a cache by CACHEDIR.TAG.
-func (f *facts) CacheDir() bool {
+func (f *facts) CacheDir() bool { return f.holds("CACHEDIR.TAG") }
+
+// VenvDir reports a Python virtual environment: a directory holding pyvenv.cfg.
+func (f *facts) VenvDir() bool { return f.holds("pyvenv.cfg") }
+
+// holds reports a directory with a regular file named name directly inside it.
+func (f *facts) holds(name string) bool {
 	if !f.Dir() {
 		return false
 	}
-	info, err := f.view.Lstat(f.p + "/CACHEDIR.TAG")
+	info, err := f.view.Lstat(f.p + "/" + name)
 	return err == nil && info.Mode().IsRegular()
 }
 

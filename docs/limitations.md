@@ -41,6 +41,9 @@
   paths, `pull`, and reattach can remain cached until the client's attribute
   timeout (up to 60 s). NFSv4 read delegations reduce that window for opened
   files, but do not cover directories or files only inspected with `stat`.
+  A recursive delete of a directory the folder just added a file to can
+  therefore fail with `ENOTEMPTY`, since the client lists it from its cache;
+  repeating the delete succeeds.
 - One SMB daemon per Windows logon session: the SMB client keeps one set of
   credentials per server name, whatever the port, so a second daemon, whose
   state directory holds another password, cannot map `\\127.0.0.1\ovnfs`

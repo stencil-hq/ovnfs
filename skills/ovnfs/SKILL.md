@@ -131,15 +131,19 @@ is always pruned.
 | Class | In the checkout | Seen by `diff`/`apply`/snapshots |
 | --- | --- | --- |
 | `source` | as captured at open | yes |
-| `cache` (ignored dirs, `node_modules`, `.venv`, ...) | the live folder until the checkout writes there; writes go to the checkout only | no |
+| `cache` (ignored dirs, `node_modules`, ...) | the live folder until the checkout writes there; writes go to the checkout only | no |
 | `local` (ignored files, secrets, files over 100 MB) | the live folder until the checkout writes there; writes go to the checkout only | no |
-| `hidden` (`.DS_Store`, ...) | absent | no |
+| `hidden` (`.DS_Store`, Python environments, ...) | absent | no |
 
 - Build outputs and dependency installs inside a checkout never reach the
   folder, and `apply` never carries them back. To keep a generated file, make
   it `source`. A checkout that built or installed keeps its own copy of every
   path it wrote or deleted, so it no longer sees the folder's later builds or
   installs there.
+- A checkout starts without the folder's Python environments (`.venv`, any
+  directory holding `pyvenv.cfg`, `.tox`, `.nox`): their scripts and editable
+  installs would run the folder's code. Create its own with `uv sync` (`uv run`
+  does it on first use).
 - Files the user adds to the folder after you open the checkout do not
   appear in it. Open a new checkout to see them.
 - `ovnfs explain PATH` names the rule that decided a path's class, with its
