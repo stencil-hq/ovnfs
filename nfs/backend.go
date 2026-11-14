@@ -23,6 +23,9 @@ type Backend interface {
 	// Path returns the current path of a live id; false makes the id's
 	// handles stale.
 	Path(id uint64) (string, bool)
+	// RetireHandle makes id stale while preserving its path for a new identity.
+	// It returns false when id is already stale or names the export root.
+	RetireHandle(id uint64) bool
 	// Cacheable permits NFSv4 read delegations on p. It must return true only
 	// when every change to p made outside this server reaches Server.Recall.
 	Cacheable(p string) bool

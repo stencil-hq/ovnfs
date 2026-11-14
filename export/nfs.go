@@ -26,6 +26,11 @@ func (n *nfsFS) Path(id uint64) (string, bool) {
 	return n.nodes.path(id)
 }
 
+// RetireHandle makes an existing NFS handle stale without removing its path.
+func (n *nfsFS) RetireHandle(id uint64) bool {
+	return n.nodes.retireHandle(id)
+}
+
 // Rename advances a regular file's mtime to stand in for the ctime change
 // rename(2) implies: the NFS server reports ctime as mtime. macOS NFS needs
 // that change to invalidate cached linker output, even when executable bits

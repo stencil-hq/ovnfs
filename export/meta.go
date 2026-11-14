@@ -222,7 +222,7 @@ func (n *nodeFS) TempFile(dir, prefix string) (f billy.File, err error) {
 		return nil, err
 	}
 	n.nodes.created(overlay.Clean(f.Name()))
-	return f, nil
+	return n.bindFile(f.Name(), f)
 }
 
 // Rename moves a node without changing its id or those of its descendants.

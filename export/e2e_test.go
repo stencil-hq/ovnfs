@@ -305,6 +305,43 @@ func TestNFSForkIsolation(t *testing.T) {
 	nfsStatus(t, status, nfstest.NoEnt, err)
 }
 
+// TestNFSCachedWrites checks retained writers across rename, freeze and replacement.
+func TestNFSCachedWrites(t *testing.T) {
+	for _, mode := range []string{"memory", "disk"} {
+		t.Run(mode, func(t *testing.T) {
+			var memory *overlay.Memory
+			if mode == "memory" {
+				memory = overlay.NewMemory(64<<20, 1<<20, 0)
+			}
+			f := newStackWithMemory(t, map[string]string{"dir/file": "before"}, memory)
+			f.create(t, "parent")
+			c := nfstest.Start(t, f.export.NFS())
+			parent := lookup(t, c, "parent")
+			file := lookup(t, c, "parent/dir/file")
+			nfsWrite(t, c, file, "cached")
+			status, err := c.Rename(parent, "dir", parent, "moved")
+			nfsStatus(t, status, nfstest.OK, err)
+			nfsWrite(t, c, file, "rename")
+			if _, err := f.reg.Fork(t.Context(), api.ForkArgs{Checkout: "parent", Name: "child"}); err != nil {
+				t.Fatal(err)
+			}
+			nfsWrite(t, c, file, "parent")
+			nfsRead(t, c, file, "parent")
+			nfsRead(t, c, lookup(t, c, "child/moved/file"), "rename")
+
+			moved := lookup(t, c, "parent/moved")
+			replacement := nfsCreate(t, c, moved, "replacement", "newone")
+			status, err = c.Rename(moved, "replacement", moved, "file")
+			nfsStatus(t, status, nfstest.OK, err)
+			_, status, err = c.Write(file, 0, []byte("stale!"))
+			nfsStatus(t, status, nfstest.Stale, err)
+			nfsWrite(t, c, replacement, "latest")
+			nfsRead(t, c, lookup(t, c, "parent/moved/file"), "latest")
+			nfsRead(t, c, lookup(t, c, "child/moved/file"), "rename")
+		})
+	}
+}
+
 // SMB wire statuses keep assertions independent of the server's private constants.
 const (
 	smbOK     uint32 = 0

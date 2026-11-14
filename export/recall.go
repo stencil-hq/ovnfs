@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -68,10 +69,31 @@ func (n *nodeFS) openFile(name string, flag int, perm os.FileMode) (f billy.File
 	}
 
 	f, err = n.Filesystem.OpenFile(name, flag, perm)
-	if err == nil && flag&os.O_CREATE != 0 {
+	if err != nil {
+		return nil, err
+	}
+	if flag&os.O_CREATE != 0 {
 		n.nodes.created(overlay.Clean(name))
 	}
-	return f, err
+	return n.bindFile(name, f)
+}
+
+// bindFile pins the identity used to reopen a retained protocol descriptor
+// after a freeze, following renames without reviving a removed/replaced file.
+func (n *nodeFS) bindFile(name string, f billy.File) (billy.File, error) {
+	if file, ok := f.(*routerFile); ok {
+		id := n.nodes.id(overlay.Clean(name))
+		if id == 0 {
+			f.Close()
+			return nil, syscall.EIO
+		}
+		file.identity, file.id, file.unpin = n, id, n.nodes.retain(id)
+		if err := n.IdentityError(); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	return f, nil
 }
 
 // Create truncates through OpenFile so the recall is not bypassed.

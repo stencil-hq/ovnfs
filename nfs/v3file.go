@@ -24,6 +24,11 @@ func (s *Server) getattr3(d *decoder, res *encoder) status {
 	if err != nil {
 		return statusOf(err)
 	}
+	if res.sizeRegressed(&a) {
+		s.Recall(id)
+		s.FS.RetireHandle(id)
+		return stStale
+	}
 	fattr3(res, &a)
 	return stOK
 }
@@ -56,11 +61,17 @@ func (s *Server) setattr3(d *decoder, res *encoder) status {
 	if guard && (sec != uint32(pre.mtime.Unix()) || nsec != uint32(pre.mtime.Nanosecond())) {
 		return stNotSync
 	}
+	if sa.setSize {
+		res.beginSize(id, sa.size)
+	}
 	s.Recall(id)
 	st = s.apply3(p, &sa)
 	s.Recall(id)
 	if st != stOK {
 		return st
+	}
+	if sa.setSize {
+		res.acceptSize()
 	}
 	s.wcc3(res, &pre, id, p)
 	return stOK
@@ -250,27 +261,32 @@ func (s *Server) write3(d *decoder, res *encoder) status {
 	return stOK
 }
 
-// writeAt3 writes data at off of file id, at p, through the file kept for
-// id when the backend refuses to open it for writing (keptFiles).
+// writeAt3 reuses the writer for id at p, falling back to a descriptor kept
+// before write permission was removed when a fresh open is denied.
 func (s *Server) writeAt3(id uint64, p string, data []byte, off int64) (int, error) {
+	key := keptKey{id: id, path: p}
+	var n int
+	write := func(f billy.File) (err error) {
+		n, err = writeAt(f, data, off)
+		return err
+	}
+	if ok, err := s.v3.kept.with(key, write); ok {
+		return n, err
+	}
 	f, err := s.FS.OpenFile(p, os.O_WRONLY, 0)
 	if err != nil {
-		var n int
 		if errors.Is(err, os.ErrPermission) {
-			if ok, kerr := s.v3.kept.with(id, func(f billy.File) (err error) {
-				n, err = writeAt(f, data, off)
-				return err
-			}); ok {
+			if ok, kerr := s.v3.kept.with(keptKey{id: id}, write); ok {
 				return n, kerr
 			}
 		}
 		return 0, err
 	}
-	n, err := writeAt(f, data, off)
-	if cerr := f.Close(); err == nil {
-		err = cerr
+	if err := write(f); err != nil {
+		f.Close()
+		return n, err
 	}
-	return n, err
+	return n, s.v3.kept.keep(key, f)
 }
 
 // commit3 answers COMMIT (section 3.3.21): writes are already stable, so

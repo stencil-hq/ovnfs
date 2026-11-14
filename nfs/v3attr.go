@@ -4,14 +4,156 @@ import (
 	"errors"
 	"math"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/stencil-hq/ovnfs/internal/unixstat"
 )
 
+// maxReportedSizes keeps a reconnect from forgetting a size another
+// connection has already reported. It never decreases.
+type maxReportedSizes struct {
+	mu   sync.Mutex
+	byID map[uint64]uint64
+}
+
+func (s *maxReportedSizes) observe(id, size uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if previous, ok := s.byID[id]; ok && previous > size {
+		return previous
+	}
+	if s.byID == nil {
+		s.byID = make(map[uint64]uint64)
+	}
+	s.byID[id] = size
+	return size
+}
+
+func (s *maxReportedSizes) previous(id uint64) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	size, ok := s.byID[id]
+	return size, ok
+}
+
+// clientReportedSizes orders size regressions with the operation that caused
+// them; an unexpected regression retires the handle before it is reported.
+type clientReportedSizes struct {
+	mu      sync.Mutex
+	changed *sync.Cond
+	byID    map[uint64]uint64
+	pending map[uint64]bool
+}
+
+func (s *clientReportedSizes) report(maximum *maxReportedSizes, id, size uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wait(id)
+	if previous, ok := s.byID[id]; ok {
+		if previous > size {
+			return previous
+		}
+		if maximum.observe(id, size) <= size {
+			delete(s.byID, id)
+		} else {
+			s.byID[id] = size
+		}
+		return size
+	}
+	return maximum.observe(id, size)
+}
+
+func (s *clientReportedSizes) regressed(maximum *maxReportedSizes, id, size uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wait(id)
+	if previous, ok := s.byID[id]; ok {
+		return size < previous
+	}
+	previous, ok := maximum.previous(id)
+	return ok && size < previous
+}
+
+func (s *clientReportedSizes) wait(id uint64) {
+	for s.pending[id] {
+		if s.changed == nil {
+			s.changed = sync.NewCond(&s.mu)
+		}
+		s.changed.Wait()
+	}
+}
+
+func (s *clientReportedSizes) begin(id uint64) {
+	s.mu.Lock()
+	for s.pending[id] {
+		if s.changed == nil {
+			s.changed = sync.NewCond(&s.mu)
+		}
+		s.changed.Wait()
+	}
+	if s.pending == nil {
+		s.pending = make(map[uint64]bool)
+	}
+	s.pending[id] = true
+	s.mu.Unlock()
+}
+
+func (s *clientReportedSizes) finish(id, size uint64, accepted bool) {
+	s.mu.Lock()
+	if accepted {
+		if s.byID == nil {
+			s.byID = make(map[uint64]uint64)
+		}
+		s.byID[id] = size
+	}
+	delete(s.pending, id)
+	if s.changed != nil {
+		s.changed.Broadcast()
+	}
+	s.mu.Unlock()
+}
+
+// beginSize holds back concurrent attributes until a client-requested resize
+// reply has been sent. That client already updates its VM size safely as part
+// of the resize operation.
+func (e *encoder) beginSize(id, size uint64) {
+	if e.sizes == nil {
+		return
+	}
+	e.sizes.begin(id)
+	e.sizeID, e.size, e.sizePending = id, size, true
+}
+
+func (e *encoder) acceptSize() { e.sizeAccepted = e.sizePending }
+
+func (e *encoder) finishSize(sent bool) {
+	if !e.sizePending {
+		return
+	}
+	accepted := sent && e.sizeAccepted
+	if accepted {
+		e.maxSizes.observe(e.sizeID, e.size)
+	}
+	e.sizes.finish(e.sizeID, e.size, accepted)
+	e.sizePending = false
+}
+
+func (e *encoder) reportSize(a *attrs) {
+	if a.typ != typeReg || e.sizes == nil || e.sizePending && e.sizeID == a.fileid {
+		return
+	}
+	a.size = e.sizes.report(e.maxSizes, a.fileid, a.size)
+}
+
+func (e *encoder) sizeRegressed(a *attrs) bool {
+	return a.typ == typeReg && e.sizes != nil && e.sizes.regressed(e.maxSizes, a.fileid, a.size)
+}
+
 // fattr3 appends a as an fattr3.
 func fattr3(e *encoder, a *attrs) {
+	e.reportSize(a)
 	e.u32(uint32(a.typ))
 	e.u32(a.mode)
 	e.u32(a.nlink)
@@ -173,11 +315,11 @@ func (s *Server) apply3(p string, a *sattr3) status {
 // owner's write permission, for writes the client still sends (keptFiles).
 func (s *Server) keepWritable3(p string) {
 	id := s.FS.FileID(p)
-	if s.v3.kept.has(id) {
+	if s.v3.kept.has(keptKey{id: id}) {
 		return
 	}
 	if f, err := s.FS.OpenFile(p, os.O_WRONLY, 0); err == nil {
-		s.v3.kept.keep(id, f)
+		s.v3.kept.keep(keptKey{id: id}, f)
 	}
 }
 
@@ -194,7 +336,7 @@ func (s *Server) truncate3(p string, size uint64) status {
 	}
 	f, err := s.FS.OpenFile(p, flag, 0)
 	if errors.Is(err, os.ErrPermission) {
-		if ok, kerr := s.v3.kept.with(s.FS.FileID(p), func(f billy.File) error { return f.Truncate(int64(size)) }); ok {
+		if ok, kerr := s.v3.kept.with(keptKey{id: s.FS.FileID(p)}, func(f billy.File) error { return f.Truncate(int64(size)) }); ok {
 			return statusOf(kerr)
 		}
 	}

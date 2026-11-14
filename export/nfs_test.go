@@ -31,6 +31,20 @@ func TestNFSIDsTrackRenameAndRetirement(t *testing.T) {
 	if err := b.Chmod("co/b/file", 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if !b.RetireHandle(id) {
+		t.Fatal("live handle was not retired")
+	}
+	if _, ok := b.Path(id); ok {
+		t.Fatal("retired handle still resolves")
+	}
+	next := b.FileID("co/b/file")
+	if next == id {
+		t.Fatal("retired path reused its old id")
+	}
+	if p, ok := b.Path(next); !ok || p != "co/b/file" {
+		t.Fatalf("fresh id resolves to %q, live %v", p, ok)
+	}
+	id = next
 	if err := b.Remove("co/b/file"); err != nil {
 		t.Fatal(err)
 	}

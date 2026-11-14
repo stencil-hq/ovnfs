@@ -364,7 +364,8 @@ func TestRouterPositionedWritesReopen(t *testing.T) {
 	}
 }
 
-// TestRouterRemovedHandlesStayClosed checks name reuse cannot revive a retained SMB file.
+// TestRouterRemovedHandlesStayClosed checks name reuse cannot revive a retained
+// protocol file, and releasing it after retirement does not close its host fd twice.
 func TestRouterRemovedHandlesStayClosed(t *testing.T) {
 	reg, rt := routerFixture(t, "alpha")
 	f, err := rt.OpenFile("alpha/source", os.O_RDWR, 0)
@@ -387,6 +388,12 @@ func TestRouterRemovedHandlesStayClosed(t *testing.T) {
 	}
 	if got := routerContents(t, rt, "alpha/source"); got != "base" {
 		t.Fatalf("retained handle mutated replacement checkout: %q", got)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("release retired protocol handle: %v", err)
+	}
+	if err := f.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("second protocol close: %v", err)
 	}
 }
 

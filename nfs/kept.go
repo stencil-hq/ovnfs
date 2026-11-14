@@ -20,66 +20,77 @@ const (
 	keptMax = 4096
 )
 
-// keptFiles holds files opened for writing just before they lost their
-// owner's write permission, by file id. A process may write through an open
-// file it created read-only or chmodded read-only (git creates objects 0444
-// and writes them), and NFS clients send those writes after the CREATE or
-// SETATTR that took the permission away. The backend refuses to open such a
-// file for writing again, as the local filesystem would; NFSv3 WRITE and
-// size changes fall back to the kept file instead, as Linux's nfsd lets the
-// owner write. NFSv4 keeps files per open instead (keepWritable).
+// keptKey separates cached writers, keyed by id and current path, from
+// permission fallbacks, whose empty path lets them follow renames like an
+// already-open file. Cached writers reopen after a rename so a backend
+// that reopens descriptors across snapshots remembers the current path.
+type keptKey struct {
+	id   uint64
+	path string
+}
+
+// keptFiles retains NFSv3 writers across bursts of WRITE requests instead
+// of opening and closing a host descriptor for each small write. Files
+// opened before CREATE or SETATTR removes write permission also stay here:
+// clients may send their buffered writes afterwards. NFSv4 keeps those
+// permission fallbacks per open instead (keepWritable).
 type keptFiles struct {
 	mu    sync.Mutex
-	files map[uint64]*list.Element // of *keptFile
-	lru   list.List                // most recently used first
-	idle  time.Duration            // zero: keptIdle
+	files map[keptKey]*list.Element // of *keptFile
+	lru   list.List                 // most recently used first
+	idle  time.Duration             // zero: keptIdle
 }
 
 // keptFile is one kept file. It closes once idle with no write under way.
 type keptFile struct {
-	id    uint64
+	mu    sync.Mutex // serializes seek/write for files without WriteAt
+	key   keptKey
 	f     billy.File
 	users int
 	timer *time.Timer
 }
 
-// has reports whether id has a kept file.
-func (k *keptFiles) has(id uint64) bool {
+// has reports whether key has a kept file.
+func (k *keptFiles) has(key keptKey) bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	_, ok := k.files[id]
+	_, ok := k.files[key]
 	return ok
 }
 
-// keep holds f, open for writing, for id. f is closed instead when id
-// already has a kept file.
-func (k *keptFiles) keep(id uint64, f billy.File) {
+// keep takes ownership of f, closing it if key is already cached or every
+// slot is busy. Any descriptor closed here reports its error to the caller.
+func (k *keptFiles) keep(key keptKey, f billy.File) error {
 	k.mu.Lock()
-	if _, ok := k.files[id]; ok {
+	if _, ok := k.files[key]; ok {
 		k.mu.Unlock()
-		f.Close()
-		return
+		return f.Close()
 	}
 	if k.files == nil {
-		k.files = make(map[uint64]*list.Element)
+		k.files = make(map[keptKey]*list.Element)
 	}
 	var evicted billy.File
 	if len(k.files) >= keptMax {
 		evicted = k.evictLocked()
+		if evicted == nil {
+			k.mu.Unlock()
+			return f.Close()
+		}
 	}
-	e := &keptFile{id: id, f: f}
-	k.files[id] = k.lru.PushFront(e)
+	e := &keptFile{key: key, f: f}
+	k.files[key] = k.lru.PushFront(e)
 	e.timer = time.AfterFunc(k.idleTime(), func() { k.expire(e) })
 	k.mu.Unlock()
 	if evicted != nil {
-		evicted.Close()
+		return evicted.Close()
 	}
+	return nil
 }
 
-// with runs fn on id's kept file; ok is false when there is none.
-func (k *keptFiles) with(id uint64, fn func(billy.File) error) (ok bool, err error) {
+// with serializes fn on key's kept file; ok is false when there is none.
+func (k *keptFiles) with(key keptKey, fn func(billy.File) error) (ok bool, err error) {
 	k.mu.Lock()
-	el := k.files[id]
+	el := k.files[key]
 	if el == nil {
 		k.mu.Unlock()
 		return false, nil
@@ -89,7 +100,9 @@ func (k *keptFiles) with(id uint64, fn func(billy.File) error) (ok bool, err err
 	k.lru.MoveToFront(el)
 	k.mu.Unlock()
 
+	e.mu.Lock()
 	err = fn(e.f)
+	e.mu.Unlock()
 
 	k.mu.Lock()
 	e.users--
@@ -101,7 +114,7 @@ func (k *keptFiles) with(id uint64, fn func(billy.File) error) (ok bool, err err
 // expire closes e once it is idle.
 func (k *keptFiles) expire(e *keptFile) {
 	k.mu.Lock()
-	el := k.files[e.id]
+	el := k.files[e.key]
 	if el == nil || el.Value != e {
 		k.mu.Unlock()
 		return
@@ -112,7 +125,7 @@ func (k *keptFiles) expire(e *keptFile) {
 		return
 	}
 	k.lru.Remove(el)
-	delete(k.files, e.id)
+	delete(k.files, e.key)
 	k.mu.Unlock()
 	e.f.Close()
 }
@@ -124,7 +137,7 @@ func (k *keptFiles) evictLocked() billy.File {
 		if e := el.Value.(*keptFile); e.users == 0 {
 			e.timer.Stop()
 			k.lru.Remove(el)
-			delete(k.files, e.id)
+			delete(k.files, e.key)
 			return e.f
 		}
 	}

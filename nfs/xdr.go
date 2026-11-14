@@ -92,7 +92,15 @@ func (d *decoder) str(limit int) string { return string(d.opaque(limit)) }
 func (d *decoder) fh(limit int) (id uint64, ok bool) { return fileID(d.opaque(limit)) }
 
 // encoder appends XDR items to a reply.
-type encoder struct{ buf []byte }
+type encoder struct {
+	buf []byte
+
+	// NFSv3 reply state; nil for callback and test encoders.
+	sizes                     *clientReportedSizes
+	maxSizes                  *maxReportedSizes
+	sizeID, size              uint64
+	sizePending, sizeAccepted bool
+}
 
 // u32 appends an unsigned int, enum or bool discriminant.
 func (e *encoder) u32(v uint32) { e.buf = binary.BigEndian.AppendUint32(e.buf, v) }

@@ -43,11 +43,12 @@ const (
 )
 
 // v3State is what the server remembers between NFSv3 calls, a stateless
-// protocol: files kept writable for writes after their permission went
-// (keptFiles), and the verifiers of EXCLUSIVE creates.
+// protocol: cached writers and permission fallbacks (keptFiles), and the
+// verifiers of EXCLUSIVE creates.
 type v3State struct {
-	kept  keptFiles
-	verfs createVerfs
+	kept     keptFiles
+	verfs    createVerfs
+	maxSizes maxReportedSizes
 }
 
 // v3proc is an NFSv3 procedure. run appends the result after the NFS3_OK
@@ -105,6 +106,7 @@ func (s *Server) nfs3(c *call, res *encoder) acceptStat {
 		return rpcGarbageArgs
 	}
 	if st != stOK {
+		res.sizeAccepted = false
 		res.truncate(at)
 		res.u32(uint32(st))
 		for range p.fail / 4 {

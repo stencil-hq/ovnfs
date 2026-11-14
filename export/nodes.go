@@ -506,6 +506,32 @@ func (t *nodeTable) rename(from, to string) {
 	t.appeared(d, name)
 }
 
+// retireHandle retires id while leaving its directory entry available for a
+// fresh identity. The caller has already established that the entry exists.
+func (t *nodeTable) retireHandle(id uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	defer t.trimCache()
+	defer t.flush()
+	if id == t.root.id {
+		return false
+	}
+	n := t.byID[id]
+	if n == nil {
+		n = t.pageID(id)
+	}
+	if n == nil {
+		if d, name := t.resolve(id); d != nil {
+			n = t.child(d, name)
+		}
+	}
+	if n == nil || n.id != id {
+		return false
+	}
+	t.drop(n)
+	return true
+}
+
 // remove retires the ids of p's subtree.
 func (t *nodeTable) remove(p string) {
 	t.mu.Lock()

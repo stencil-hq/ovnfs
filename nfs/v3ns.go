@@ -115,7 +115,9 @@ func (s *Server) create3(d *decoder, res *encoder) status {
 		s.v3.verfs.put(fid, verf)
 	}
 	if perm&0o200 == 0 {
-		s.v3.kept.keep(fid, f)
+		if err := s.v3.kept.keep(keptKey{id: fid}, f); err != nil {
+			return statusOf(err)
+		}
 	} else if err := f.Close(); err != nil {
 		return statusOf(err)
 	}
@@ -139,12 +141,14 @@ func (s *Server) exists3(res *encoder, dir, p string, info os.FileInfo, how uint
 		}
 	case sa.setSize:
 		id := s.FS.FileID(p)
+		res.beginSize(id, sa.size)
 		s.Recall(id)
 		st := s.apply3(p, &sattr3{size: sa.size, setSize: true})
 		s.Recall(id)
 		if st != stOK {
 			return st
 		}
+		res.acceptSize()
 	}
 	return s.created3(res, dir, p)
 }

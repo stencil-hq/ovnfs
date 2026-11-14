@@ -70,9 +70,10 @@ type call struct {
 // conn is one client connection. Replies may go out in any order: each
 // carries its call's xid.
 type conn struct {
-	srv *Server
-	nc  net.Conn
-	wmu sync.Mutex // serializes replies
+	srv     *Server
+	nc      net.Conn
+	wmu     sync.Mutex // serializes replies
+	v3sizes clientReportedSizes
 	// v4client is the NFSv4 client last identified on this connection, for
 	// requests that name none (an NFSv4.0 client uses its own connections).
 	v4client atomic.Uint64
@@ -196,7 +197,11 @@ func (c *conn) answer(rec []byte, cl *call, e *encoder) {
 
 	rb := bufs.Get().(*[]byte)
 	defer putBuf(rb)
-	*e = encoder{buf: *rb}
+	*e = encoder{
+		buf:      *rb,
+		sizes:    &c.v3sizes,
+		maxSizes: &c.srv.v3.maxSizes,
+	}
 	e.u32(0) // record mark, set below
 	e.u32(xid)
 	e.u32(msgReply)
@@ -225,19 +230,21 @@ func (c *conn) answer(rec []byte, cl *call, e *encoder) {
 	}
 	e.put32(0, lastFragment|uint32(e.len()-4))
 	*rb = e.buf
-	c.send(e.buf)
+	sent := c.send(e.buf)
+	e.finishSize(sent)
 	cl.args = decoder{}
 	e.buf = nil
 }
 
 // send writes one reply record; a failed write closes the connection.
-func (c *conn) send(b []byte) {
+func (c *conn) send(b []byte) bool {
 	c.wmu.Lock()
 	_, err := c.nc.Write(b)
 	c.wmu.Unlock()
 	if err != nil {
 		c.nc.Close()
 	}
+	return err == nil
 }
 
 // dispatch answers a call, appending the result body to res, and returns the

@@ -178,6 +178,106 @@ func TestV3Lookup(t *testing.T) {
 	}
 }
 
+// TestV3SizeRegressionRetiresHandle checks that an unexpected shrink makes
+// the old handle stale, while a client-requested truncate preserves it.
+func TestV3SizeRegressionRetiresHandle(t *testing.T) {
+	fs := newTestFS(t)
+	fs.write(t, "f", "12345678")
+	addr := startServer(t, &Server{FS: fs, Concurrency: 4})
+	first, second := dial(t, addr), dial(t, addr)
+	id := fs.FileID("f")
+
+	getattr := func(c *rpcClient, id uint64) (status, wireAttr) {
+		t.Helper()
+		st, d := c.v3call(v3GetAttr, func(e *encoder) { e.fh(id) })
+		if st != stOK {
+			if len(d.buf) != 0 {
+				t.Fatalf("GETATTR failure %d has %d body bytes", st, len(d.buf))
+			}
+			return st, wireAttr{}
+		}
+		a := fattr3Of(d)
+		if d.err != nil || len(d.buf) != 0 {
+			t.Fatal("GETATTR: malformed reply")
+		}
+		return st, a
+	}
+	lookup := func(c *rpcClient) (uint64, wireAttr) {
+		t.Helper()
+		st, d := c.v3call(v3Lookup, func(e *encoder) { dirop(e, 1, "f") })
+		if st != stOK {
+			t.Fatalf("LOOKUP: %d", st)
+		}
+		id, ok := d.fh(maxFH3)
+		a, attrs := postOpOf(t, d)
+		if _, dirAttrs := postOpOf(t, d); !ok || !attrs || !dirAttrs || d.err != nil || len(d.buf) != 0 {
+			t.Fatal("LOOKUP: malformed reply")
+		}
+		return id, a
+	}
+
+	if st, a := getattr(first, id); st != stOK || a.size != 8 {
+		t.Fatalf("initial GETATTR: %d, size %d", st, a.size)
+	}
+	if err := os.Truncate(fs.host("f"), 3); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := getattr(first, id); st != stStale {
+		t.Fatalf("GETATTR after shrink: %d, want STALE", st)
+	}
+	if st, _ := getattr(second, id); st != stStale {
+		t.Fatalf("old handle on another connection: %d, want STALE", st)
+	}
+	next, a := lookup(first)
+	if next == id || a.size != 3 {
+		t.Fatalf("fresh lookup: id %d size %d, old id %d", next, a.size, id)
+	}
+	id = next
+
+	st, d := first.v3call(v3SetAttr, func(e *encoder) {
+		e.fh(id)
+		e.u32(0) // mode
+		e.u32(0) // uid
+		e.u32(0) // gid
+		e.bool(true)
+		e.u64(2)
+		e.u32(0) // atime
+		e.u32(0) // mtime
+		e.bool(false)
+	})
+	if st != stOK || !d.bool() {
+		t.Fatalf("SETATTR size: %d with absent pre-op attributes", st)
+	}
+	if size := d.u64(); size != 3 {
+		t.Fatalf("SETATTR pre-op size %d, want 3", size)
+	}
+	d.fixed(16) // pre-op mtime and ctime
+	post, ok := postOpOf(t, d)
+	if !ok || post.size != 2 || d.err != nil || len(d.buf) != 0 {
+		t.Fatalf("SETATTR post-op attributes %+v, present %v", post, ok)
+	}
+	if got, a := getattr(first, id); got != stOK || a.size != 2 {
+		t.Fatalf("requested shrink: %d, size %d", got, a.size)
+	}
+
+	if err := os.Truncate(fs.host("f"), 12); err != nil {
+		t.Fatal(err)
+	}
+	if got, a := getattr(first, id); got != stOK || a.size != 12 {
+		t.Fatalf("growth: %d, size %d", got, a.size)
+	}
+	if err := os.Truncate(fs.host("f"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := getattr(first, id); got != stStale {
+		t.Fatalf("second shrink: %d, want STALE", got)
+	}
+	fresh, a := lookup(first)
+	if fresh == id || a.size != 1 {
+		t.Fatalf("second fresh lookup: id %d size %d, old id %d", fresh, a.size, id)
+	}
+}
+
 // TestV3FailureBodies checks every procedure's failure arm: the status and
 // the discriminants of its absent attributes.
 func TestV3FailureBodies(t *testing.T) {
@@ -629,7 +729,7 @@ func TestV3WritesAfterOwnerWriteGoes(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
-	for srv.v3.kept.has(created) || srv.v3.kept.has(chmodded) {
+	for srv.v3.kept.has(keptKey{id: created}) || srv.v3.kept.has(keptKey{id: chmodded}) {
 		if time.Now().After(deadline) {
 			t.Fatal("kept files never expired")
 		}

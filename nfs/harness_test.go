@@ -80,6 +80,18 @@ func (f *testFS) Path(id uint64) (string, bool) {
 	return p, ok
 }
 
+// RetireHandle makes id stale while preserving its path for the next FileID.
+func (f *testFS) RetireHandle(id uint64) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.paths[id]
+	if !ok || p == "" {
+		return false
+	}
+	f.retireLocked(p)
+	return true
+}
+
 // Rename moves the ids of from and its descendants to to, retiring to's.
 func (f *testFS) Rename(from, to string) error {
 	if err := f.Filesystem.Rename(from, to); err != nil {

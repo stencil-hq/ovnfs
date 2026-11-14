@@ -12,18 +12,21 @@ import (
 
 // routerFile serializes file calls and redirects stale descriptors into the current upper.
 type routerFile struct {
-	mu     sync.Mutex
-	router *Router
-	co     string
-	path   string
-	name   string
-	flags  int
-	perm   os.FileMode
-	gen    uint64
-	offset int64
-	file   billy.File
-	closed bool
-	life   *routerLife
+	mu       sync.Mutex
+	router   *Router
+	co       string
+	path     string
+	name     string
+	flags    int
+	perm     os.FileMode
+	gen      uint64
+	offset   int64
+	file     billy.File
+	closed   bool
+	life     *routerLife
+	identity *nodeFS
+	id       uint64
+	unpin    func()
 }
 
 // routerFileInterface checks that generation-aware files provide all billy operations.
@@ -47,6 +50,22 @@ func (f *routerFile) current(op string, s *checkout.Session) error {
 	}
 	if s.Gen == f.gen {
 		return nil
+	}
+	if f.identity != nil {
+		name, ok := f.identity.nodes.path(f.id)
+		if !ok {
+			s.Done()
+			if err := f.identity.IdentityError(); err != nil {
+				return err
+			}
+			return &os.PathError{Op: op, Path: f.Name(), Err: os.ErrClosed}
+		}
+		co, p := splitRouterPath(name)
+		if co != f.co {
+			s.Done()
+			return &os.PathError{Op: op, Path: f.Name(), Err: os.ErrClosed}
+		}
+		f.path = p
 	}
 	// Creation and truncation are one-time open effects, never replayed at a freeze.
 	flags := f.flags &^ (os.O_CREATE | os.O_EXCL | os.O_TRUNC)
@@ -236,5 +255,8 @@ func (f *routerFile) Close() error {
 		return &os.PathError{Op: "close", Path: f.Name(), Err: os.ErrClosed}
 	}
 	f.closed = true
+	if f.unpin != nil {
+		defer f.unpin()
+	}
 	return f.file.Close()
 }
