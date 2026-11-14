@@ -101,6 +101,62 @@ failed checkout removal prints the `ovnfs rm` command to retry. Successful
 runs remove the temporary checkout and scratch files, leaving any daemon
 they started running.
 
+### Balanced configuration tuning
+
+`ovnfs tune` compares disposable daemons and mounts on the backing state's
+volume. It leaves the live daemon and user configuration alone during trials:
+
+```sh
+ovnfs tune
+ovnfs tune --project /path/to/cargo/workspace
+ovnfs tune --proto nfs --runs 1
+ovnfs --json tune
+```
+
+The search always includes the configured `serve` baseline, then the selected
+platform frontends, NFS transfer sizes of 16, 64, 128, 256 and 1024 KiB, and
+memory disabled versus the configured budget. Cargo trials also consider 256 MiB.
+Environment overrides constrain the search so an applied result is not silently
+overridden on restart. Existing fsync, atime and security policies are retained;
+NFS is excluded when switching to it would remove explicitly enabled fsync
+forwarding.
+
+Each configuration runs the same four I/O workloads as `bench`, artifact
+creation/write/rename/publication/removal, and directory/stat/fingerprint
+reads. Artifact publication uses real hard links or a byte-copy fallback where
+unsupported, reports which happened, and verifies the resulting bytes.
+`--project` adds real Cargo cold, no-op and touched-source incremental builds
+in disposable checkouts. Compiler wrappers are disabled, the original
+workspace's toolchain is retained, and Cargo runs locked/offline without
+automatic toolchain installation. Build scripts still execute normally.
+Existing target directories are hidden; the source checkout is not touched.
+Source snapshot identities must agree across trials or tuning aborts rather
+than comparing different code.
+
+The default is three samples (`--runs`); Cargo cold builds run once per
+configuration and warm phases use the sample count. `--timeout` bounds each
+configuration (default 2 min); native mount commands retain their 5 s deadlines.
+Workers and compiler children are killed on cancellation. Cleanup has a separate
+12 s budget, may force-detach only private trial mounts, and retains a failed
+cleanup's directory with its location rather than traversing a stalled mount.
+
+Ranking compares each workload with the configured baseline, normalizing I/O
+and metadata against their paired native measurements. By default, any workload
+regression exceeding 20% disqualifies a candidate (`--max-regression`).
+Gains are capped at 2x for scoring, the I/O/metadata/Cargo groups have equal
+weight, and the weakest workload also contributes half the score in log space.
+A candidate must beat the baseline score by 3%; ties keep the baseline.
+Thus a spectacular random-write win cannot conceal a slow metadata or Cargo
+path. This is the best measured configuration, not a guarantee for every workload.
+
+After reporting, the command asks `Apply? [y/N]`. Only `y` or `yes` activates
+the selected protocol, memory budget and NFS size, restarts the selected daemon,
+then atomically saves those three keys in `~/.o2/ovnfs.yml`, preserving unrelated
+settings and comments. Failed activation leaves that file unchanged. Concurrent
+edits to tuned keys are not overwritten. Protocol or option changes may force
+a remount and invalidate active checkout handles; finish those jobs first.
+EOF declines; `--json` reports only and never prompts or applies.
+
 ### Build comparisons
 
 `bench.sh REPO [TOUCH]` compares Cargo build times across ways of getting a

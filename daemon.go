@@ -87,7 +87,7 @@ func startDaemon(ctx context.Context, state, mount string) (*admin.Client, int, 
 		return nil, 0, err
 	}
 	defer lock.Close()
-	return spawnDaemon(ctx, state, mount)
+	return spawnDaemon(ctx, state, mount, nil)
 }
 
 // lockDaemon creates the state directory and waits for its start lock, held
@@ -104,8 +104,9 @@ func lockDaemon(state string) (*os.File, error) {
 	return lock, nil
 }
 
-// spawnDaemon is startDaemon for a caller that holds the start lock.
-func spawnDaemon(ctx context.Context, state, mount string) (*admin.Client, int, error) {
+// spawnDaemon starts under the caller's start lock; overrides let tune activate
+// a measured configuration before it is committed to the user's manifest.
+func spawnDaemon(ctx context.Context, state, mount string, overrides []string) (*admin.Client, int, error) {
 	state, err := filepath.Abs(state)
 	if err != nil {
 		return nil, 0, fmt.Errorf("resolving state %s: %w", state, err)
@@ -126,7 +127,11 @@ func spawnDaemon(ctx context.Context, state, mount string) (*admin.Client, int, 
 	if err != nil {
 		return nil, 0, fmt.Errorf("locating ovnfs binary: %w", err)
 	}
-	cmd := exec.Command(exe, "serve", "-state", state, "-mount", mount)
+	args := make([]string, 0, 5+len(overrides))
+	args = append(args, "serve", "-state", state, "-mount", mount)
+	args = append(args, overrides...)
+	cmd := exec.Command(exe, args...)
+	cmd.Dir = state // never retain a cwd inside a mount that restart may replace
 	cmd.Stdin = nil // exec connects a nil Stdin to the null device
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.SysProcAttr = detachedProcess()
@@ -371,7 +376,7 @@ func (cmd *restartCmd) Run(c *cli) error {
 			return err
 		}
 	}
-	client, pid, err := spawnDaemon(c.ctx, c.state, c.mount)
+	client, pid, err := spawnDaemon(c.ctx, c.state, c.mount, nil)
 	if err != nil {
 		return err
 	}

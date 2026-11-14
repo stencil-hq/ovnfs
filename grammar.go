@@ -105,41 +105,45 @@ func needsValue(name string) bool {
 // verbs is the kong grammar: one command per verb that takes its arguments from
 // it. The group of a command is its help section, printed in this order.
 type verbs struct {
-	Ls         lsCmd                     `cmd:"" group:"checkouts" help:"list checkouts (of DIR: . or a path with /), or one checkout's snapshots"`
-	New        newCmd                    `cmd:"" group:"checkouts" help:"open a checkout on a folder (default .), git revision, or snapshot"`
-	Run        runCmd                    `cmd:"" group:"checkouts" help:"run a command in a disposable checkout"`
-	Fork       forkCmd                   `cmd:"" group:"checkouts" help:"snapshot a checkout and open a second checkout on it"`
-	Snap       snapCmd                   `cmd:"" group:"checkouts" help:"freeze a checkout's changes into a snapshot"`
-	Diff       diffCmd                   `cmd:"" group:"checkouts" help:"list source changes since a snapshot (default: the base)"`
-	Apply      applyCmd                  `cmd:"" group:"checkouts" help:"merge a checkout's source changes back into its folder"`
-	Grep       grepCmd                   `cmd:"" group:"inspect" help:"search contents in the daemon, bypassing the checkout mount"`
-	Glob       globCmd                   `cmd:"" group:"inspect" help:"list matching paths in the daemon, bypassing the checkout mount"`
-	Explain    explainCmd                `cmd:"" group:"inspect" help:"show which class a path gets and which rule decided"`
-	Plan       planCmd                   `cmd:"" group:"inspect" help:"show what a launch elsewhere would transfer, rebuild and leave"`
-	Rm         rmCmd                     `cmd:"" group:"clean up" help:"remove a checkout and its unused snapshots"`
-	Prune      pruneCmd                  `cmd:"" group:"clean up" help:"remove matching checkouts and unused snapshots"`
-	Drop       dropCmd                   `cmd:"" group:"clean up" help:"release a snapshot"`
-	Attach     attachCmd                 `cmd:"" group:"other machines" help:"make a checkout appear on another machine over ssh; content moves on first read"`
-	Send       sendCmd                   `cmd:"" group:"other machines" help:"attach over ssh, first installing ovnfs there if missing; PATH there links to the checkout"`
-	Pull       pullCmd                   `cmd:"" group:"other machines" help:"merge attached remote source changes into the local checkout"`
-	Push       pushCmd                   `cmd:"" group:"other machines" help:"have attached machines fetch all content they still read from this one, so they work without it"`
-	Share      shareCmd                  `cmd:"" group:"other machines" help:"serve a checkout over remote-fs for a VM (vmon --remote-fs TAG:SOCK[:rw]) or a peer"`
-	Link       linkCmd                   `cmd:"" group:"other machines" help:"pipe an attach session from ssh into this machine's daemon (run by attach)"`
-	Status     statusCmd                 `cmd:"" group:"daemon" help:"show the running daemon"`
-	Start      startCmd                  `cmd:"" group:"daemon" help:"make sure the daemon runs, starting it in the background"`
-	Stop       stopCmd                   `cmd:"" group:"daemon" help:"stop the daemon"`
-	Restart    restartCmd                `cmd:"" group:"daemon" help:"stop the daemon and start a new one from this binary"`
-	Serve      serveCmd                  `cmd:"" group:"daemon" help:"run the daemon in the foreground"`
-	Subscribe  subscribeCmd              `cmd:"" group:"daemon" help:"stream daemon events as JSON lines until interrupted"`
-	Ctl        ctlCmd                    `cmd:"" group:"daemon" help:"send one raw admin request and print the raw reply"`
-	Profile    profileCmd                `cmd:"" group:"daemon" help:"capture a runtime profile from the daemon (cpu, heap, allocs, goroutine, block, mutex, threadcreate)"`
-	Bench      benchCmd                  `cmd:"" group:"daemon" help:"compare mounted ovnfs and disk I/O in under 30 seconds"`
-	BenchIO    benchIOCmd                `cmd:"" name:"bench-io" hidden:"" help:"internal benchmark I/O worker"`
-	Config     configCmd                 `cmd:"" group:"ovnfs itself" help:"get and set .o2/ovnfs.yml settings by key, as git config does"`
-	Version    versionCmd                `cmd:"" group:"ovnfs itself" help:"print the version and toolchain this binary was built from"`
-	Update     updateCmd                 `cmd:"" group:"ovnfs itself" help:"replace this binary with the latest ovnfs, by go install if it built it, else from the latest release"`
-	Mesh       meshCmd                   `cmd:"" group:"ovnfs itself" hidden:"" help:"removed"`
-	Completion kongcompletion.Completion `cmd:"" group:"ovnfs itself" help:"print the shell code that enables tab completion"`
+	Ls          lsCmd                     `cmd:"" group:"checkouts" help:"list checkouts (of DIR: . or a path with /), or one checkout's snapshots"`
+	New         newCmd                    `cmd:"" group:"checkouts" help:"open a checkout on a folder (default .), git revision, or snapshot"`
+	Run         runCmd                    `cmd:"" group:"checkouts" help:"run a command in a disposable checkout"`
+	Fork        forkCmd                   `cmd:"" group:"checkouts" help:"snapshot a checkout and open a second checkout on it"`
+	Snap        snapCmd                   `cmd:"" group:"checkouts" help:"freeze a checkout's changes into a snapshot"`
+	Diff        diffCmd                   `cmd:"" group:"checkouts" help:"list source changes since a snapshot (default: the base)"`
+	Apply       applyCmd                  `cmd:"" group:"checkouts" help:"merge a checkout's source changes back into its folder"`
+	Grep        grepCmd                   `cmd:"" group:"inspect" help:"search contents in the daemon, bypassing the checkout mount"`
+	Glob        globCmd                   `cmd:"" group:"inspect" help:"list matching paths in the daemon, bypassing the checkout mount"`
+	Explain     explainCmd                `cmd:"" group:"inspect" help:"show which class a path gets and which rule decided"`
+	Plan        planCmd                   `cmd:"" group:"inspect" help:"show what a launch elsewhere would transfer, rebuild and leave"`
+	Rm          rmCmd                     `cmd:"" group:"clean up" help:"remove a checkout and its unused snapshots"`
+	Prune       pruneCmd                  `cmd:"" group:"clean up" help:"remove matching checkouts and unused snapshots"`
+	Drop        dropCmd                   `cmd:"" group:"clean up" help:"release a snapshot"`
+	Attach      attachCmd                 `cmd:"" group:"other machines" help:"make a checkout appear on another machine over ssh; content moves on first read"`
+	Send        sendCmd                   `cmd:"" group:"other machines" help:"attach over ssh, first installing ovnfs there if missing; PATH there links to the checkout"`
+	Pull        pullCmd                   `cmd:"" group:"other machines" help:"merge attached remote source changes into the local checkout"`
+	Push        pushCmd                   `cmd:"" group:"other machines" help:"have attached machines fetch all content they still read from this one, so they work without it"`
+	Share       shareCmd                  `cmd:"" group:"other machines" help:"serve a checkout over remote-fs for a VM (vmon --remote-fs TAG:SOCK[:rw]) or a peer"`
+	Link        linkCmd                   `cmd:"" group:"other machines" help:"pipe an attach session from ssh into this machine's daemon (run by attach)"`
+	Status      statusCmd                 `cmd:"" group:"daemon" help:"show the running daemon"`
+	Start       startCmd                  `cmd:"" group:"daemon" help:"make sure the daemon runs, starting it in the background"`
+	Stop        stopCmd                   `cmd:"" group:"daemon" help:"stop the daemon"`
+	Restart     restartCmd                `cmd:"" group:"daemon" help:"stop the daemon and start a new one from this binary"`
+	Serve       serveCmd                  `cmd:"" group:"daemon" help:"run the daemon in the foreground"`
+	Subscribe   subscribeCmd              `cmd:"" group:"daemon" help:"stream daemon events as JSON lines until interrupted"`
+	Ctl         ctlCmd                    `cmd:"" group:"daemon" help:"send one raw admin request and print the raw reply"`
+	Profile     profileCmd                `cmd:"" group:"daemon" help:"capture a runtime profile from the daemon (cpu, heap, allocs, goroutine, block, mutex, threadcreate)"`
+	Bench       benchCmd                  `cmd:"" group:"daemon" help:"compare mounted ovnfs and disk I/O in under 30 seconds"`
+	BenchIO     benchIOCmd                `cmd:"" name:"bench-io" hidden:"" help:"internal benchmark I/O worker"`
+	Tune        tuneCmd                   `cmd:"" group:"daemon" help:"compare isolated mount configurations and optionally apply a balanced winner"`
+	TuneWork    tuneWorkCmd               `cmd:"" name:"tune-work" hidden:"" help:"internal tuning I/O and metadata worker"`
+	TuneCargo   tuneCargoCmd              `cmd:"" name:"tune-cargo" hidden:"" help:"internal tuning Cargo worker"`
+	TuneUnmount tuneUnmountCmd            `cmd:"" name:"tune-unmount" hidden:"" help:"internal tuning mount cleanup"`
+	Config      configCmd                 `cmd:"" group:"ovnfs itself" help:"get and set .o2/ovnfs.yml settings by key, as git config does"`
+	Version     versionCmd                `cmd:"" group:"ovnfs itself" help:"print the version and toolchain this binary was built from"`
+	Update      updateCmd                 `cmd:"" group:"ovnfs itself" help:"replace this binary with the latest ovnfs, by go install if it built it, else from the latest release"`
+	Mesh        meshCmd                   `cmd:"" group:"ovnfs itself" hidden:"" help:"removed"`
+	Completion  kongcompletion.Completion `cmd:"" group:"ovnfs itself" help:"print the shell code that enables tab completion"`
 }
 
 // newCLIParser loads serve defaults only for serve, including when both global

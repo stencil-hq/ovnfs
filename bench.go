@@ -190,30 +190,39 @@ type benchIOCmd struct {
 }
 
 // Run prepares identical files, alternates which filesystem runs first, and emits measurements.
-func (cmd *benchIOCmd) Run(c *cli) (err error) {
+func (cmd *benchIOCmd) Run(c *cli) error {
+	results, err := measureBenchFiles(c.ctx, cmd.Disk, cmd.Ovnfs)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(results)
+}
+
+// measureBenchFiles is shared by bench and tune's killable workers.
+func measureBenchFiles(ctx context.Context, disk, ovnfs string) (results []benchRow, err error) {
 	data := make([]byte, benchFileSize)
 	rng := rand.NewChaCha8([32]byte{1})
 	if _, err := rng.Read(data); err != nil {
-		return err
+		return nil, err
 	}
 	var files [2]*os.File
-	for i, dir := range []string{cmd.Disk, cmd.Ovnfs} {
+	for i, dir := range []string{disk, ovnfs} {
 		f, openErr := os.OpenFile(filepath.Join(dir, "io.bin"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 		if openErr != nil {
-			return openErr
+			return nil, openErr
 		}
 		defer func() { err = errors.Join(err, f.Close()) }()
 		files[i] = f
 		for offset := 0; offset < len(data); offset += benchBlockSize {
-			if err := c.ctx.Err(); err != nil {
-				return err
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
 			if _, err := f.Write(data[offset : offset+benchBlockSize]); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if err := f.Sync(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	buffer := make([]byte, benchBlockSize)
@@ -223,13 +232,13 @@ func (cmd *benchIOCmd) Run(c *cli) (err error) {
 		{name: "Random read (4 KiB)", block: 4096, random: true},
 		{name: "Random write (4 KiB)", block: 4096, write: true, random: true},
 	}
-	results := make([]benchRow, 0, len(workloads))
+	results = make([]benchRow, 0, len(workloads))
 	for i, workload := range workloads {
 		var measurements [2]benchMeasurement
 		for _, side := range []int{i % 2, 1 - i%2} {
-			measurements[side], err = measureBench(c.ctx, files[side], workload, data, buffer, benchSample)
+			measurements[side], err = measureBench(ctx, files[side], workload, data, buffer, benchSample)
 			if err != nil {
-				return fmt.Errorf("%s on %s: %w", workload.name, files[side].Name(), err)
+				return nil, fmt.Errorf("%s on %s: %w", workload.name, files[side].Name(), err)
 			}
 		}
 		results = append(results, benchRow{
@@ -237,7 +246,7 @@ func (cmd *benchIOCmd) Run(c *cli) (err error) {
 			Disk: measurements[0], Ovnfs: measurements[1], Ratio: measurements[1].MiBPS / measurements[0].MiBPS,
 		})
 	}
-	return json.NewEncoder(stdout).Encode(results)
+	return results, nil
 }
 
 // measureBench wraps within a fixed-size file; writes preserve its seeded bytes.
