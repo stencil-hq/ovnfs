@@ -642,6 +642,133 @@ func TestSweepKeepsBaseOfStayingDelta(t *testing.T) {
 	mustRead(t, reopen(t, s), delta, next)
 }
 
+// TestSweepInterruptedRewrite removes every copy of a dead delta after
+// interrupted rewrites, without losing live objects beside its shadow copies.
+func TestSweepInterruptedRewrite(t *testing.T) {
+	for _, restarted := range []bool{false, true} {
+		t.Run(fmt.Sprint("restarted=", restarted), func(t *testing.T) {
+			s := openStoreCache(t, 0)
+			old := time.Unix(100, 0)
+			baseData := prose(17, 100<<10)
+			base := putLikeFile(t, s, baseData, "")
+			age(t, s, base, old)
+			nextPack(t, s)
+			deltaData := edit(baseData, 1)
+			delta := putLikeFile(t, s, deltaData, base)
+			if s.packs.depth(rawOf(delta)) != 1 {
+				t.Fatal("edit not stored as a delta")
+			}
+			age(t, s, delta, old)
+			keepData := []byte("live beside the original delta")
+			keep, err := s.PutBytes(keepData)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nextPack(t, s)
+
+			// Stop two rewrites before their merge drops the original pack. One
+			// shadow is sealed and the other active; each shares its pack with a
+			// large fresh object, so its dead delta alone is below the threshold.
+			p := s.packs
+			v := &sweepView{p: p, srcs: p.sources()}
+			for _, x := range v.srcs {
+				v.offs = append(v.offs, v.total)
+				v.total += x.n
+			}
+			dead := make([]uint64, (v.total+63)/64)
+			e, _ := p.lookup(rawOf(delta))
+			bodies := map[OID][]byte{keep: keepData}
+			for copy := range 2 {
+				p.appendMu.Lock()
+				err := v.rewrite(e.pack, dead)
+				p.appendMu.Unlock()
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := prose(uint64(30+copy), 100<<10)
+				id, err := s.PutBytes(body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bodies[id] = body
+				if copy == 0 {
+					nextPack(t, s)
+				}
+			}
+			if restarted {
+				s = reopen(t, s)
+			}
+			mustRead(t, s, delta, deltaData)
+			if n, err := s.Sweep(nil, time.Unix(200, 0)); err != nil || n != 2 {
+				t.Fatalf("Sweep removed %d objects, %v; want the base and delta", n, err)
+			}
+			for _, st := range []*Store{s, reopen(t, s)} {
+				if st.Has(base) || st.Has(delta) {
+					t.Fatal("removed base or delta survived through a shadow copy")
+				}
+				for id, body := range bodies {
+					mustRead(t, st, id, body)
+				}
+			}
+		})
+	}
+}
+
+// TestPackFreshnessBatchOrder schedules an old flushing batch after a newer
+// pending batch, either on the same index or after a merge replaces it.
+func TestPackFreshnessBatchOrder(t *testing.T) {
+	for _, merged := range []bool{false, true} {
+		t.Run(fmt.Sprint("merged=", merged), func(t *testing.T) {
+			s := openStoreCache(t, 0)
+			body := []byte("refreshed in reordered batches")
+			id, err := s.PutBytes(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nextPack(t, s)
+			age(t, s, id, time.Unix(100, 0))
+			p := s.packs
+			r := rawOf(id)
+			if !p.touch(r, time.Unix(200, 0).UnixNano()) {
+				t.Fatal("sealed object not found")
+			}
+			// Model touch paused after publishing its batch but before
+			// flushBatch acquires flushMu, without timing or goroutines.
+			p.touchMu.Lock()
+			p.flushing, p.pending = p.pending, nil
+			p.touchMu.Unlock()
+			newest := time.Unix(300, 0).UnixNano()
+			if !p.touch(r, newest) {
+				t.Fatal("sealed object not found on refresh")
+			}
+			if merged {
+				p.appendMu.Lock()
+				err := p.merge(nil)
+				p.appendMu.Unlock()
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				p.flushMu.Lock()
+				p.touchMu.Lock()
+				p.flush()
+				p.touchMu.Unlock()
+				p.flushMu.Unlock()
+			}
+			p.flushBatch()
+			for _, st := range []*Store{s, reopen(t, s)} {
+				if got := packedObjects(st)[r].at; got != newest {
+					t.Errorf("freshness = %d, want %d", got, newest)
+				}
+				if n, err := st.Sweep(nil, time.Unix(250, 0)); err != nil || n != 0 {
+					t.Fatalf("Sweep removed %d objects, %v; want 0", n, err)
+				}
+				mustRead(t, st, id, body)
+			}
+		})
+	}
+}
+
 // TestOpenMigratesUnsortedIndex replaces the unsorted index an earlier release
 // wrote for a sealed pack with a sorted one at Open, keeping every object and
 // its freshness, and scans a pack whose old index is damaged.
@@ -737,11 +864,9 @@ func TestPackIndexMerge(t *testing.T) {
 	if merged == "" || idxs >= mergeAfter {
 		t.Fatalf("sealed indexes not merged: %v", files)
 	}
-	var first OID
-	for id := range bodies {
-		first = id
-		break
-	}
+	// Age an indexed object: active freshness lives only in memory and a
+	// reopen recovers its original frame timestamp instead.
+	first := s.packs.merged.id(0).oid()
 	old := time.Now().Add(-time.Hour)
 	age(t, s, first, old)
 	again := reopen(t, s)

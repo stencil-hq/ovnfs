@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
 
 	"github.com/stencil-hq/ovnfs/internal/durable"
 	"github.com/stencil-hq/ovnfs/internal/mapped"
@@ -143,11 +144,15 @@ func decodeSlot(b []byte, epoch uint64) nodeSlot {
 	}
 }
 
-// nodeIndex is an open logged node index. Its fields do not change after
-// open, so I/O uses it without the node mutex. Slots of resident keys are
+// nodeIndex is an open logged node index. Its locations do not change after
+// open, so I/O uses it without the node mutex. mu protects the files' lifetime:
+// an operation releases its read lock before reacquiring the node mutex, so
+// close may wait for I/O while holding that mutex. Slots of resident keys are
 // written only by their node's spills, eviction or close, and read only
 // while the key is cold, so no slot is read while it is written.
 type nodeIndex struct {
+	mu      sync.RWMutex
+	closed  bool
 	dir     string
 	table   *os.File
 	view    *mapped.File // the table, whose size never changes after the build; slots are read here
@@ -160,9 +165,9 @@ type nodeIndex struct {
 	epoch uint64
 }
 
-// locate returns the file and offset of key's slot, or false when no slot
-// can exist for it.
-func (x *nodeIndex) locate(key uint64) (*os.File, int64, bool, error) {
+// locateLocked returns the file and offset of key's slot, or false when no
+// slot can exist for it. The caller holds mu and has checked closed.
+func (x *nodeIndex) locateLocked(key uint64) (*os.File, int64, bool, error) {
 	if key >= x.base {
 		return x.runtime, int64(key-x.base) * slotSize, true, nil
 	}
@@ -185,9 +190,10 @@ func (x *nodeIndex) locate(key uint64) (*os.File, int64, bool, error) {
 	return nil, 0, false, nil
 }
 
-// slot reads key's slot; false means no record was ever written for it.
-func (x *nodeIndex) slot(key uint64) (nodeSlot, bool, error) {
-	f, off, ok, err := x.locate(key)
+// slotLocked reads key's slot; false means no record was ever written for it.
+// The caller holds mu and has checked closed.
+func (x *nodeIndex) slotLocked(key uint64) (nodeSlot, bool, error) {
+	f, off, ok, err := x.locateLocked(key)
 	if !ok || err != nil {
 		return nodeSlot{}, false, err
 	}
@@ -207,9 +213,10 @@ func (x *nodeIndex) slot(key uint64) (nodeSlot, bool, error) {
 	return s, s.key == key && s.length > 0, nil
 }
 
-// slotFile returns the file and offset of key's slot: in the runtime file,
-// at at in the table when at is known, or else wherever the table has it.
-func (x *nodeIndex) slotFile(key uint64, at int64) (*os.File, int64, error) {
+// slotFileLocked returns the file and offset of key's slot: in the runtime
+// file, at at in the table when known, or else wherever the table has it.
+// The caller holds mu and has checked closed.
+func (x *nodeIndex) slotFileLocked(key uint64, at int64) (*os.File, int64, error) {
 	if key >= x.base || at >= tableHeader {
 		f := x.table
 		if key >= x.base {
@@ -217,7 +224,7 @@ func (x *nodeIndex) slotFile(key uint64, at int64) (*os.File, int64, error) {
 		}
 		return f, at, nil
 	}
-	f, at, ok, err := x.locate(key)
+	f, at, ok, err := x.locateLocked(key)
 	if err == nil && !ok {
 		err = errNodeIndex
 	}
@@ -226,7 +233,12 @@ func (x *nodeIndex) slotFile(key uint64, at int64) (*os.File, int64, error) {
 
 // read returns key's record and slot.
 func (x *nodeIndex) read(key uint64) (rec loggedRecord, s nodeSlot, found bool, err error) {
-	s, found, err = x.slot(key)
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return rec, s, false, os.ErrClosed
+	}
+	s, found, err = x.slotLocked(key)
 	if !found || err != nil {
 		return rec, s, false, err
 	}
@@ -242,7 +254,12 @@ func (x *nodeIndex) read(key uint64) (rec loggedRecord, s nodeSlot, found bool, 
 // and, when rec is not nil, the record rec, first written at offset in
 // records.
 func (x *nodeIndex) publish(key uint64, at int64, rec []byte, offset int64, owner nodeOwner) error {
-	f, off, err := x.slotFile(key, at)
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return os.ErrClosed
+	}
+	f, off, err := x.slotFileLocked(key, at)
 	if err != nil {
 		return err
 	}
@@ -266,9 +283,25 @@ func (x *nodeIndex) publish(key uint64, at int64, rec []byte, offset int64, owne
 	return err
 }
 
-// close releases the index files; the next open reads their owner fields.
+// close waits for in-flight I/O and releases even a partially opened index.
+// Later operations fail without touching the unmapped table or closed files.
 func (x *nodeIndex) close() error {
-	return errors.Join(x.view.Close(), x.table.Close(), x.records.Close(), x.runtime.Close())
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.closed {
+		return nil
+	}
+	x.closed = true
+	var err error
+	if x.view != nil {
+		err = x.view.Close()
+	}
+	for _, f := range []*os.File{x.table, x.records, x.runtime} {
+		if f != nil {
+			err = errors.Join(err, f.Close())
+		}
+	}
+	return err
 }
 
 // loggedRecord is a logged node as its record describes it.
@@ -538,11 +571,7 @@ func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 	}
 	x.table, x.records, x.runtime = open("table"), open("records"), open("runtime")
 	if err != nil {
-		for _, f := range []*os.File{x.table, x.records, x.runtime} {
-			if f != nil {
-				f.Close()
-			}
-		}
+		x.close()
 		return err
 	}
 	fail := func(err error) error {
@@ -693,14 +722,7 @@ func (t *nodeTable) adoptIndex(h *ownersHeader, prior *priorIndex) error {
 	x.table, x.records, x.runtime = open("table"), open("records"), open("runtime")
 	var pack *ownerPack
 	fail := func(err error) error {
-		for _, f := range []*os.File{x.table, x.records, x.runtime} {
-			if f != nil {
-				f.Close()
-			}
-		}
-		if x.view != nil {
-			x.view.Close()
-		}
+		x.close()
 		if pack != nil {
 			pack.close()
 		}
@@ -1035,6 +1057,11 @@ func (t *nodeTable) slotWritten(key uint64) {
 // the index (syncIndex) before the manifest.
 func (t *nodeTable) saveIndex() error {
 	x := t.index
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return os.ErrClosed
+	}
 	var keys []uint64
 	for key, d := range t.byKey {
 		if s := d.state(); s.stale || ownerOf(s) != s.loaded {
@@ -1059,7 +1086,7 @@ func (t *nodeTable) saveIndex() error {
 		d := t.byKey[key]
 		s := d.dir
 		owner := ownerOf(s)
-		f, at, err := x.slotFile(key, s.slot)
+		f, at, err := x.slotFileLocked(key, s.slot)
 		if err != nil {
 			return err
 		}
@@ -1112,6 +1139,11 @@ func (t *nodeTable) saveIndex() error {
 // directories naming them. The caller holds mu, with no index write running.
 func (t *nodeTable) syncIndex() error {
 	x := t.index
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return os.ErrClosed
+	}
 	type flush struct {
 		f   func() error
 		err error

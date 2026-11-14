@@ -573,8 +573,6 @@ func buildCaptureTree(res *source.Result) (*captureTree, error) {
 			}
 		}
 	}
-	// A tracked path's ancestors below its repository's root are tracked by the
-	// same repository: no other one answers for them.
 	t.repo = make([]uint16, n)
 	if res.Domains != nil {
 		ids := map[string]uint16{}
@@ -585,11 +583,8 @@ func buildCaptureTree(res *source.Result) (*captureTree, error) {
 			ids[r.Path] = uint16(i + 1)
 		}
 		for p, repo := range res.Domains.Tracked() {
-			id := ids[repo]
 			j, _ := slices.BinarySearch(t.paths, p)
-			for ; id != 0 && t.repo[j] == 0 && t.paths[j] != repo; j = int(parents[j]) {
-				t.repo[j] = id
-			}
+			t.repo[j] = ids[repo]
 		}
 	}
 	// Bucket children by parent, in path order (which is name order), then

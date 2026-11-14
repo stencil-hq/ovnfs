@@ -37,7 +37,7 @@ func ownerHead(t *testing.T, nt *nodeTable, key uint64) int64 {
 		}
 		return d.dir.base
 	}
-	s, _, err := nt.index.slot(key)
+	_, s, _, err := nt.index.read(key)
 	if err != nil || s.key != key || s.owner.size == 0 {
 		t.Fatalf("key %d has no owner index: %v", key, err)
 	}

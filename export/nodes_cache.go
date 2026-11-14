@@ -70,7 +70,11 @@ func (t *nodeTable) guard(all bool, paths ...string) (func(), error) {
 			}
 		}
 	}
-	releasePaths, err := t.keepPaths(recoverOwners, paths...)
+	how := recoverOwners
+	if all {
+		how = recoverDirectoryOwners
+	}
+	releasePaths, err := t.keepPaths(how, paths...)
 	if err != nil {
 		releasePaths.release()
 		t.mu.Unlock()

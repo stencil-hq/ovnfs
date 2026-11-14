@@ -1,13 +1,127 @@
 package export
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestNodeIndexCloseWaitsForReaders(t *testing.T) {
+	ns := newNamespace("co/file")
+	log := filepath.Join(t.TempDir(), "nodes.log")
+	nt := openLogged(t, log, ns)
+	nt.id("co/file")
+	key := nt.find("co").key
+	closeLogged(t, nt)
+	nt = openLogged(t, log, ns)
+	x := nt.index
+
+	// Hold the same lifetime lease as a mapped read. Wait until close queues
+	// its exclusive lock, without pausing production I/O through a test hook.
+	x.mu.RLock()
+	held := true
+	defer func() {
+		if held {
+			x.mu.RUnlock()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- nt.close() }()
+	deadline := time.After(2 * time.Second)
+	for x.mu.TryRLock() {
+		x.mu.RUnlock()
+		select {
+		case err := <-done:
+			t.Fatalf("close did not wait for the mapped reader: %v", err)
+		case <-deadline:
+			t.Fatal("close did not reach the index")
+		default:
+			runtime.Gosched()
+		}
+	}
+	if slot, found, err := x.slotLocked(key); err != nil || !found || slot.key != key {
+		t.Fatalf("in-flight mapped read failed: found=%t slot=%+v err=%v", found, slot, err)
+	}
+	x.mu.RUnlock()
+	held = false
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close did not finish after its mapped reader")
+	}
+
+	// Both table and runtime accessors reject late work before using any
+	// file, including publication paths which locate a slot through the map.
+	for _, k := range []uint64{key, x.base} {
+		if _, _, _, err := x.read(k); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("record after close: %v", err)
+		}
+		if err := x.publish(k, 0, nil, 0, nodeOwner{}); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("publication after close: %v", err)
+		}
+	}
+	if id := nt.id("co/file"); id != 0 || nt.cacheErr == nil {
+		t.Fatal("late request did not fail closed")
+	}
+}
+
+func TestNodeIndexClosePartial(t *testing.T) {
+	for opened := 0; opened <= 3; opened++ {
+		t.Run(fmt.Sprint(opened), func(t *testing.T) {
+			x := &nodeIndex{}
+			files := []**os.File{&x.table, &x.records, &x.runtime}
+			for _, f := range files[:opened] {
+				var err error
+				*f, err = os.CreateTemp(t.TempDir(), "index-")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Construction failures reach close before mapped.Open succeeds.
+			if err := x.close(); err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range files[:opened] {
+				if _, err := (*f).Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("partial construction leaked a file: %v", err)
+				}
+			}
+			if err := x.close(); err != nil {
+				t.Fatalf("repeated close: %v", err)
+			}
+		})
+	}
+}
+
+func TestKnownNameGuardRestoresOnlyItsHash(t *testing.T) {
+	ns := newNamespace("co/" + collideA)
+	nt := newNodeTable(ns.list)
+	defer nt.close()
+	nt.id("co/" + collideA)
+	for i := range 64 {
+		p := fmt.Sprintf("co/unrelated-%d", i)
+		ns.add(p)
+		nt.id(p)
+	}
+	forceCold(t, nt, ns, "co")
+	release, err := nt.guard(false, "co/"+collideB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	d := nt.find("co")
+	if !d.leaf(collideA) || len(d.dir.leaves) != 1 {
+		t.Fatalf("known-name guard restored %d owners", len(d.dir.leaves))
+	}
+}
 
 func TestIndexWriteDoesNotHoldNodeMutex(t *testing.T) {
 	ns := newNamespace("co/file", "other/file", "pressure/entry")

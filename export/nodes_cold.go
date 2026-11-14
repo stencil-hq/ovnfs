@@ -34,10 +34,11 @@ import (
 // once its extensions outgrow its base, so a directory's segments, live and
 // superseded, stay within a few times its live size. Lookups binary-search
 // the chain through a memory map of the pack under the node mutex: a cold
-// name costs a few page reads and no heap, and no directory is ever loaded
-// whole. Resident state overrides the chain, whose owners an operation
-// admits one name at a time. The segments merges superseded stay in the
-// pack until an open rebuilds it (rebuildReason).
+// name costs a few page reads and no heap. Resident state overrides the
+// chain, whose owners a known-name operation admits one hash at a time;
+// generated-name mutations retain every owner in their destination instead.
+// Segments superseded by merges stay in the pack until an open rebuilds it
+// (rebuildReason).
 
 // errOwnerIndex reports an owner index segment that contradicts itself.
 var errOwnerIndex = errors.New("invalid owner index")
@@ -614,8 +615,9 @@ func (t *nodeTable) pagePaths(paths ...string) (*pathPins, error) {
 type recovery int
 
 const (
-	pageLogged    recovery = iota // the logged nodes
-	recoverOwners                 // also each name's cold owner
+	pageLogged             recovery = iota // the logged nodes
+	recoverOwners                          // also each name's cold owner
+	recoverDirectoryOwners                 // also all owners of the destination directory
 )
 
 // pathPins retains directory state while an operation may release the node mutex.
@@ -646,7 +648,8 @@ func (p *pathPins) release() {
 // in their cold logged nodes, which releases the mutex, restarting from the
 // root after each. With recoverOwners it also admits each name's issued cold
 // owner as a leaf, and checks the index of a directory a path ends in, so a
-// fault rejects a mutation before it changes the namespace.
+// fault rejects a mutation before it changes the namespace. Generated names
+// use recoverDirectoryOwners to retain every possible destination hash.
 func (t *nodeTable) keepPaths(how recovery, paths ...string) (*pathPins, error) {
 	pins := pathPinPool.Get().(*pathPins)
 	for failures := 0; failures < 16; {
@@ -660,8 +663,14 @@ func (t *nodeTable) keepPaths(how recovery, paths ...string) (*pathPins, error) 
 				}
 				name, rest, _ := strings.Cut(p, "/")
 				p = rest
-				if how == recoverOwners {
-					if err := t.recoverOwner(d, name); err != nil {
+				if how != pageLogged {
+					var err error
+					if how == recoverDirectoryOwners && name == "" {
+						err = t.recoverDirectory(d)
+					} else {
+						err = t.recoverOwner(d, name)
+					}
+					if err != nil {
 						return pins, err
 					}
 				}
@@ -727,6 +736,32 @@ func (t *nodeTable) recoverOwner(d *node, name string) error {
 		return syscall.ENOSPC
 	default:
 		t.addLeaf(d, string(owner))
+	}
+	return nil
+}
+
+// recoverDirectory makes every cold owner and retirement resident before a
+// generated-name mutation. Its pinned state then needs no index read to
+// record a collision, even if an unrelated directory faults during backend I/O.
+func (t *nodeTable) recoverDirectory(d *node) error {
+	rows, _, ok := t.coldRows(d)
+	if !ok {
+		return t.cacheErr
+	}
+	for _, r := range rows {
+		if t.takenResident(d, r.hash) {
+			continue
+		}
+		if r.name == nil {
+			if d.dir.retire(r.hash) {
+				t.charge(d, retiredBytes)
+			}
+		} else {
+			if t.spillErr != nil {
+				return syscall.ENOSPC
+			}
+			t.addLeaf(d, string(r.name))
+		}
 	}
 	return nil
 }

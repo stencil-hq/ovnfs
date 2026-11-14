@@ -523,9 +523,9 @@ func (v *sweepView) follow(id rawID, descend func(rawID) bool) error {
 	return nil
 }
 
-// removals finds the records the Sweep removes, as a bit set over the view,
-// and the packs that lose them. live must be closed under dependencies, as
-// keepBases leaves it.
+// removals finds the canonical records the Sweep removes, as a bit set over
+// the view, and every pack holding a copy of them. live must be closed under
+// dependencies, as keepBases leaves it.
 func (v *sweepView) removals() ([]uint64, map[uint32]bool, error) {
 	dead := make([]uint64, (v.total+63)/64)
 	indexed := map[uint32]int64{}
@@ -595,8 +595,25 @@ func (v *sweepView) removals() ([]uint64, map[uint32]bool, error) {
 				return true
 			})
 		})
-		if err != nil || !changed {
-			return dead, victims, err
+		if err != nil {
+			return nil, nil, err
+		}
+		if !changed {
+			// An interrupted rewrite can leave shadow copies in later
+			// indexes or the active pack. Once an id is removed, every
+			// pack holding it must be rewritten, even below the threshold,
+			// or merging without its canonical pack resurrects a shadow.
+			// rewrite copies only surviving canonical records, so these
+			// extra victims preserve live objects without copying shadows.
+			v.eachDead(dead, func(k, i int) {
+				id := v.srcs[k].id(i)
+				for _, x := range v.srcs[k+1:] {
+					if j, ok := x.find(id); ok {
+						victims[x.entry(j).pack] = true
+					}
+				}
+			})
+			return dead, victims, nil
 		}
 	}
 }

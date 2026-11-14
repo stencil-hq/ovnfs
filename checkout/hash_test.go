@@ -459,6 +459,56 @@ func TestSnapshotKeepsNestedEmptyDirectories(t *testing.T) {
 	}
 }
 
+// TestSnapshotKeepsOuterTrackedNestedRepository preserves outer tracking at a
+// nested repository's root without letting it override the inner file rules.
+func TestSnapshotKeepsOuterTrackedNestedRepository(t *testing.T) {
+	isolateGit(t)
+	dir := folder(t, map[string]string{
+		".gitignore":            "nested/\n",
+		"nested/.gitignore":     "outer-only.txt\n",
+		"nested/source.txt":     "captured\n",
+		"nested/keep.txt":       "unchanged\n",
+		"nested/outer-only.txt": "outer tracked, inner ignored\n",
+	})
+	gitRun(t, dir, "init", "-q", "-b", "main")
+	gitRun(t, dir, "add", "-f", ".gitignore", "nested/source.txt", "nested/keep.txt", "nested/outer-only.txt")
+	gitRun(t, dir, "commit", "-qm", "outer")
+	nested := filepath.Join(dir, "nested")
+	gitRun(t, nested, "init", "-q", "-b", "main")
+	gitRun(t, nested, "add", ".gitignore", "source.txt", "keep.txt")
+	gitRun(t, nested, "commit", "-qm", "inner")
+
+	f := newFixture(t)
+	f.newCheckout(dir, "c")
+	for _, phase := range []string{"captured", "reopened"} {
+		if phase == "reopened" {
+			if err := f.reg.Close(); err != nil {
+				t.Fatal(err)
+			}
+			f.open()
+		}
+		content := phase + " edit\n"
+		f.put("c", "nested/source.txt", content)
+		reply, err := f.reg.Snap(context.Background(), api.SnapArgs{Checkout: "c", Wait: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		files, err := f.reg.store.Flatten(store.OID(reply.Snapshot.Tree))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for p, body := range map[string]string{"nested/source.txt": content, "nested/keep.txt": "unchanged\n"} {
+			want := store.File{Mode: store.ModeFile, ID: store.HashBytes("blob", []byte(body))}
+			if files[p] != want {
+				t.Errorf("%s: %s = %+v, want %+v", phase, p, files[p], want)
+			}
+		}
+		if _, ok := files["nested/outer-only.txt"]; ok {
+			t.Errorf("%s: outer tracking overrode the nested repository's ignore rules", phase)
+		}
+	}
+}
+
 // TestSnapshotStoresEditAsDelta bounds history growth across edits and renames,
 // including replaced destinations, directory moves whose source sorts first,
 // and saves that write a temporary file and rename it over the target.

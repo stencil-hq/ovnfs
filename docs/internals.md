@@ -154,13 +154,16 @@ following each dependency once per sweep. It waits for running captures and,
 without holding up reads or other writes, for chunked ingests in flight, and
 replaces `store/epoch` before it removes anything; a folder's stat cache trusts its
 object ids without checking the store only while that epoch is unchanged. A
-pack is rewritten, its live frames copied without recompressing, only once a
-quarter of it is garbage.
+pack is normally rewritten, its live frames copied without recompressing, once a
+quarter of it is garbage. Removing an object also rewrites every pack holding
+a shadow copy from an interrupted rewrite, even below that threshold, so a
+restart cannot restore collected objects.
 Pack lookups binary-search memory-mapped index files sorted by object id, so
 the index costs page cache rather than daemon memory; only the pack being
 appended to is indexed in memory, and it is sealed at 32 MiB or 16384
 objects. Storing an object again records its freshness in its index file,
-in batches of 4096. Collection marks live objects in a bitmap over the index
+in batches of 4096. Freshness never moves backward when an index merge
+overtakes an older batch. Collection marks live objects in a bitmap over the index
 records and walks trees in place, so its peak memory grows by a bit per object
 plus the ids of loose objects. Indexes written by releases before sorted
 indexes are rewritten sorted when the store opens.
@@ -302,7 +305,9 @@ tracked-path facts read its `capture.idx` through a read-only mapping, whose
 pages the kernel shares with its file cache and can drop at any time. A path is
 found through a hash table of full paths, a directory lists as one contiguous
 range of children sorted by name, and git indexes are read only while a capture
-runs.
+runs. Tracking includes ancestor directories under the repository that answers
+their facts: a nested repository's root keeps its outer repository's tracking,
+while paths below it use the nested repository's facts.
 
 Small store blobs (at most 1 MiB) are served from a second budget
 (`--blob-cache`, default 16 MiB) instead of their object files. `ovnfs status` shows both. A
@@ -344,10 +349,12 @@ extensions would outgrow its base or it spans four segments, so a directory's
 live and superseded segments stay within a few times its live size. Lookups
 binary-search the chain through a read-only memory map of the pack under the
 node mutex: a cold name costs a few page reads and no heap, the pages belong to
-the file cache rather than the daemon's footprint, and no directory is ever
-loaded whole. An operation admits only the names it touches: a lookup the name
-itself, a mutation whatever owns or retired the hash of the name it changes, so
-that the change can complete from memory even after an index fault.
+the file cache rather than the daemon's footprint, and ordinary lookups never
+load a directory whole. A known-name operation admits only the names it
+touches: a lookup the name itself, a mutation whatever owns or retired the hash
+of the name it changes, so that the change can complete from memory even after
+an index fault. A generated-name mutation temporarily retains every owner and
+retired hash in its destination directory until its identity bookkeeping ends.
 
 Logged ids page out too, to an index `nodes.log.cache/nodes-*`: a record per
 logged key with its id, parent key and name, its logged children and the logged
@@ -368,8 +375,10 @@ uses its ancestors, so they leave last, and the root never does. A node whose
 record changed while resident (a creation, move or removal below or of it) has
 it appended to the index's `records` file when it leaves; eviction never
 renames, reuses or retires an id. Slots of the keys the index was built with
-are read through a memory map of the table. Removing a directory logs the
-removal without paging in its cold subtree: a record is only paged in under a
+are read through a memory map of the table. A lifetime lock lets in-flight I/O
+finish before close unmaps the table; later requests fail without touching
+closed files. Removing a directory logs the removal without paging in its cold
+subtree: a record is only paged in under a
 parent that still names it, so its descendants stop resolving at once, and
 their owner indexes are discounted from the live index size a batch per
 operation. A record that cannot be read or contradicts its parent latches the

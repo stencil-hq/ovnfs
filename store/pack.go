@@ -431,9 +431,9 @@ func (p *packSet) loadIdx(n uint32, size int64) *idxFile {
 	return x
 }
 
-// scan indexes the frames of pf from its start as the active pack's,
-// returning the length of its intact prefix; objects already indexed keep
-// that entry.
+// scan indexes the first frame of each object in pf as the active pack's,
+// returning the length of its intact prefix. Shadows of earlier indexes stay
+// recorded so Sweep can remove their bytes before they become canonical.
 func (p *packSet) scan(pf *packFile) (int64, error) {
 	r := bufio.NewReaderSize(io.NewSectionReader(pf.f, 0, 1<<62), 1<<20)
 	var off int64
@@ -460,7 +460,7 @@ func (p *packSet) scan(pf *packFile) (int64, error) {
 			return off, nil
 		}
 		e.pack, e.off = pf.n, uint32(off)
-		if _, _, _, dup := p.locate(id); !dup {
+		if _, dup := p.entries[id]; !dup {
 			if e.flags&frameManifest != 0 && checkManifest(id, frame) != nil {
 				return off, nil
 			}

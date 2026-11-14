@@ -187,17 +187,16 @@ func (d *Domains) open(r Repo, repo *git.Repo, index git.Index, tracked Tracked)
 	return nil
 }
 
-// Tracked yields every root-relative path that is tracked by the repository
-// answering its facts (see For), with that repository's root-relative path,
-// from the indexes read so far; directories holding tracked paths are left out.
+// Tracked yields tracked files and their ancestor directories from the indexes
+// read so far, paired with the repository answering their facts (see For).
+// This preserves outer tracking at a nested repository's root.
 func (d *Domains) Tracked() iter.Seq2[string, string] {
 	return func(yield func(p, repo string) bool) {
 		d.mu.RLock()
 		list := slices.Clone(d.list)
 		d.mu.RUnlock()
 		for _, dom := range list {
-			for _, e := range dom.index.Entries {
-				p := e.Path
+			for p := range dom.at {
 				if dom.path != "" {
 					p = dom.path + "/" + p
 				}

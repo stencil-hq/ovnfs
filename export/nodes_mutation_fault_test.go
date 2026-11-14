@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -21,8 +22,9 @@ func (f *faultFile) Close() error { f.closes++; return f.File.Close() }
 
 type faultCreateFS struct {
 	billy.Filesystem
-	after func()
-	file  *faultFile
+	after    func()
+	file     *faultFile
+	tempName string
 }
 
 func (f *faultCreateFS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, error) {
@@ -35,7 +37,13 @@ func (f *faultCreateFS) OpenFile(name string, flag int, perm os.FileMode) (billy
 	return f.file, nil
 }
 func (f *faultCreateFS) TempFile(dir, prefix string) (billy.File, error) {
-	file, err := f.Filesystem.TempFile(dir, prefix)
+	var file billy.File
+	var err error
+	if f.tempName != "" {
+		file, err = f.Filesystem.OpenFile(path.Join(dir, f.tempName), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	} else {
+		file, err = f.Filesystem.TempFile(dir, prefix)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +74,96 @@ func TestLateCreateFaultClosesResult(t *testing.T) {
 				t.Fatal("late fault did not close the unpublished descriptor exactly once")
 			}
 		})
+	}
+}
+
+// TestTempFileCollisionAfterLateFault forces a generated name to collide with
+// a cold owner or retirement, then faults before creation bookkeeping. The
+// committed entry must be logged even though the caller gets no descriptor.
+func TestTempFileCollisionAfterLateFault(t *testing.T) {
+	for _, dir := range []string{"", "co/deep"} {
+		for _, retired := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/retired=%t", dir, retired), func(t *testing.T) {
+				n := newMetadataTestFS(t)
+				backend := n.Filesystem
+				owner, generated := path.Join(dir, collideA), path.Join(dir, collideB)
+				for _, p := range []string{owner, "pressure/entry"} {
+					parent, _ := split(p)
+					if err := backend.MkdirAll(parent, 0755); err != nil {
+						t.Fatal(err)
+					}
+					f, err := backend.Create(p)
+					if err != nil {
+						t.Fatal(err)
+					}
+					f.Close()
+				}
+				log := filepath.Join(t.TempDir(), "nodes.log")
+				nt, err := openNodeTable(log, backend.ReadDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { nt.close() })
+				n.nodes = nt
+				old := nt.id(owner)
+				if old == 0 || old&derivedBit == 0 {
+					t.Fatal("fixture did not issue a derived owner")
+				}
+				key := nt.find(dir).key
+				if retired {
+					if err := n.Remove(owner); err != nil {
+						t.Fatal(err)
+					}
+				}
+				nt.cacheLimit = 0
+				nt.id("pressure/entry")
+				ownerHead(t, nt, key)
+				if d := nt.find(dir); d != nil && nt.takenResident(d, nameHash(collideB)) {
+					t.Fatal("fixture kept collision ownership resident")
+				}
+				nt.cacheLimit = 1 << 20
+				fs := &faultCreateFS{Filesystem: backend, tempName: collideB, after: func() {
+					// Pressure during backend I/O must not evict the guarded owners.
+					nt.cacheLimit = 0
+					nt.id("pressure/entry")
+					nt.mu.Lock()
+					nt.cacheFailure(os.ErrPermission)
+					nt.mu.Unlock()
+				}}
+				n.Filesystem = fs
+				file, err := n.TempFile(dir, collideB)
+				if file != nil || !errors.Is(err, syscall.EIO) {
+					t.Fatalf("returned file %v, error %v", file, err)
+				}
+				if fs.file == nil || fs.file.closes != 1 {
+					t.Fatal("late fault did not close the created descriptor exactly once")
+				}
+				if _, err := backend.Lstat(generated); err != nil {
+					t.Fatalf("backend did not commit generated name: %v", err)
+				}
+				if nt.close() == nil {
+					t.Fatal("fault disappeared")
+				}
+				if !retired {
+					// With only the generated name left, an unlogged collision
+					// would let the old handle resolve to the new file on replay.
+					if err := backend.Remove(owner); err != nil {
+						t.Fatal(err)
+					}
+				}
+				reopened, err := openNodeTable(log, backend.ReadDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				nt = reopened
+				if got := pathOf(t, nt, old); got != "<stale>" {
+					t.Fatalf("old handle aliased generated file after reopen: %s", got)
+				}
+				if fresh := nt.id(generated); fresh == 0 || fresh == old || fresh&derivedBit != 0 {
+					t.Fatalf("committed collision was not logged: %x", fresh)
+				}
+			})
+		}
 	}
 }
 

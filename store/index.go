@@ -317,8 +317,10 @@ const freshGap = 4096
 
 // writeUpdates writes updates to their index files, coalescing those within
 // freshGap bytes of each other into one write of the span between them; the
-// unchanged values in a span are copied from the file. Only one writer may
-// update an index file's freshness at a time.
+// unchanged values in a span are copied from the file. Updates only raise
+// freshness: a delayed batch may resolve an index already updated or merged
+// with a newer batch. Only one writer may update an index file's freshness at
+// a time.
 func writeUpdates(updates []freshUpdate) {
 	slices.SortFunc(updates, func(a, b freshUpdate) int {
 		if a.x != b.x {
@@ -337,7 +339,9 @@ func writeUpdates(updates []freshUpdate) {
 		}
 		buf = append(buf[:0], x.fresh[8*first:8*(last+1)]...)
 		for _, u := range updates[k:end] {
-			binary.LittleEndian.PutUint64(buf[8*(u.i-first):], uint64(u.at))
+			b := buf[8*(u.i-first):]
+			at := max(u.at, int64(binary.LittleEndian.Uint64(b)))
+			binary.LittleEndian.PutUint64(b, uint64(at))
 		}
 		x.writeFresh(first, buf)
 		k = end
