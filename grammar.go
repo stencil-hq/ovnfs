@@ -133,6 +133,8 @@ type verbs struct {
 	Subscribe  subscribeCmd              `cmd:"" group:"daemon" help:"stream daemon events as JSON lines until interrupted"`
 	Ctl        ctlCmd                    `cmd:"" group:"daemon" help:"send one raw admin request and print the raw reply"`
 	Profile    profileCmd                `cmd:"" group:"daemon" help:"capture a runtime profile from the daemon (cpu, heap, allocs, goroutine, block, mutex, threadcreate)"`
+	Bench      benchCmd                  `cmd:"" group:"daemon" help:"compare mounted ovnfs and disk I/O in under 30 seconds"`
+	BenchIO    benchIOCmd                `cmd:"" name:"bench-io" hidden:"" help:"internal benchmark I/O worker"`
 	Config     configCmd                 `cmd:"" group:"ovnfs itself" help:"get and set .o2/ovnfs.yml settings by key, as git config does"`
 	Version    versionCmd                `cmd:"" group:"ovnfs itself" help:"print the version and toolchain this binary was built from"`
 	Update     updateCmd                 `cmd:"" group:"ovnfs itself" help:"replace this binary with the latest ovnfs, by go install if it built it, else from the latest release"`

@@ -65,6 +65,44 @@ publish `v<version>` tags.
 
 ## Benchmark
 
+### Quick I/O comparison
+
+`ovnfs bench [DIR]` compares the active ovnfs mount with a native disk
+directory, normally in about 10 seconds. Without DIR, disk scratch files live
+in the daemon's state directory, on the same volume as its backing files.
+DIR selects another existing directory; a directory inside the ovnfs mount
+is rejected. The daemon starts automatically if needed.
+
+```sh
+ovnfs bench
+ovnfs bench /path/on/another/disk
+ovnfs --json bench
+```
+
+Each side gets a 32 MiB file of identical pseudorandom data. Four workloads
+run for 750 ms per side: sequential reads and writes in 1 MiB blocks, then
+random reads and writes in 4 KiB blocks. Operations are single-threaded,
+queue depth one, with the same random-offset seed and alternating which
+filesystem runs first. Writes include a final `fsync` in their timing.
+
+Output reports MiB/s, IOPS, and ovnfs throughput divided by disk throughput
+(higher is better). The normal CLI palette highlights workloads and ratios;
+`--color` and `NO_COLOR` control it as for other commands.
+These are **buffered filesystem measurements**, not raw
+device speeds: OS caches stay enabled, and reads use newly written files
+rather than cold source-layer reads. The working set stays at 32 MiB per
+side, though each sample may rewrite it many times. JSON includes completed
+bytes, operations, actual sample durations, and the same rates and ratios.
+
+Setup and I/O have a 23-second budget, with up to three seconds for checkout
+removal. I/O runs in a killable child so a stalled mount does not hold up the
+command. Timeout and interruption report an error and still attempt cleanup;
+failed checkout removal prints the `ovnfs rm` command to retry. Successful
+runs remove the temporary checkout and scratch files, leaving any daemon
+they started running.
+
+### Build comparisons
+
 `bench.sh REPO [TOUCH]` compares Cargo build times across ways of getting a
 second working tree of REPO: a git worktree, an ovnfs checkout over each
 protocol (NFS and SMB on macOS; FUSE, NFS and SMB on Linux, mounting the latter

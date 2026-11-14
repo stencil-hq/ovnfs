@@ -70,6 +70,7 @@ ovnfs grep 'TODO' app          # search in the daemon, without traversing the mo
 ovnfs glob '*.go' app          # matching paths, recursively and ignore-aware
 ovnfs ls .                     # the checkouts of this folder
 ovnfs prune . --idle 7d        # remove those untouched for a week (--dry-run first)
+ovnfs bench                   # compare mounted ovnfs and disk I/O in under 30 seconds
 ```
 
 `ovnfs help` lists every verb, grouped by what they do and coloured on a
