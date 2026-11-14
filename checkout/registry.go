@@ -177,7 +177,7 @@ func Open(c Config) (*Registry, error) {
 				return nil, coded(err)
 			}
 		}
-		fs, openErr := overlay.New(upper, stack, b.view.Bottom(), r.config.Memory)
+		fs, openErr := overlay.New(upper, stack, b.view.Bottom(disk.Created), r.config.Memory)
 		if openErr != nil {
 			cleanup()
 			return nil, coded(openErr)
@@ -333,7 +333,7 @@ func (r *Registry) storeHashedLayersLocked() {
 		if err != nil {
 			continue
 		}
-		view, err := overlay.New("", stack, s.base.view.Bottom(), nil)
+		view, err := overlay.New("", stack, s.base.view.Bottom(time.Time{}), nil)
 		if err != nil {
 			continue
 		}

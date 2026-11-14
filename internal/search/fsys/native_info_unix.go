@@ -3,6 +3,7 @@
 package fsys
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"syscall"
@@ -19,6 +20,18 @@ type nativeInfo struct {
 	mode os.FileMode
 	mod  time.Time
 	st   syscall.Stat_t
+}
+
+// ChangeTime returns the status change time, in Unix nanoseconds, of the
+// entry at path that info describes (its [os.Lstat] data or a [ReadDir]
+// entry's Info). Content, metadata and renames move it, and unlike the mtime
+// no tool can set it back. It fails for an info with no host stat data.
+func ChangeTime(_ string, info os.FileInfo) (int64, error) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, errors.ErrUnsupported
+	}
+	return statChange(st), nil
 }
 
 func (e *nativeInfo) Name() string               { return e.name }

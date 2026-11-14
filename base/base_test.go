@@ -99,7 +99,7 @@ func prepend(t *testing.T, o *source.Options, line string) {
 // readBase reads through the production bottom interface rather than the donor.
 func readBase(t *testing.T, b *Base, p string) string {
 	t.Helper()
-	f, err := b.Bottom().Open(p)
+	f, err := b.Bottom(time.Time{}).Open(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestSourceFallbackPreservesCapturedMtime(t *testing.T) {
 	if got := readBase(t, b, "source.txt"); got != "fork source\n" {
 		t.Fatalf("source = %q", got)
 	}
-	info, err := b.Bottom().Lstat("source.txt")
+	info, err := b.Bottom(time.Time{}).Lstat("source.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestSourceFallbackPreservesCapturedMtime(t *testing.T) {
 	if got := readBase(t, b, "src/nested.txt"); got != "nested source\n" {
 		t.Fatalf("deleted source = %q", got)
 	}
-	if _, err := b.Bottom().Lstat(".git"); !os.IsNotExist(err) {
+	if _, err := b.Bottom(time.Time{}).Lstat(".git"); !os.IsNotExist(err) {
 		t.Fatalf(".git visible: %v", err)
 	}
 }
@@ -170,13 +170,13 @@ func TestLiveRootsFollowTheFolder(t *testing.T) {
 			t.Errorf("%s = %q, want the folder's current %q", p, got, want)
 		}
 	}
-	if _, err := b.Bottom().Lstat("new-source"); !os.IsNotExist(err) {
+	if _, err := b.Bottom(time.Time{}).Lstat("new-source"); !os.IsNotExist(err) {
 		t.Errorf("new source path visible: %v", err)
 	}
-	if _, err := b.Bottom().Lstat("node_modules/escape/leak"); err == nil {
+	if _, err := b.Bottom(time.Time{}).Lstat("node_modules/escape/leak"); err == nil {
 		t.Error("a symlink inside a live root led outside the folder")
 	}
-	entries, err := b.Bottom().ReadDir("node_modules")
+	entries, err := b.Bottom(time.Time{}).ReadDir("node_modules")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,8 +190,48 @@ func TestLiveRootsFollowTheFolder(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(dir, "node_modules", "pkg")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Bottom().Lstat("node_modules/pkg/index.js"); !os.IsNotExist(err) {
+	if _, err := b.Bottom(time.Time{}).Lstat("node_modules/pkg/index.js"); !os.IsNotExist(err) {
 		t.Fatalf("deleted cache file still visible: %v", err)
+	}
+}
+
+// TestFencedCacheHidesLaterFolderChanges serves a checkout's cache paths as the
+// folder held them when it opened: files the folder rewrites or adds later are
+// absent (a build rebuilds them rather than trusting the folder's newer
+// output, #58), untouched ones and directories stay, and local paths follow
+// the folder.
+func TestFencedCacheHidesLaterFolderChanges(t *testing.T) {
+	repo, dir := repository(t)
+	writeTestFile(t, filepath.Join(dir, "node_modules", "kept", "a.js"), "kept")
+	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
+	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=1")
+	b, _ := createTestBase(t, repo, nil)
+	view := b.Bottom(time.Now())
+	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v2")
+	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "added.js"), "added")
+	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=2")
+	for _, p := range []string{"node_modules/pkg/index.js", "node_modules/pkg/added.js"} {
+		if _, err := view.Lstat(p); !os.IsNotExist(err) {
+			t.Errorf("%s changed after the open is visible: %v", p, err)
+		}
+	}
+	entries, err := view.ReadDir("node_modules/pkg")
+	if err != nil || len(entries) != 0 {
+		t.Errorf("listing after the folder rewrote pkg = %d entries, %v; want none", len(entries), err)
+	}
+	for p, want := range map[string]string{"node_modules/kept/a.js": "kept", ".env": "SECRET=2"} {
+		f, err := view.Open(p)
+		if err != nil {
+			t.Fatalf("open %s: %v", p, err)
+		}
+		got, err := io.ReadAll(f)
+		f.Close()
+		if err != nil || string(got) != want {
+			t.Errorf("%s = %q, %v; want %q", p, got, err, want)
+		}
+	}
+	if got := readBase(t, b, "node_modules/pkg/index.js"); got != "v2" {
+		t.Errorf("unfenced view = %q, want the folder's current v2", got)
 	}
 }
 
@@ -222,7 +262,7 @@ func TestLiveLinksIntoTheFolderAreRelative(t *testing.T) {
 		"node_modules/escape":  filepath.ToSlash(outside),
 		"node_modules/sibling": "pkg",
 	} {
-		if got, err := b.Bottom().Readlink(link); err != nil || got != want {
+		if got, err := b.Bottom(time.Time{}).Readlink(link); err != nil || got != want {
 			t.Errorf("readlink %s = %q, %v; want %q", link, got, err, want)
 		}
 	}
@@ -267,7 +307,7 @@ func TestCapturedNamesOutliveTheFolder(t *testing.T) {
 		writeTestFile(t, filepath.Join(dir, "built", name), name)
 	}
 	b, _ := createTestBase(t, repo, nil)
-	entries, err := b.Bottom().ReadDir("built")
+	entries, err := b.Bottom(time.Time{}).ReadDir("built")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +317,7 @@ func TestCapturedNamesOutliveTheFolder(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(dir, "built")); err != nil {
 		t.Fatal(err)
 	}
-	if entries, err = b.Bottom().ReadDir("built"); err != nil || len(entries) != 8 {
+	if entries, err = b.Bottom(time.Time{}).ReadDir("built"); err != nil || len(entries) != 8 {
 		t.Fatalf("listing after the folder deleted it = %d entries, %v", len(entries), err)
 	}
 	for _, entry := range entries {
@@ -294,14 +334,14 @@ func TestReadDirPreservesCapturedMetadata(t *testing.T) {
 	b, _ := createTestBase(t, repo, nil)
 	check := func(p string, names []string) {
 		t.Helper()
-		entries, err := b.Bottom().ReadDir(p)
+		entries, err := b.Bottom(time.Time{}).ReadDir(p)
 		if err != nil {
 			t.Fatal(err)
 		}
 		var got []string
 		for _, entry := range entries {
 			got = append(got, entry.Name())
-			info, err := b.Bottom().Lstat(filepath.ToSlash(filepath.Join(p, entry.Name())))
+			info, err := b.Bottom(time.Time{}).Lstat(filepath.ToSlash(filepath.Join(p, entry.Name())))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -390,7 +430,7 @@ func TestAncestorReplacementCannotSubstituteOldInodes(t *testing.T) {
 	replacement := t.TempDir()
 	writeTestFile(t, filepath.Join(replacement, "nested.txt"), "foreign old source")
 	b, _ := createTestBase(t, repo, nil)
-	if _, err := b.Bottom().Lstat("src"); err != nil {
+	if _, err := b.Bottom(time.Time{}).Lstat("src"); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(filepath.Join(dir, "src"), filepath.Join(dir, "old-src")); err != nil {
@@ -422,14 +462,14 @@ func TestCapturedSymlinkAndMode(t *testing.T) {
 	if err := os.Symlink("elsewhere", filepath.Join(dir, "link")); err != nil {
 		t.Fatal(err)
 	}
-	target, err := b.Bottom().Readlink("link")
+	target, err := b.Bottom(time.Time{}).Readlink("link")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if target != "source.txt" {
 		t.Fatalf("link = %q", target)
 	}
-	info, err := b.Bottom().Lstat("link")
+	info, err := b.Bottom(time.Time{}).Lstat("link")
 	if err != nil {
 		t.Fatal(err)
 	}

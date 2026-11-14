@@ -15,8 +15,27 @@ import (
 // It implements both os.FileInfo and os.DirEntry with the values os.Lstat
 // would return for the same entry.
 type winInfo struct {
-	name string
-	data syscall.Win32FileAttributeData
+	name   string
+	data   syscall.Win32FileAttributeData
+	change int64 // ChangeTime in Unix nanoseconds; the attribute data has none
+}
+
+// ChangeTime returns the NTFS change time, in Unix nanoseconds, of the entry
+// at path that info describes (its [os.Lstat] data or a [ReadDir] entry's
+// Info). Content, metadata and renames move it, and unlike the mtime no tool
+// can set it back. A listed entry carries it; anything else costs a
+// nonfollowing stat of path, which fails as that stat does.
+func ChangeTime(path string, info os.FileInfo) (int64, error) {
+	if i, ok := info.(*winInfo); ok {
+		return i.change, nil
+	}
+	s := readDirSessions.Get().(*session)
+	fi, err := s.Stat(path, false)
+	readDirSessions.Put(s)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Stamp.Ctime, nil
 }
 
 var (
@@ -113,6 +132,6 @@ func (s *session) addMetadata(rec []byte, name string, attrs uint32, slab *[]win
 		LastWriteTime:  filetimeOf(binary.LittleEndian.Uint64(rec[fdiLastWriteTime:])),
 		FileSizeHigh:   uint32(size >> 32),
 		FileSizeLow:    uint32(size),
-	}}
+	}, change: filetimeNanos(int64(binary.LittleEndian.Uint64(rec[fdiChangeTime:])))}
 	s.entries = append(s.entries, info)
 }

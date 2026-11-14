@@ -475,11 +475,13 @@ func (r *Registry) openOnLocked(ctx context.Context, b *baseRecord, template git
 	return reply, nil
 }
 
-// namePrepared names prepared checkout h: its git directories now mark it as
-// checkout name, and its objects are its base's (see setWarmLocked). config is the
-// root git directory's config as prepared.
+// namePrepared names prepared checkout h: it opens now, so its cache paths are
+// fenced from now, its git directories mark it as checkout name, and its
+// objects are its base's (see setWarmLocked). config is the root git
+// directory's config as prepared.
 func (r *Registry) namePrepared(h *checkoutRecord, name, config string) error {
 	h.meta.Name, h.meta.Created = name, time.Now().UTC()
+	h.fs.Rebase(h.base.view.Bottom(h.meta.Created))
 	if !h.meta.Git {
 		return nil
 	}
@@ -634,7 +636,7 @@ func (r *Registry) setWarmLocked(f *reuseFolder, b *baseRecord, gen, gitGen uint
 	if f.warm != nil && f.warmGitGen == gitGen && f.warmLock == hash && template.config == f.template.config && len(submodules(b.view)) == 0 {
 		kept, f.pool = f.pool, nil
 		for _, h := range kept {
-			h.fs.Rebase(b.view.Bottom())
+			h.fs.Rebase(b.view.Bottom(h.meta.Created))
 			r.releaseLocked(h.base, nil)
 			r.retainLocked(b, nil)
 			h.base, h.meta.Base = b, b.view.Meta().ID

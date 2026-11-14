@@ -54,8 +54,14 @@ Opening a folder classifies every path into one of four classes:
 Nothing is copied to make this view. A source file is the folder's own file
 while its size, mtime and inode still match the capture, and its captured
 content (from the store or the repository's objects) once they do not; a file
-the user adds later stays out. Cache and local paths are the folder as it is
-now. Writes in the checkout copy up into its own upper, so the folder is never
+the user adds later stays out. Local paths are the folder as it is now. Cache
+paths are too, minus every file the folder changed or added after the checkout
+opened (directories stay): build tools such as cargo trust mtimes, so output
+the folder rebuilt would pass for the checkout's own and link the folder's
+code. Hidden, it is rebuilt; untouched output stays warm, and a deleted cache
+directory costs a full rebuild. A file's change time decides, which content,
+metadata and renames move and no tool sets back. Writes in the checkout copy
+up into its own upper, so the folder is never
 written: a cache or local path the checkout wrote or deleted is its own from
 then on, no longer follows the folder, and is ignored by `diff` and `apply`.
 

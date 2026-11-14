@@ -79,7 +79,7 @@ func TestRevisionIndexCarriesPresentedStat(t *testing.T) {
 			}
 			continue
 		}
-		info, err := b.Bottom().Lstat(e.Path)
+		info, err := b.Bottom(time.Time{}).Lstat(e.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -136,7 +136,7 @@ func TestRevisionIndexCarriesPresentedStat(t *testing.T) {
 			content = strings.ToUpper(content)
 		}
 		writeTestFile(t, host, content)
-		info, err := b.Bottom().Lstat(e.Path)
+		info, err := b.Bottom(time.Time{}).Lstat(e.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,7 +209,7 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 			}
 			defer b.Close()
 			for _, p := range append(slices.Clone(always), tc.absent...) {
-				if info, err := b.Bottom().Lstat(p); !os.IsNotExist(err) {
+				if info, err := b.Bottom(time.Time{}).Lstat(p); !os.IsNotExist(err) {
 					t.Errorf("%s = %v, %v; want absent", p, info, err)
 				}
 			}
@@ -221,7 +221,7 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 			if got := readBase(t, b, "vendor/lib.txt"); got != "vendored\n" {
 				t.Errorf("tracked file below a hidden root = %q", got)
 			}
-			list, err := b.Bottom().ReadDir("")
+			list, err := b.Bottom(time.Time{}).ReadDir("")
 			if err != nil {
 				t.Fatal(err)
 			}

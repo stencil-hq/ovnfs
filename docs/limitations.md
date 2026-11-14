@@ -2,8 +2,9 @@
 
 - This is not a sandbox: absolute paths and symlinks can reach the host.
 - The view is best effort, not a frozen snapshot: a source file the user
-  rewrites while the agent is reading it can show either version, and cache
-  and local paths always show the folder as it is.
+  rewrites while the agent is reading it can show either version, local paths
+  always show the folder as it is, and cache paths show what the folder has
+  not changed since the open.
 - A tracked file the user changes after open is read from the repository's
   objects; pruning those objects can make it unreadable.
 - ovnfs reads git repositories with its own implementation, not a git

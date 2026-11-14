@@ -640,7 +640,8 @@ func (r *Registry) prepareCheckout(name, dir string, b *baseRecord, layers []*ov
 			return nil, err
 		}
 	}
-	fs, err := overlay.New(upper, layers, b.view.Bottom(), r.config.Memory)
+	created := time.Now().UTC()
+	fs, err := overlay.New(upper, layers, b.view.Bottom(created), r.config.Memory)
 	if err != nil {
 		return nil, err
 	}
@@ -650,7 +651,7 @@ func (r *Registry) prepareCheckout(name, dir string, b *baseRecord, layers []*ov
 			return nil, err
 		}
 	}
-	meta := checkoutMeta{Name: name, Base: b.view.Meta().ID, Parent: copyString(parent), Git: hasGit, Created: time.Now().UTC(), Copied: copied}
+	meta := checkoutMeta{Name: name, Base: b.view.Meta().ID, Parent: copyString(parent), Git: hasGit, Created: created, Copied: copied}
 	if dir != name {
 		meta.Dir = dir
 	}
@@ -1249,7 +1250,7 @@ func (r *Registry) freezeLocked(ctx context.Context, h *checkoutRecord, label st
 		if renamed {
 			layers, e := r.layerStackLocked(oldStack, h.meta.Base)
 			if e == nil {
-				h.fs, e = overlay.New(h.upper, layers, h.base.view.Bottom(), r.config.Memory)
+				h.fs, e = overlay.New(h.upper, layers, h.base.view.Bottom(h.meta.Created), r.config.Memory)
 			}
 			rollbackErr = errors.Join(rollbackErr, e)
 		}
@@ -1297,7 +1298,7 @@ func (r *Registry) freezeLocked(ctx context.Context, h *checkoutRecord, label st
 				return rollback(err)
 			}
 		}
-		fresh, freshErr := overlay.New(h.upper, layers, h.base.view.Bottom(), r.config.Memory)
+		fresh, freshErr := overlay.New(h.upper, layers, h.base.view.Bottom(h.meta.Created), r.config.Memory)
 		if freshErr != nil {
 			return rollback(freshErr)
 		}
@@ -1549,7 +1550,7 @@ func (r *Registry) scheduleHashesLocked() {
 			r.finishHashLocked(s, "", err)
 			continue
 		}
-		view, err := overlay.New("", stack, s.base.view.Bottom(), nil)
+		view, err := overlay.New("", stack, s.base.view.Bottom(time.Time{}), nil)
 		if err != nil {
 			r.finishHashLocked(s, "", err)
 			continue

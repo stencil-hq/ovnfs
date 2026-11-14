@@ -131,7 +131,7 @@ is always pruned.
 | Class | In the checkout | Seen by `diff`/`apply`/snapshots |
 | --- | --- | --- |
 | `source` | as captured at open | yes |
-| `cache` (ignored dirs, `node_modules`, ...) | the live folder until the checkout writes there; writes go to the checkout only | no |
+| `cache` (ignored dirs, `node_modules`, ...) | the live folder until the checkout writes there, minus files the folder changed after the open (a build redoes those); writes go to the checkout only | no |
 | `local` (ignored files, secrets, files over 100 MB) | the live folder until the checkout writes there; writes go to the checkout only | no |
 | `hidden` (`.DS_Store`, Python environments, ...) | absent | no |
 

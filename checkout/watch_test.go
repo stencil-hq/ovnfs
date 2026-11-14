@@ -33,8 +33,9 @@ func TestFolderRescanInvalidatesOnlyItsTree(t *testing.T) {
 }
 
 // TestFolderEditsInvalidateLivePaths recalls clients' caches of cache paths
-// edited in the source folder, while captured source stays pinned and is
-// neither invalidated nor ever untracked.
+// edited in the source folder, which the checkout then no longer serves (they
+// changed after it opened), while captured source stays pinned and is neither
+// invalidated nor ever untracked.
 func TestFolderEditsInvalidateLivePaths(t *testing.T) {
 	f := newFixture(t)
 	if f.reg.watcher == nil {
@@ -53,8 +54,8 @@ func TestFolderEditsInvalidateLivePaths(t *testing.T) {
 	if f.invalidatedPath("app", "src/main") {
 		t.Fatal("a folder edit to captured source was invalidated")
 	}
-	if got := f.read("app", "target/out"); got != "two" {
-		t.Fatalf("live cache path = %q", got)
+	if got := f.read("app", "target/out"); got != "<absent>" {
+		t.Fatalf("cache path the folder changed after the open = %q, want absent", got)
 	}
 	if got := f.read("app", "src/main"); got != "one" {
 		t.Fatalf("captured source = %q", got)

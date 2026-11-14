@@ -387,6 +387,9 @@ func statHandle(h handle) (Stamp, Type, int64, error) {
 	return stampOf(&st), typeFromMode(uint32(st.Mode)), st.Size, err
 }
 
+// statChange is st's status change time in Unix nanoseconds.
+func statChange(st *syscall.Stat_t) int64 { return nanos(st.Ctimespec.Sec, st.Ctimespec.Nsec) }
+
 func stampOf(st *unix.Stat_t) Stamp {
 	return Stamp{Dev: uint64(uint32(st.Dev)), Ino: st.Ino, Mtime: nanos(st.Mtim.Sec, st.Mtim.Nsec), Ctime: nanos(st.Ctim.Sec, st.Ctim.Nsec)}
 }

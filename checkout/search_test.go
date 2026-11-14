@@ -64,7 +64,8 @@ func TestSearchIgnoreRulesAndLivePaths(t *testing.T) {
 		".gitignore": "ignored/\n", "keep.txt": "needle\n", "ignored/live.txt": "old\n",
 		".hidden.txt": "needle\n", "secret.txt": "needle\n", "node_modules/pkg/index.js": "needle\n",
 	})
-	f.newCheckout(dir, "search", "hidden secret.txt")
+	// Local, not cache: a checkout hides cache files the folder changes after it opens.
+	f.newCheckout(dir, "search", "hidden secret.txt", "local ignored & dir")
 	write(t, filepath.Join(dir, "ignored", "live.txt"), "needle live\n")
 	defaults, err := f.reg.Glob(t.Context(), api.GlobArgs{Checkout: "search", Pattern: "*.txt"})
 	if err != nil || !slices.Equal(globPaths(defaults), []string{"keep.txt"}) {

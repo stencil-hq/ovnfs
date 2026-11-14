@@ -83,7 +83,7 @@ func (r *Registry) installWorkspace(h *checkoutRecord, ws jjWorkspace) error {
 	if err := removeTree(ws.dir); err != nil {
 		return err
 	}
-	fs, err := overlay.New(h.upper, h.fs.Stack(), h.base.view.Bottom(), r.config.Memory)
+	fs, err := overlay.New(h.upper, h.fs.Stack(), h.base.view.Bottom(h.meta.Created), r.config.Memory)
 	if err != nil {
 		return err
 	}

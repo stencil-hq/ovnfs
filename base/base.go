@@ -326,12 +326,19 @@ func (b *Base) Blob(p string, id store.OID) ([]byte, error) {
 	return objects.Blob(string(id))
 }
 
-// Bottom exposes the immutable base through the overlay read-only interface.
-func (b *Base) Bottom() overlay.Bottom {
+// Bottom exposes the immutable base through the overlay read-only interface,
+// for a checkout opened at opened: its cache paths leave out what the folder
+// changed since (see [changedAfter]). A zero opened fences nothing, for views
+// that never read cache paths (snapshot hashing).
+func (b *Base) Bottom(opened time.Time) overlay.Bottom {
 	if b.remote != nil {
 		return remoteBottom{b}
 	}
-	return bottom{b}
+	v := bottom{b: b}
+	if !opened.IsZero() {
+		v.fence = opened.UnixNano()
+	}
+	return v
 }
 
 // Close commits pending pin metadata and stops object readers and the group-commit timer.

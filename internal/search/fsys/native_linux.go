@@ -229,6 +229,9 @@ func statStamp(dir int, cname []byte, flags int) (Stamp, Type, int64, error) {
 	return Stamp{Dev: uint64(st.Dev), Ino: uint64(st.Ino), Mtime: nanos(int64(st.Mtim.Sec), int64(st.Mtim.Nsec)), Ctime: nanos(int64(st.Ctim.Sec), int64(st.Ctim.Nsec))}, typeFromMode(uint32(st.Mode)), int64(st.Size), err
 }
 
+// statChange is st's status change time in Unix nanoseconds.
+func statChange(st *syscall.Stat_t) int64 { return nanos(int64(st.Ctim.Sec), int64(st.Ctim.Nsec)) }
+
 // fstatat is unix.Fstatat on a NUL-terminated name without converting it to
 // a string, retrying EINTR.
 func fstatat(dir int, cname []byte, st *syscall.Stat_t, flags int) error {

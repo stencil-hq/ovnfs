@@ -45,7 +45,7 @@ func TestTakeBlobsRemainLazyAcrossReopen(t *testing.T) {
 			if st.Has(oid) {
 				t.Fatal("taking a git blob materialized its content at creation")
 			}
-			if info, err := b.Bottom().Lstat("source.txt"); err != nil || info.Size() != int64(len("selected object content\n")) {
+			if info, err := b.Bottom(time.Time{}).Lstat("source.txt"); err != nil || info.Size() != int64(len("selected object content\n")) {
 				t.Fatalf("taken metadata before reopen = %v, %v", info, err)
 			}
 			meta := b.Meta()
@@ -60,7 +60,7 @@ func TestTakeBlobsRemainLazyAcrossReopen(t *testing.T) {
 			if st.Has(oid) {
 				t.Fatal("reopening a take materialized its blob")
 			}
-			if info, err := b.Bottom().Lstat("source.txt"); err != nil || info.Size() != int64(len("selected object content\n")) {
+			if info, err := b.Bottom(time.Time{}).Lstat("source.txt"); err != nil || info.Size() != int64(len("selected object content\n")) {
 				t.Fatalf("taken metadata = %v, %v", info, err)
 			}
 			if got := readBase(t, b, "source.txt"); got != "selected object content\n" {
@@ -203,7 +203,7 @@ func TestTakeDirectoryFileTransitions(t *testing.T) {
 	if got := readBase(t, b, "source.txt/nested"); got != "now a directory\n" {
 		t.Fatalf("file to directory = %q", got)
 	}
-	if _, err := b.Bottom().Lstat("src/nested.txt"); !os.IsNotExist(err) {
+	if _, err := b.Bottom(time.Time{}).Lstat("src/nested.txt"); !os.IsNotExist(err) {
 		t.Fatalf("old directory child survived: %v", err)
 	}
 }
@@ -232,7 +232,7 @@ func TestTakePreservesIgnoredDescendantOfDeletedDirectory(t *testing.T) {
 	if got := readBase(t, b, "src/deep/cache/cache.bin"); got != "nested cache\n" {
 		t.Fatalf("nested ignored descendant = %q", got)
 	}
-	if _, err := b.Bottom().Lstat("src/nested.txt"); !os.IsNotExist(err) {
+	if _, err := b.Bottom(time.Time{}).Lstat("src/nested.txt"); !os.IsNotExist(err) {
 		t.Fatalf("deleted source child survived: %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // mklinkJ creates a junction at link pointing at target, as Bun and npm do on Windows.
@@ -24,15 +25,15 @@ func TestJunctionsAreLinks(t *testing.T) {
 	b, _ := createTestBase(t, repo, nil)
 	mklinkJ(t, filepath.Join(dir, "node_modules", "agent"), filepath.Join(b.Meta().Dir, "src"))
 	for p, want := range map[string]string{"linked": filepath.ToSlash(filepath.Join(dir, "src")), "node_modules/agent": "../src"} {
-		info, err := b.Bottom().Lstat(p)
+		info, err := b.Bottom(time.Time{}).Lstat(p)
 		if err != nil || info.Mode()&os.ModeSymlink == 0 {
 			t.Fatalf("lstat %s = %v, %v; want a symlink", p, info, err)
 		}
-		if got, err := b.Bottom().Readlink(p); err != nil || got != want {
+		if got, err := b.Bottom(time.Time{}).Readlink(p); err != nil || got != want {
 			t.Errorf("readlink %s = %q, %v; want %q", p, got, err, want)
 		}
 	}
-	entries, err := b.Bottom().ReadDir("node_modules")
+	entries, err := b.Bottom(time.Time{}).ReadDir("node_modules")
 	if err != nil {
 		t.Fatal(err)
 	}

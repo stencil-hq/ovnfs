@@ -88,7 +88,9 @@ Opening a folder sorts every path into a class. `source` paths are captured:
 they are what `diff`, `apply` and snapshots see, and the only bytes that leave
 the machine. `cache` and `local` paths (build outputs, ignored files, secrets)
 show the live folder until the checkout writes them: a path it writes or
-deletes stays its own from then on, and `apply` never carries it back.
+deletes stays its own from then on, and `apply` never carries it back. A
+`cache` file the folder changes after the open disappears from the checkout
+instead, so a build there redoes it rather than linking the folder's output.
 `hidden` paths are absent. Built-in rules
 handle the common cases; `.o2/ovnfs.yml` and `--rule` override them, and
 `ovnfs explain PATH` says which rule decided.

@@ -318,7 +318,7 @@ func (hb *hashBench) snap(name string, fills ...func(dir string)) bool {
 		layers[i] = l
 		hb.stack = append([]*overlay.Layer{l}, hb.stack...)
 	}
-	view, err := overlay.New("", hb.stack, hb.b.view.Bottom(), nil)
+	view, err := overlay.New("", hb.stack, hb.b.view.Bottom(time.Time{}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
