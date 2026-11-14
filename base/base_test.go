@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/stencil-hq/ovnfs/git"
+	"github.com/stencil-hq/ovnfs/internal/search/fsys"
 	"github.com/stencil-hq/ovnfs/rules"
 	"github.com/stencil-hq/ovnfs/source"
 	"github.com/stencil-hq/ovnfs/store"
@@ -206,7 +207,9 @@ func TestFencedCacheHidesLaterFolderChanges(t *testing.T) {
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v1")
 	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=1")
 	b, _ := createTestBase(t, repo, nil)
-	view := b.Bottom(time.Now())
+	opened := time.Now()
+	view := b.Bottom(opened)
+	awaitFileClock(t, opened)
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "index.js"), "v2")
 	writeTestFile(t, filepath.Join(dir, "node_modules", "pkg", "added.js"), "added")
 	writeTestFile(t, filepath.Join(dir, ".env"), "SECRET=2")
@@ -232,6 +235,29 @@ func TestFencedCacheHidesLaterFolderChanges(t *testing.T) {
 	}
 	if got := readBase(t, b, "node_modules/pkg/index.js"); got != "v2" {
 		t.Errorf("unfenced view = %q, want the folder's current v2", got)
+	}
+}
+
+// awaitFileClock returns once a file written now is stamped later than
+// after. Linux stamps files from the clock as of the last scheduler tick, so a
+// write made right after time.Now can carry an earlier change time.
+func awaitFileClock(t *testing.T, after time.Time) {
+	t.Helper()
+	probe := filepath.Join(t.TempDir(), "clock")
+	for {
+		writeTestFile(t, probe, "")
+		info, err := os.Lstat(probe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed, err := fsys.ChangeTime(probe, info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changed > after.UnixNano() {
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
