@@ -141,7 +141,7 @@ func newEOLConverter(ctx context.Context, view *base.Base, paths []string) (*eol
 		return nil, err
 	}
 	c := &eolConverter{ctx: ctx, repo: repo, actions: make(map[string]eolAction, len(paths))}
-	for _, rr := range view.Capture().Repos {
+	for _, rr := range view.Repos() {
 		if rr.Path == "" {
 			c.indexAt = rr.Index
 		}

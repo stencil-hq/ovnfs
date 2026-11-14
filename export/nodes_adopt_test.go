@@ -377,11 +377,9 @@ func TestUnreadableOwnerFromLastOpenDegrades(t *testing.T) {
 	if nt.find("co") != nil {
 		t.Fatal("co stayed resident")
 	}
+	at := ownerHead(t, nt, key)
 	closeLogged(t, nt)
-	file := coldIndexPath(nt.coldRoot, key)
-	if err := os.WriteFile(file, []byte{0xff, 0xff, 0xff, 0xff}, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	breakOwners(t, nt.pack.path, at)
 	nt = openLogged(t, name, ns)
 	if !nt.opened.adopted {
 		t.Fatalf("replayed: %v", nt.opened)
@@ -412,43 +410,33 @@ func TestNoManifestDuringIndexWrite(t *testing.T) {
 	}
 }
 
-// TestRetiredGarbageSurvivesAdoption reclaims the index files of a removed
-// paged-out subtree after a clean restart that adopted the index, when the
-// close came before their reclamation finished.
-func TestRetiredGarbageSurvivesAdoption(t *testing.T) {
+// TestRetiredOwnersForceRebuild discounts the owner indexes of a removed
+// paged-out subtree, also after a clean restart that adopted the index
+// before they were all discounted, so that the garbage they leave in the
+// pack makes a later open rebuild it.
+func TestRetiredOwnersForceRebuild(t *testing.T) {
 	name := filepath.Join(t.TempDir(), "nodes.log")
 	ns := newNamespace("co/keep/file")
-	for i := range 300 {
-		ns.add(fmt.Sprintf("co/big/d%03d/file", i))
-	}
 	nt := openLogged(t, name, ns)
-	var keys []uint64
+	nt.id("co/keep/file")
 	for i := range 300 {
-		p := fmt.Sprintf("co/big/d%03d", i)
-		nt.id(p + "/file")
-		keys = append(keys, nt.find(p).key)
+		for f := range 20 {
+			p := fmt.Sprintf("co/big/d%03d/a-file-name-of-some-length-%02d", i, f)
+			ns.add(p)
+			nt.id(p)
+		}
 	}
 	evictAll(t, nt, ns)
 	if nt.find("co/big") != nil {
 		t.Fatal("co/big stayed resident")
 	}
-	var files []string
-	for _, key := range keys {
-		for _, file := range []string{coldIndexPath(nt.index.dir, key), coldIndexPath(nt.coldRoot, key)} {
-			if _, err := os.Stat(file); err == nil {
-				files = append(files, file)
-			}
-		}
-	}
-	if len(files) < len(keys) {
-		t.Fatalf("%d index files for %d paged-out directories", len(files), len(keys))
-	}
+	live := nt.coldBytes
 	ns.del("co/big")
 	nt.remove("co/big")
 	closeLogged(t, nt)
 	nt = openLogged(t, name, ns)
 	if !nt.opened.adopted || len(nt.deadKeys) == 0 {
-		t.Fatalf("adopted %v with %d retired keys to reclaim", nt.opened.adopted, len(nt.deadKeys))
+		t.Fatalf("adopted %v with %d retired keys to discount", nt.opened.adopted, len(nt.deadKeys))
 	}
 	for i := 0; len(nt.deadKeys) > 0; i++ {
 		if i > 100 {
@@ -456,10 +444,13 @@ func TestRetiredGarbageSurvivesAdoption(t *testing.T) {
 		}
 		nt.id("co/keep/file")
 	}
-	for _, file := range files {
-		if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("%s survived: %v", file, err)
-		}
+	if nt.coldBytes > live/10 {
+		t.Fatalf("%d of %d index bytes still live", nt.coldBytes, live)
+	}
+	closeLogged(t, nt)
+	nt = openLogged(t, name, ns)
+	if nt.opened.adopted {
+		t.Fatal("adopted a pack of mostly retired owners")
 	}
 }
 
@@ -485,94 +476,6 @@ func retireBigSubtree(t *testing.T, nt *nodeTable, ns *namespace, dirs int) {
 		t.Fatalf("%d retired keys queued", len(nt.deadKeys))
 	}
 	nt.cacheLimit = DefaultNodeCache
-}
-
-// TestRewrittenRecordSurvivesReclamation pages a directory with a record
-// file of its own back in and changes it before a clean close that leaves
-// plenty of garbage to reclaim. After adopting, the directory changes and
-// leaves memory again, rewriting that file, before the garbage drains:
-// reclamation must not remove the live record.
-func TestRewrittenRecordSurvivesReclamation(t *testing.T) {
-	name := filepath.Join(t.TempDir(), "nodes.log")
-	ns := newNamespace("co/k/a/file")
-	nt := openLogged(t, name, ns)
-	want := map[string]uint64{}
-	change := func(dir string) {
-		t.Helper()
-		ns.add(dir + "/file")
-		for _, p := range []string{dir + "/file", dir} {
-			want[p] = nt.id(p)
-		}
-	}
-	change("co/k/a")
-	retireBigSubtree(t, nt, ns, 700) // pages co/k out too
-	if nt.find("co/k") != nil {
-		t.Fatal("co/k stayed resident")
-	}
-	change("co/k/b")
-	if k := nt.find("co/k"); k == nil || k.dir.recordSize == 0 || !k.dir.stale {
-		t.Fatal("co/k is not a changed record file of its own")
-	}
-	closeLogged(t, nt)
-
-	nt = openLogged(t, name, ns)
-	// Three operations reclaim a batch each before co/k leaves memory.
-	if !nt.opened.adopted || len(nt.deadKeys) < 4*deadBatch {
-		t.Fatalf("adopted %v with %d retired keys to reclaim", nt.opened.adopted, len(nt.deadKeys))
-	}
-	change("co/k/c")
-	evictAll(t, nt, ns)
-	if nt.find("co/k") != nil {
-		t.Fatal("co/k stayed resident")
-	}
-	for i := 0; len(nt.deadKeys)+len(nt.deadFiles) > 0; i++ {
-		if i > 100 {
-			t.Fatalf("%d retired keys and %d files left", len(nt.deadKeys), len(nt.deadFiles))
-		}
-		nt.lookup("")
-	}
-	checkIDs(t, nt, want)
-}
-
-// TestUnflushableIndexFileLeavesNoManifest leaves no manifest when close
-// cannot flush a record or owner index file of its own this open wrote: the
-// next open must not adopt files a kernel crash may lose.
-func TestUnflushableIndexFileLeavesNoManifest(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root opens files without permission")
-	}
-	for _, kind := range []string{"record", "owner"} {
-		t.Run(kind, func(t *testing.T) {
-			name := filepath.Join(t.TempDir(), "nodes.log")
-			ns := newNamespace("co/d/file")
-			nt := openLogged(t, name, ns)
-			id := nt.id("co/d/file")
-			key := nt.find("co/d").key
-			evictAll(t, nt, ns)
-			if nt.find("co/d") != nil {
-				t.Fatal("co/d stayed resident")
-			}
-			file := coldIndexPath(nt.index.dir, key)
-			if kind == "owner" {
-				file = coldIndexPath(nt.coldRoot, key)
-			}
-			if err := os.Chmod(file, 0); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { os.Chmod(file, 0o600) })
-			closeLogged(t, nt)
-			if _, err := os.Stat(filepath.Join(name+".cache", ownersName)); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("manifest written over an unflushed %s file: %v", kind, err)
-			}
-			nt = openLogged(t, name, ns)
-			if nt.opened.adopted {
-				t.Fatal("adopted an unflushed index")
-			}
-			if got := pathOf(t, nt, id); got != "co/d/file" {
-				t.Fatalf("%x → %q", id, got)
-			}
-		})
-	}
 }
 
 // TestNoManifestDuringReclamation leaves no manifest when close comes while
@@ -605,5 +508,80 @@ func TestNoManifestDuringReclamation(t *testing.T) {
 	nt = openLogged(t, name, ns)
 	if nt.opened.adopted {
 		t.Fatal("adopted an index whose reclamation was in flight")
+	}
+}
+
+// TestLegacyIndexMigrates opens the stores clean closes of earlier layouts
+// left, and rebuilds each into one pack without losing an issued owner or
+// retired hash, so that names replaced behind the export cannot take over
+// handles issued before the upgrade, and discards the old files. In
+// testdata/owners1 (no logged node index) and testdata/owners3 alike, own's
+// owners were evicted to a file of its own, packed's stayed resident until
+// close packed them, and the gone names were removed through the export; in
+// owners3, deep's records were files of their own too.
+func TestLegacyIndexMigrates(t *testing.T) {
+	for _, fixture := range []struct {
+		dir           string
+		packed, owner uint64 // ids of packed and packed's owner
+		retired       map[string]uint64
+	}{
+		{"owners1", 7, 4503599657940000, map[string]uint64{"own/gone": 4503599636300732, "packed/gone": 4503599657272252}},
+		{"owners3", 10, 4503599670522912, map[string]uint64{"own/gone": 4503599636300732, "packed/gone": 4503599669855164, "dead/x/y/file": 4503599664757595}},
+	} {
+		t.Run(fixture.dir, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.CopyFS(dir, os.DirFS(filepath.Join("testdata", fixture.dir))); err != nil {
+				t.Fatal(err)
+			}
+			name := filepath.Join(dir, "nodes.log")
+			want := map[string]uint64{
+				"own": 2, "own/" + collideA: 4503599636968480, "packed": fixture.packed, "packed/" + collideA: fixture.owner,
+				"deep": 3, "deep/a": 4, "deep/a/b": 5, "deep/a/b/file": 4503599652174683,
+			}
+			// Behind the export, the issued names gave way to others of their
+			// hash, and the retired ones came back.
+			ns := newNamespace("deep/a/b/file", "own/"+collideB, "packed/"+collideB)
+			for p := range fixture.retired {
+				ns.add(p)
+			}
+			for restart := range 2 {
+				nt := openLogged(t, name, ns)
+				if restart == 0 && (nt.opened.adopted || nt.opened.why != "index of an earlier layout") {
+					t.Fatalf("open %v", nt.opened)
+				}
+				if restart == 1 && !nt.opened.adopted {
+					t.Fatalf("migrated index not adopted: %v", nt.opened)
+				}
+				for p, id := range want {
+					if got := pathOf(t, nt, id); got != p {
+						t.Fatalf("restart %d: %x → %q, want %q", restart, id, got, p)
+					}
+				}
+				for p, id := range fixture.retired {
+					if got := pathOf(t, nt, id); got != "<stale>" {
+						t.Fatalf("restart %d: retired %x → %q", restart, id, got)
+					}
+					if nt.id(p) == id {
+						t.Fatalf("restart %d: %s took its retired id", restart, p)
+					}
+				}
+				for _, p := range []string{"own/" + collideB, "packed/" + collideB} {
+					if id := nt.id(p); id == 0 || id == want[strings.Replace(p, collideB, collideA, 1)] {
+						t.Fatalf("restart %d: %s took the issued id", restart, p)
+					}
+				}
+				closeLogged(t, nt)
+			}
+			var legacy []string
+			filepath.WalkDir(name+".cache", func(p string, e fs.DirEntry, err error) error {
+				if err == nil && e.IsDir() && len(e.Name()) == 2 {
+					legacy = append(legacy, p)
+				}
+				return err
+			})
+			if len(legacy) > 0 {
+				t.Fatalf("legacy files remain: %v", legacy)
+			}
+		})
 	}
 }

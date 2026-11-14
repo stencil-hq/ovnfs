@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/stencil-hq/ovnfs/git/internal/object"
+	"github.com/stencil-hq/ovnfs/internal/mapped"
 )
 
 // Commit-graph constants from gitformat-commit-graph.
@@ -175,7 +176,7 @@ func (g *commitGraph) close() {
 // addLayer maps one graph file and checks its header and chunks; depth is
 // the number of layers it must sit on.
 func (g *commitGraph) addLayer(path string, depth int) error {
-	data, unmap, err := object.MapFile(path)
+	data, unmap, err := mapped.Map(path)
 	if err != nil {
 		return err
 	}

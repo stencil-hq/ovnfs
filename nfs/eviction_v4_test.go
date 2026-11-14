@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -354,16 +352,9 @@ func TestV4EvictingExport(t *testing.T) {
 	}
 	pressure()
 	nodestest.Cold(t, state, expireID, "expire")
-	// Released unlogged state must really leave memory. Corrupt its exact
-	// cold store only now; Path would succeed if the node were still pinned.
-	key := expireID >> 22 & ((1 << 30) - 1)
-	indexes, _ := filepath.Glob(filepath.Join(state, "nodes.log.cache", "instance-*", fmt.Sprintf("%02x", key&255), fmt.Sprint(key)))
-	if len(indexes) != 1 {
-		t.Fatal(indexes)
-	}
-	if err := os.Remove(indexes[0]); err != nil {
-		t.Fatal(err)
-	}
+	// Released unlogged state must really leave memory. Corrupt the cold
+	// store only now; Path would succeed if the node were still pinned.
+	nodestest.BreakCold(t, state)
 	if _, ok := e.Nodes().Path(expireID); ok || e.Nodes().IdentityError() == nil {
 		t.Fatal("released identity was not evictable")
 	}

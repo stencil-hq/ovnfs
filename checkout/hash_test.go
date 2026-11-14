@@ -107,7 +107,7 @@ func (t *flatTree) classify(p string, info os.FileInfo) rules.Class {
 	if _, ok := t.files[p]; ok {
 		return rules.Source
 	}
-	if class, ok := t.base.view.Capture().Roots[p]; ok {
+	if class, ok := t.base.view.Class(p); ok {
 		return class
 	}
 	if rule, ok := t.base.rules.Match(p, t.base.view.Domains().Facts(t.view, p, info)); ok {

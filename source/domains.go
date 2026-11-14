@@ -5,9 +5,11 @@
 package source
 
 import (
+	"iter"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -46,15 +48,61 @@ func (d Dir) ReadFile(p string) ([]byte, error) { return os.ReadFile(d.path(p)) 
 // path joins a root-relative slash path to the host root.
 func (d Dir) path(p string) string { return filepath.Join(string(d), filepath.FromSlash(p)) }
 
+// Tracked is a repository's set of tracked paths, as rules.Facts.Tracked asks
+// it. A capture answers from the index it read; a base answers from its
+// capture index on disk once the git index is no longer needed (see
+// Domains.Release).
+type Tracked interface {
+	// Tracked reports whether root-relative p, a path the repository answers
+	// facts for, is tracked or a directory holding a tracked path.
+	Tracked(p string) bool
+}
+
 // domain holds the facts of one git repository (or of the plain root) for its subtree.
 type domain struct {
-	path    string          // root-relative; "" for the root
-	repo    *git.Repo       // nil outside any repository
-	module  string          // Repo.Module
-	tracked map[string]bool // domain-relative tracked paths and their ancestor directories
-	index   map[string]git.IndexEntry
-	indexAt git.Index
-	ignore  *git.Ignore
+	path    string    // root-relative; "" for the root
+	repo    *git.Repo // nil outside any repository
+	module  string    // Repo.Module
+	tracked Tracked   // the domain itself while it holds its index
+	// index is the repository's index as read, for a capture to reuse its stat
+	// data and blob ids; at maps each entry's domain-relative path to its
+	// position, and each directory holding entries to -1. Both are dropped
+	// once released (see Domains.Release).
+	index  git.Index
+	at     map[string]int32
+	ignore *git.Ignore
+}
+
+// newDomain indexes the entries of index for a domain at root-relative path
+// p; the domain answers Tracked from them.
+func newDomain(p string, repo *git.Repo, module string, index git.Index, ignore *git.Ignore) *domain {
+	d := &domain{path: p, repo: repo, module: module, index: index, at: make(map[string]int32, len(index.Entries)), ignore: ignore}
+	for i, e := range index.Entries {
+		d.at[e.Path] = int32(i)
+		for q := parent(e.Path); q != ""; q = parent(q) {
+			if _, ok := d.at[q]; ok {
+				break
+			}
+			d.at[q] = -1
+		}
+	}
+	d.tracked = d
+	return d
+}
+
+// Tracked looks p up in the index the domain read.
+func (d *domain) Tracked(p string) bool {
+	rel := d.rel(p)
+	_, ok := d.at[rel]
+	return ok && rel != ""
+}
+
+// indexed returns the index entry of domain-relative rel.
+func (d *domain) indexed(rel string) (git.IndexEntry, bool) {
+	if i, ok := d.at[rel]; ok && i >= 0 {
+		return d.index.Entries[i], true
+	}
+	return git.IndexEntry{}, false
 }
 
 // rel converts a root-relative path to this domain's relative path.
@@ -75,15 +123,26 @@ type Domains struct {
 }
 
 // NewDomains opens the facts of root and of the given repositories. A root
-// without a Repo entry for "" is a plain folder whose .gitignore files still apply.
-func NewDomains(root string, repos []Repo) (*Domains, error) {
+// without a Repo entry for "" is a plain folder whose .gitignore files still
+// apply. Each repository's index is read unless tracked is set: then it
+// supplies each repository's tracked paths by Repo.Path, and nothing is kept
+// for a capture to reuse.
+func NewDomains(root string, repos []Repo, tracked func(repo string) Tracked) (*Domains, error) {
 	d := &Domains{root: root}
 	rootRepo := false
 	for _, r := range repos {
 		if r.Path == "" {
 			rootRepo = true
 		}
-		if err := d.Add(r); err != nil {
+		repo, err := git.Open(filepath.Join(root, filepath.FromSlash(r.Path)))
+		if err == nil {
+			if tracked == nil {
+				err = d.add(r, repo)
+			} else {
+				err = d.open(r, repo, git.Index{}, tracked(r.Path))
+			}
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -92,18 +151,9 @@ func NewDomains(root string, repos []Repo) (*Domains, error) {
 		if err != nil {
 			return nil, err
 		}
-		d.insert(&domain{path: "", tracked: map[string]bool{}, index: map[string]git.IndexEntry{}, ignore: ignore})
+		d.insert(newDomain("", nil, "", git.Index{}, ignore))
 	}
 	return d, nil
-}
-
-// Add opens a repository whose work tree is r.Path below the root and reads its index.
-func (d *Domains) Add(r Repo) error {
-	repo, err := git.Open(filepath.Join(d.root, filepath.FromSlash(r.Path)))
-	if err != nil {
-		return err
-	}
-	return d.add(r, repo)
 }
 
 // add reads the index of repo, opened at r.Path, and adds its facts.
@@ -116,25 +166,61 @@ func (d *Domains) add(r Repo, repo *git.Repo) error {
 	if err != nil {
 		return err
 	}
+	return d.open(r, repo, index, nil)
+}
+
+// open adds the facts of repo, opened at r.Path, with its index, answering
+// Tracked from tracked when set, else from the index.
+func (d *Domains) open(r Repo, repo *git.Repo, index git.Index, tracked Tracked) error {
 	ignore, err := git.NewIgnore(repo)
 	if err != nil {
 		return err
 	}
-	dom := &domain{path: r.Path, repo: repo, module: r.Module, tracked: make(map[string]bool, len(index.Entries)), index: make(map[string]git.IndexEntry, len(index.Entries)), indexAt: index, ignore: ignore}
-	for _, e := range index.Entries {
-		dom.index[e.Path] = e
-		for p := e.Path; p != ""; p = parent(p) {
-			if dom.tracked[p] {
-				break
-			}
-			dom.tracked[p] = true
-		}
-	}
 	d.mu.Lock()
 	d.repos = append(d.repos, r)
 	d.mu.Unlock()
+	dom := newDomain(r.Path, repo, r.Module, index, ignore)
+	if tracked != nil {
+		dom.tracked = tracked
+	}
 	d.insert(dom)
 	return nil
+}
+
+// Tracked yields every root-relative path that is tracked by the repository
+// answering its facts (see For), with that repository's root-relative path,
+// from the indexes read so far; directories holding tracked paths are left out.
+func (d *Domains) Tracked() iter.Seq2[string, string] {
+	return func(yield func(p, repo string) bool) {
+		d.mu.RLock()
+		list := slices.Clone(d.list)
+		d.mu.RUnlock()
+		for _, dom := range list {
+			for _, e := range dom.index.Entries {
+				p := e.Path
+				if dom.path != "" {
+					p = dom.path + "/" + p
+				}
+				if d.For(p) == dom && !yield(p, dom.path) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// Release drops the indexes read for a capture once it is over: each
+// repository then answers Tracked from tracked(Repo.Path). It must be called
+// before the domains are shared. Repositories Discover opens later read their
+// index as usual.
+func (d *Domains) Release(tracked func(repo string) Tracked) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, dom := range d.list {
+		if dom.repo != nil {
+			dom.tracked, dom.index, dom.at = tracked(dom.path), git.Index{}, nil
+		}
+	}
 }
 
 // insert keeps domains ordered innermost first.
@@ -268,7 +354,7 @@ func (f *facts) Size() int64 {
 }
 
 // Tracked reports a path in its repository's index, or a directory holding one.
-func (f *facts) Tracked() bool { return f.dom.tracked[f.dom.rel(f.p)] }
+func (f *facts) Tracked() bool { return f.dom.tracked.Tracked(f.p) }
 
 // Ignored reports git's own notion: untracked and excluded by ignore rules.
 func (f *facts) Ignored() bool {

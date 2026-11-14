@@ -65,8 +65,12 @@ type Status struct {
 	Memory         Usage   `json:"memory"` // checkouts' written files held in memory before they spill to disk
 	NodeIndexBytes int64   `json:"node_index_bytes"`
 	NodeCacheError string  `json:"node_cache_error,omitempty"`
-	NodeCache      Usage   `json:"node_cache"` // estimated reconstructible node and listing bytes
-	BlobCache      Usage   `json:"blob_cache"` // content-addressed blobs served from memory
+	NodeCache      Usage   `json:"node_cache"`  // estimated reconstructible node and listing bytes
+	BlobCache      Usage   `json:"blob_cache"`  // content-addressed blobs served from memory
+	HeapLive       int64   `json:"heap_live"`   // Go heap the last collection found reachable
+	HeapInUse      int64   `json:"heap_in_use"` // Go heap spans holding objects: live, not yet collected garbage and fragmentation
+	GoHeld         int64   `json:"go_held"`     // memory the Go runtime holds from the OS (heap, stacks, metadata), minus what it returned
+	Footprint      int64   `json:"footprint"`   // process memory as the OS charges it (macOS phys_footprint, Linux RssAnon+VmSwap, Windows private bytes); 0 where unknown
 }
 
 // Usage is resident bytes against a limit. A zero Limit disables file/blob

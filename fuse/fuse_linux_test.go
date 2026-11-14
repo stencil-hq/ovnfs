@@ -20,6 +20,7 @@ import (
 	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/checkout"
 	"github.com/stencil-hq/ovnfs/export"
+	"github.com/stencil-hq/ovnfs/internal/nodestest"
 	"github.com/stencil-hq/ovnfs/overlay"
 	"golang.org/x/sys/unix"
 )
@@ -633,15 +634,7 @@ func TestIndexFaultBlocksTruncate(t *testing.T) {
 	nodes.ID("alpha/pressure/file")
 	nodes.ID("beta/d/file")
 	nodes.ID("beta/pressure/file")
-	files, err := filepath.Glob(filepath.Join(f.state, "nodes.log.cache", "instance-*", "*", "*"))
-	if err != nil || len(files) == 0 {
-		t.Fatalf("cold indexes: %v %v", files, err)
-	}
-	for _, name := range files {
-		if err := os.Remove(name); err != nil {
-			t.Fatal(err)
-		}
-	}
+	nodestest.BreakCold(t, f.state)
 	if nodes.ID("beta/d/file") != 0 || nodes.IdentityError() == nil {
 		t.Fatal("missing cold index did not latch a fault")
 	}

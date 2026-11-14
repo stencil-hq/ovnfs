@@ -17,6 +17,7 @@ go.work.sum
 
 # Local state and logs
 *.log
+!/export/testdata/*/nodes.log
 *.pid
 *.sock
 .env

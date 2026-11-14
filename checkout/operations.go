@@ -247,7 +247,7 @@ func (r *Registry) capture(ctx context.Context, root string, m manifest.Manifest
 	if err != nil {
 		return api.NewReply{}, nil, err
 	}
-	stats := view.Capture().Stats
+	stats := view.Stats()
 	reply.Capture, reply.Warnings = &stats, append(append([]string{}, warnings...), reply.Warnings...)
 	return reply, b, nil
 }
@@ -307,7 +307,7 @@ func gitSourceOf(view *base.Base) (gitSource, error) {
 		return gs, nil
 	}
 	gs.repo = repo
-	for _, rr := range view.Capture().Repos {
+	for _, rr := range view.Repos() {
 		if rr.Path == "" {
 			gs.index = rr.Index
 		}
@@ -326,7 +326,7 @@ func gitSourceOf(view *base.Base) (gitSource, error) {
 // each gets a private git directory below the root's (source.Repo.Module).
 func submodules(view *base.Base) []source.Repo {
 	var out []source.Repo
-	for _, repo := range view.Capture().Repos {
+	for _, repo := range view.Repos() {
 		if repo.Module != "" {
 			out = append(out, repo)
 		}

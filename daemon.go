@@ -428,6 +428,10 @@ func (cmd *statusCmd) Run(c *cli) error {
 		{"node cache", usage(st.NodeCache, "current directory")},
 		{"node index", humanBytes(st.NodeIndexBytes)},
 		{"blob cache", usage(st.BlobCache, "off")},
+		{"go heap", humanBytes(st.HeapLive) + " live, " + humanBytes(st.HeapInUse) + " in use, " + humanBytes(st.GoHeld) + " held"},
+	}
+	if st.Footprint != 0 {
+		rows = append(rows, [2]string{"footprint", humanBytes(st.Footprint)})
 	}
 	if st.NodeCacheError != "" {
 		rows = append(rows, [2]string{"node cache error", st.NodeCacheError})

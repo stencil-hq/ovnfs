@@ -318,7 +318,7 @@ func TestChunkedSweepAndOpenReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages := 0
-	for _, e := range s.packs.index {
+	for _, e := range packedObjects(s) {
 		if e.flags == frameManifest|frameInternal {
 			pages++
 		}
@@ -336,7 +336,7 @@ func TestChunkedSweepAndOpenReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-time.Hour)
-	for raw := range s.packs.index {
+	for raw := range packedObjects(s) {
 		age(t, s, raw.oid(), old)
 	}
 	if n, err := s.Sweep([]OID{root}, time.Now().Add(-time.Minute)); err != nil || n == 0 {
@@ -356,8 +356,8 @@ func TestChunkedSweepAndOpenReader(t *testing.T) {
 	if n, err := s.Sweep(nil, time.Now().Add(-time.Minute)); err != nil || n == 0 {
 		t.Fatalf("final Sweep = %d, %v", n, err)
 	}
-	if len(s.packs.index) != 0 {
-		t.Fatalf("unreachable graph retained %d objects", len(s.packs.index))
+	if len(packedObjects(s)) != 0 {
+		t.Fatalf("unreachable graph retained %d objects", len(packedObjects(s)))
 	}
 	got, err := io.ReadAll(r)
 	if err != nil || !bytes.Equal(got, data) {
@@ -473,7 +473,7 @@ func TestChunkedRestartTornManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	var leaf rawID
-	for raw, e := range s.packs.index {
+	for raw, e := range packedObjects(s) {
 		if e.flags&frameChunk != 0 {
 			leaf = raw
 			break
@@ -488,7 +488,7 @@ func TestChunkedRestartTornManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	again := reopen(t, s)
-	if len(again.packs.index) != len(s.packs.index) {
+	if len(packedObjects(again)) != len(packedObjects(s)) {
 		t.Fatal("torn manifest was indexed")
 	}
 	mustRead(t, again, id, data)
@@ -503,16 +503,14 @@ func TestChunkedCorruption(t *testing.T) {
 				t.Fatal(err)
 			}
 			var leaf rawID
-			for raw, e := range s.packs.index {
+			for raw, e := range packedObjects(s) {
 				if e.flags&frameChunk != 0 {
 					leaf = raw
 					break
 				}
 			}
 			if what == "missing chunk" {
-				s.packs.mu.Lock()
-				delete(s.packs.index, leaf)
-				s.packs.mu.Unlock()
+				forget(t, s, leaf.oid())
 			} else {
 				target := rawOf(id)
 				if what == "chunk checksum" || what == "chunk hash" {
@@ -586,7 +584,7 @@ func TestTreeWriterDeltaRollover(t *testing.T) {
 			}
 		}
 	}
-	for raw := range s.packs.index {
+	for raw := range packedObjects(s) {
 		age(t, s, raw.oid(), time.Now().Add(-time.Hour))
 	}
 	if _, err := s.Sweep([]OID{like}, time.Now().Add(-time.Minute)); err != nil {

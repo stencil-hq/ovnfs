@@ -16,9 +16,9 @@ import (
 	"github.com/stencil-hq/ovnfs/store"
 )
 
-// Capture metadata (a persisted Result, the stat cache) is O(files), so it is
-// stored as a small binary file instead of JSON: a magic line naming the format,
-// the CRC-32 of the body, and the body deflated. The body lists sorted paths
+// Capture metadata (the stat cache, and the capture file bases kept before
+// their capture index) is O(files), so it is stored as a small binary file: a
+// magic line naming the format, the CRC-32 of the body, and the body deflated. The body lists sorted paths
 // with shared-prefix encoding and then each per-path field as its own column of
 // varints, mostly deltas from the previous path's value, which deflate shrinks
 // to a few bytes per path. The stat cache names its paths, modes and blob ids by
@@ -35,55 +35,10 @@ const (
 // errCorrupt reports capture metadata that does not decode.
 var errCorrupt = errors.New("corrupt capture metadata")
 
-// MarshalBinary encodes the persisted part of a capture (the fields with JSON
-// names: root, tree, info, roots, repos, blob_repo). Bases store their capture
-// with it.
-func (r *Result) MarshalBinary() ([]byte, error) {
-	var e encoder
-	e.str(r.Root)
-	e.str(string(r.Tree))
-	e.uvarint(uint64(len(r.Repos)))
-	for _, repo := range r.Repos {
-		e.str(repo.Path)
-		e.str(repo.Head)
-		e.str(repo.Index)
-		e.str(repo.Module)
-	}
-	roots := SortedPaths(r.Roots)
-	e.paths(roots)
-	for _, p := range roots {
-		e.str(string(r.Roots[p]))
-	}
-	taken := SortedPaths(r.BlobRepo)
-	e.paths(taken)
-	for _, p := range taken {
-		e.str(r.BlobRepo[p])
-	}
-	infos := SortedPaths(r.Info)
-	e.paths(infos)
-	var prev int64
-	for _, p := range infos {
-		sec := r.Info[p].Mtime.Unix()
-		e.varint(sec - prev)
-		prev = sec
-	}
-	for _, p := range infos {
-		e.uvarint(uint64(r.Info[p].Mtime.Nanosecond()))
-	}
-	for _, p := range infos {
-		e.varint(r.Info[p].Size)
-	}
-	prev = 0
-	for _, p := range infos {
-		ino := int64(r.Info[p].Ino)
-		e.varint(ino - prev)
-		prev = ino
-	}
-	return pack(resultMagic, e.buf)
-}
-
-// UnmarshalBinary decodes a capture written by MarshalBinary into r's persisted
-// fields; Files and the other runtime fields are left alone.
+// UnmarshalBinary decodes the persisted fields of a capture (those with JSON
+// names: root, tree, info, roots, repos, blob_repo) from the capture file of a
+// base created before bases kept capture indexes, for migrating it; Files and
+// the other runtime fields are left alone.
 func (r *Result) UnmarshalBinary(data []byte) error {
 	fields, magic := 4, resultMagic
 	if bytes.HasPrefix(data, []byte(resultMagicV1)) {

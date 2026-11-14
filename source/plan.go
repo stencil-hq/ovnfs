@@ -44,7 +44,7 @@ type PlanInput struct {
 	Root    string // folder that cache key files are read from
 	On      string
 	Files   map[string]store.File
-	Info    map[string]Info
+	Info    func(p string) Info // captured or current stat data; zero when unknown
 	Roots   map[string]rules.Class
 	Domains *Domains
 	Lock    manifest.Lock
@@ -104,7 +104,7 @@ func Plan(ctx context.Context, in PlanInput) (api.PlanReply, error) {
 		if f.Mode == store.ModeDir {
 			continue
 		}
-		size := in.Info[p].Size
+		size := in.Info(p).Size
 		add(&reply.Source, p, size)
 		dom := in.Domains.For(p)
 		if ids, ok := upstream[dom.path]; ok && dom.repo != nil && ids[dom.rel(p)] == string(f.ID) {
@@ -133,9 +133,9 @@ func Plan(ctx context.Context, in PlanInput) (api.PlanReply, error) {
 			}
 			reply.Cache = append(reply.Cache, c)
 		case rules.Local:
-			add(&reply.Local, p, in.Info[p].Size)
+			add(&reply.Local, p, in.Info(p).Size)
 		case rules.Hidden:
-			add(&reply.Hidden, p, in.Info[p].Size)
+			add(&reply.Hidden, p, in.Info(p).Size)
 		}
 	}
 	return reply, nil

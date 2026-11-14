@@ -1,7 +1,6 @@
 package export
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -281,15 +280,7 @@ func TestUnreadableAdoptedIndexResolvesByListing(t *testing.T) {
 	nt := openLogged(t, name, ns)
 	id := nt.id("co/file")
 	closeLogged(t, nt)
-	ix := nt.coldIndexOf(nt.find("co"))
-	f, err := os.OpenFile(ix.file, os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = f.WriteAt([]byte{0xff, 0xff, 0xff, 0xff}, ix.base) // more records than bytes
-	if err := errors.Join(err, f.Close()); err != nil {
-		t.Fatal(err)
-	}
+	breakOwners(t, nt.pack.path, nt.find("co").dir.base)
 	nt = openLogged(t, name, ns)
 	if got := pathOf(t, nt, id); got != "co/file" || nt.cacheErr != nil {
 		t.Fatalf("%x → %q, %v", id, got, nt.cacheErr)

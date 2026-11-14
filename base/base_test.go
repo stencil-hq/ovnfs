@@ -382,7 +382,7 @@ func TestCaptureKeepsOriginalIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := createTestBase(t, repo, func(c *Config, o *source.Options) { prepend(t, o, "source cache/secret") })
-	saved, err := os.ReadFile(b.Capture().Repos[0].Index)
+	saved, err := os.ReadFile(b.Repos()[0].Index)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +406,7 @@ func TestCaptureKeepsOriginalIndex(t *testing.T) {
 	if got := readBase(t, b, "untracked"); got != "untracked" {
 		t.Fatalf("untracked = %q", got)
 	}
-	if m, head := b.Meta(), b.Capture().Repos[0].Head; m.Tree == "" || head == "" {
+	if m, head := b.Meta(), b.Repos()[0].Head; m.Tree == "" || head == "" {
 		t.Fatalf("capture metadata missing: %+v head %q", m, head)
 	}
 }
@@ -478,17 +478,33 @@ func TestCapturedSymlinkAndMode(t *testing.T) {
 	}
 }
 
-// TestOpenLoadsCaptureFormats reopens a base from its binary capture and from
-// the JSON capture of bases created before it, serving the same view, and
-// refuses a damaged capture.
-func TestOpenLoadsCaptureFormats(t *testing.T) {
+// TestOpenMigratesCaptureFiles reopens a base from its capture index, and one
+// created before capture indexes from its JSON capture file, which it replaces
+// by an index; each serves the capture it was created with, and a damaged
+// index is refused.
+func TestOpenMigratesCaptureFiles(t *testing.T) {
 	repo, dir := repository(t)
 	writeTestFile(t, filepath.Join(dir, "dir", "ü 日本.txt"), "unicode\n")
 	writeTestFile(t, filepath.Join(dir, "target", "out.bin"), "built\n")
-	b, c := createTestBase(t, repo, nil)
-	want, meta := *b.Capture(), b.Meta()
+	st, err := store.Open(filepath.Join(t.TempDir(), "store"), 64<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := Config{ID: "b_test", StateDir: filepath.Join(t.TempDir(), "base"), Store: st}
+	res, _, err := Capture(context.Background(), c, source.Options{Root: repo.Top, Rules: rules.Set{Rules: rules.Builtins()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := CreateCaptured(c, res, time.Now(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := b.Meta()
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if len(res.Roots) == 0 || len(res.Info) == 0 {
+		t.Fatalf("fixture captured no roots or stat data: %+v", res)
 	}
 	reopen := func(name string) {
 		t.Helper()
@@ -497,38 +513,51 @@ func TestOpenLoadsCaptureFormats(t *testing.T) {
 			t.Fatalf("%s: %v", name, err)
 		}
 		defer b.Close()
-		got := b.Capture()
-		if got.Root != want.Root || got.Tree != want.Tree || !reflect.DeepEqual(got.Repos, want.Repos) || !reflect.DeepEqual(got.Roots, want.Roots) || len(got.Info) != len(want.Info) {
-			t.Fatalf("%s: capture %+v, want %+v", name, got, want)
+		if !reflect.DeepEqual(b.Repos(), res.Repos) || !reflect.DeepEqual(b.Roots(), res.Roots) {
+			t.Fatalf("%s: repos %+v roots %v, want %+v %v", name, b.Repos(), b.Roots(), res.Repos, res.Roots)
 		}
-		for p, i := range want.Info {
-			if g := got.Info[p]; !g.Mtime.Equal(i.Mtime) || g.Size != i.Size || g.Ino != i.Ino {
+		for p, f := range res.Files {
+			if got, ok := b.Leaf(p); !ok || got != f {
+				t.Fatalf("%s: leaf %q = %+v, want %+v", name, p, got, f)
+			}
+		}
+		for p, i := range res.Info {
+			if g, ok := b.Info(p); !ok || !g.Mtime.Equal(i.Mtime) || g.Size != i.Size || g.Ino != i.Ino {
 				t.Fatalf("%s: info %q = %+v, want %+v", name, p, g, i)
+			}
+		}
+		for p, want := range map[string]bool{"src": true, "src/nested.txt": true, "dir": false, "sr": false, "src/n": false} {
+			if got := b.Domains().Facts(source.Dir(dir), p, nil).Tracked(); got != want {
+				t.Fatalf("%s: %q tracked = %v", name, p, got)
 			}
 		}
 		if got := readBase(t, b, "dir/ü 日本.txt"); got != "unicode\n" {
 			t.Fatalf("%s: read %q", name, got)
 		}
 	}
-	reopen("binary")
+	reopen("index")
 
-	legacy, err := json.Marshal(want)
+	legacy, err := json.Marshal(res)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(c.StateDir, legacyCaptureFile), legacy, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(c.StateDir, jsonCaptureFile), legacy, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(c.StateDir, captureFile)); err != nil {
+	if err := os.Remove(filepath.Join(c.StateDir, captureIndexFile)); err != nil {
 		t.Fatal(err)
 	}
-	reopen("legacy json")
+	reopen("migrated")
+	if _, err := os.Stat(filepath.Join(c.StateDir, jsonCaptureFile)); !os.IsNotExist(err) {
+		t.Fatalf("migration left the capture file: %v", err)
+	}
+	reopen("after migration")
 
-	if err := os.WriteFile(filepath.Join(c.StateDir, captureFile), []byte("ovnfs-capture-1\ntruncated"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(c.StateDir, captureIndexFile), []byte(captureMagic+"truncated"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if b, err := Open(c, meta); err == nil {
 		b.Close()
-		t.Fatal("opened a base whose capture is damaged")
+		t.Fatal("opened a base whose capture index is damaged")
 	}
 }

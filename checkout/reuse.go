@@ -403,7 +403,7 @@ func (r *Registry) newOnBase(ctx context.Context, id, name string) (api.NewReply
 		}
 		template.config = string(data)
 	}
-	return r.openOnLocked(ctx, b, template, name, filepath.Base(b.view.Capture().Stats.Root), nil)
+	return r.openOnLocked(ctx, b, template, name, filepath.Base(b.view.Stats().Root), nil)
 }
 
 // openOnLocked opens checkout name (or one derived from fallback) on capture b,
@@ -457,7 +457,7 @@ func (r *Registry) openOnLocked(ctx context.Context, b *baseRecord, template git
 	r.moveRootLocked()
 	seq := r.requestCommitLocked()
 	// The capture was taken before this create, which read nothing of the folder.
-	stats := h.base.view.Capture().Stats
+	stats := h.base.view.Stats()
 	stats.Hashed, stats.HashedBytes, stats.Seconds = 0, 0, 0
 	reply := api.NewReply{Checkout: r.checkoutLocked(h), Capture: &stats, Warnings: append([]string{}, warnings...)}
 	r.mu.Unlock()

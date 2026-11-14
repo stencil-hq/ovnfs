@@ -43,7 +43,7 @@ func reviseCapture(ctx context.Context, c Config, res *source.Result, revision *
 		return err
 	}
 	repos := []source.Repo{{Path: "", Head: revision.Commit, Index: index}}
-	domains, err := source.NewDomains(res.Root, repos)
+	domains, err := source.NewDomains(res.Root, repos, nil)
 	if err != nil {
 		return err
 	}

@@ -15,15 +15,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"slices"
-	"sort"
 	"sync"
 	"time"
 
+	"github.com/stencil-hq/ovnfs/api"
 	"github.com/stencil-hq/ovnfs/git"
-	"github.com/stencil-hq/ovnfs/internal/durable"
 	"github.com/stencil-hq/ovnfs/overlay"
 	"github.com/stencil-hq/ovnfs/rules"
 	"github.com/stencil-hq/ovnfs/source"
@@ -76,29 +74,13 @@ type Config struct {
 	OnFault      func(msg string)
 }
 
-// captureFile persists the classified capture next to the base's pins
-// (source.Result.MarshalBinary). Bases created before it hold legacyCaptureFile,
-// the same fields as JSON, and keep loading from it.
-const (
-	captureFile       = "capture.bin"
-	legacyCaptureFile = "capture.json"
-)
-
-// entry is a captured blob, symlink or directory.
-type entry struct {
-	mode os.FileMode
-	oid  store.OID
-}
-
 // Base serves one capture of a folder to every checkout opened on it.
 type Base struct {
 	config    Config
 	meta      Meta
-	capture   *source.Result
+	index     *captureIndex // every captured path; see captureIndexFile
+	stats     api.Capture
 	domains   *source.Domains
-	sources   map[string]entry
-	children  map[string][]string // sorted root-relative paths, borrowed from sources
-	classes   map[string]rules.Class
 	objectsMu sync.Mutex
 	objects   map[string]*git.Objects // object readers by work tree top
 	proofs    dirProofs
@@ -178,91 +160,97 @@ func CreateCaptured(c Config, res source.Result, fork time.Time, reuseKey string
 	if c.Store == nil {
 		return nil, errors.New("base: missing store")
 	}
-	if err := saveCapture(c.StateDir, &res); err != nil {
-		return nil, err
-	}
 	m := Meta{ID: c.ID, Dir: res.Root, ForkTime: fork, Tree: res.Tree, ReuseKey: reuseKey}
-	return load(c, m, &res)
+	return create(c, m, &res)
 }
 
-// Open rebuilds the captured-tree index while retaining every existing pin.
+// Open serves a base from its capture index, migrating the capture file of a
+// base created before the index into one first.
 func Open(c Config, m Meta) (*Base, error) {
 	if c.Store == nil {
 		return nil, errors.New("base: missing store")
 	}
+	x, err := openCaptureIndex(c.StateDir, m.Tree)
+	if errors.Is(err, os.ErrNotExist) {
+		return migrate(c, m)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("base %s: %w", m.ID, err)
+	}
+	// A migration that crashed after publishing the index may have left these.
+	removeLegacyCaptures(c.StateDir)
+	domains, err := source.NewDomains(m.Dir, available(c, m, x.repos), x.trackedOf)
+	if err != nil {
+		return nil, err
+	}
+	return newBase(c, m, x, api.Capture{}, domains), nil
+}
+
+// migrate writes the capture index of a base created before it, from its
+// capture file, its tree and its repositories' index copies, then removes the
+// capture file.
+func migrate(c Config, m Meta) (*Base, error) {
 	res, err := loadCapture(c.StateDir)
 	if err != nil {
 		return nil, fmt.Errorf("base %s: %w", m.ID, err)
 	}
-	files, err := c.Store.Flatten(m.Tree)
-	if err != nil {
+	if res.Files, err = c.Store.Flatten(m.Tree); err != nil {
 		return nil, fmt.Errorf("base %s: %w", m.ID, err)
 	}
-	res.Files = files
-	return load(c, m, res)
+	b, err := create(c, m, res)
+	if err != nil {
+		return nil, err
+	}
+	removeLegacyCaptures(c.StateDir)
+	return b, nil
 }
 
-// load indexes the capture's leaves and their implied directories. A capture
-// just taken brings the domains it read; one loaded from disk reads them again.
-func load(c Config, m Meta, res *source.Result) (*Base, error) {
-	m.ForkTime = m.ForkTime.UTC()
-	domains := res.Domains
-	if domains == nil {
-		// A repository that vanished since capture only loses its facts and objects;
-		// the base stays readable from pins and the store.
-		var repos []source.Repo
-		for _, r := range res.Repos {
-			if _, err := git.Open(filepath.Join(m.Dir, filepath.FromSlash(r.Path))); err == nil {
-				repos = append(repos, r)
-			} else if c.OnFault != nil {
-				c.OnFault(fmt.Sprintf("base %s: repository %q unavailable: %v", m.ID, r.Path, err))
-			}
-		}
-		var err error
-		if domains, err = source.NewDomains(m.Dir, repos); err != nil {
+// create publishes the capture index of res and serves the base from it. A
+// capture just taken brings the domains it read; one loaded from disk reads
+// them again. Either way their indexes are released once the capture index
+// holds the tracked paths.
+func create(c Config, m Meta, res *source.Result) (*Base, error) {
+	if res.Domains == nil {
+		domains, err := source.NewDomains(m.Dir, available(c, m, res.Repos), nil)
+		if err != nil {
 			return nil, err
 		}
 		res.Domains = domains
 	}
-	b := &Base{config: c, meta: m, capture: res, domains: domains, sources: map[string]entry{"": {mode: os.ModeDir | 0o755}}, children: make(map[string][]string), classes: res.Roots, objects: make(map[string]*git.Objects)}
-	if b.classes == nil {
-		b.classes = map[string]rules.Class{}
+	if err := writeCaptureIndex(c.StateDir, res); err != nil {
+		return nil, fmt.Errorf("base %s: %w", m.ID, err)
 	}
-	for p, f := range res.Files {
-		e := entry{oid: f.ID}
-		switch f.Mode {
-		case store.ModeDir:
-			e.mode = os.ModeDir | 0o755
-		case store.ModeSymlink:
-			e.mode = os.ModeSymlink | 0o777
-		case store.ModeExec:
-			e.mode = 0o755
-		default:
-			e.mode = 0o644
-		}
-		b.sources[p] = e
-		for dir := path.Dir(p); dir != "."; dir = path.Dir(dir) {
-			if _, ok := b.sources[dir]; !ok {
-				b.sources[dir] = entry{mode: os.ModeDir | 0o755}
-			}
-		}
+	x, err := openCaptureIndex(c.StateDir, m.Tree)
+	if err != nil {
+		return nil, fmt.Errorf("base %s: %w", m.ID, err)
 	}
-	for p := range b.sources {
-		if p != "" {
-			parent := path.Dir(p)
-			if parent == "." {
-				parent = ""
-			}
-			b.children[parent] = append(b.children[parent], p)
+	res.Domains.Release(x.trackedOf)
+	return newBase(c, m, x, res.Stats, res.Domains), nil
+}
+
+// available lists the repositories still present in the folder. One that
+// vanished since capture only loses its facts and objects; the base stays
+// readable from pins and the store.
+func available(c Config, m Meta, repos []source.Repo) []source.Repo {
+	var out []source.Repo
+	for _, r := range repos {
+		if _, err := git.Open(filepath.Join(m.Dir, filepath.FromSlash(r.Path))); err == nil {
+			out = append(out, r)
+		} else if c.OnFault != nil {
+			c.OnFault(fmt.Sprintf("base %s: repository %q unavailable: %v", m.ID, r.Path, err))
 		}
 	}
+	return out
+}
+
+// newBase serves an open capture index.
+func newBase(c Config, m Meta, x *captureIndex, stats api.Capture, domains *source.Domains) *Base {
+	m.ForkTime = m.ForkTime.UTC()
+	b := &Base{config: c, meta: m, index: x, stats: stats, domains: domains, objects: make(map[string]*git.Objects)}
 	if m.Remote != nil {
-		b.remote = newRemoteState(b)
+		b.remote = &remoteState{b: b, prefetched: map[string]bool{}}
 	}
-	for p := range b.children {
-		sort.Strings(b.children[p])
-	}
-	return b, nil
+	return b
 }
 
 // Meta returns an independent snapshot of the base's persisted metadata.
@@ -278,8 +266,43 @@ func (b *Base) Meta() Meta {
 	return m
 }
 
-// Capture returns the classified capture the base serves; callers must not modify it.
-func (b *Base) Capture() *source.Result { return b.capture }
+// Repos lists the repositories of the captured folder; callers must not modify it.
+func (b *Base) Repos() []source.Repo { return b.index.repos }
+
+// Stats summarizes the capture that created the base; zero once reopened from disk.
+func (b *Base) Stats() api.Capture { return b.stats }
+
+// Leaf returns the captured leaf at p: a blob, symlink or empty directory.
+func (b *Base) Leaf(p string) (store.File, bool) {
+	if n, ok := b.index.lookup(p); ok {
+		return b.index.leaf(n)
+	}
+	return store.File{}, false
+}
+
+// Info returns the stat data the capture recorded for p, a leaf or a non-source root.
+func (b *Base) Info(p string) (source.Info, bool) {
+	if n, ok := b.index.lookup(p); ok {
+		return b.index.info(n)
+	}
+	return source.Info{}, false
+}
+
+// Class returns the class of p when the capture recorded it as a non-source root.
+func (b *Base) Class(p string) (rules.Class, bool) {
+	if n, ok := b.index.lookup(p); ok {
+		class := b.index.class(n)
+		return class, class != ""
+	}
+	return "", false
+}
+
+// Roots returns a new map of the capture's non-source roots and their classes.
+func (b *Base) Roots() map[string]rules.Class {
+	roots := map[string]rules.Class{}
+	b.index.eachRoot(func(p string, class rules.Class) { roots[p] = class })
+	return roots
+}
 
 // Domains answers rule facts for paths of the captured folder.
 func (b *Base) Domains() *source.Domains { return b.domains }
@@ -301,7 +324,11 @@ func (b *Base) Blob(p string, id store.OID) ([]byte, error) {
 	}
 	repo := b.domains.RepoOf(p)
 	top := ""
-	if origin, overridden := b.capture.BlobRepo[p]; overridden {
+	origin, overridden := "", false
+	if n, ok := b.index.lookup(p); ok {
+		origin, overridden = b.index.origin(n)
+	}
+	if overridden {
 		top = filepath.Join(b.meta.Dir, filepath.FromSlash(origin))
 	} else if repo != nil {
 		top = repo.Top
@@ -341,7 +368,10 @@ func (b *Base) Bottom(opened time.Time) overlay.Bottom {
 	return v
 }
 
-// Close commits pending pin metadata and stops object readers and the group-commit timer.
+// Close commits pending pin metadata and stops object readers and the
+// group-commit timer. The capture index stays mapped until the base is
+// unreachable, so a lookup racing Close (or Remove) reads the capture as it
+// was, never unmapped memory.
 func (b *Base) Close() error {
 	b.closeOnce.Do(func() {
 		var errs []error
@@ -355,37 +385,37 @@ func (b *Base) Close() error {
 	return b.closeErr
 }
 
-// Remove closes the base and removes its private storage.
+// Remove closes the base and removes its private storage. Where a mapped
+// file cannot be deleted (Windows), the directory goes once the capture index
+// is unmapped.
 func (b *Base) Remove() error {
 	err := b.Close()
-	removeErr := os.RemoveAll(b.config.StateDir)
+	dir := b.config.StateDir
+	b.index.m.orphan.Store(&dir)
+	removeErr := os.RemoveAll(dir)
+	if removeErr != nil {
+		if left, _ := os.ReadDir(dir); len(left) == 1 && left[0].Name() == captureIndexFile {
+			removeErr = nil
+		}
+	}
 	if err != nil {
 		return err
 	}
 	return removeErr
 }
 
-// saveCapture persists the capture a base serves in its state directory.
-func saveCapture(stateDir string, res *source.Result) error {
-	data, err := res.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	return writeFile(filepath.Join(stateDir, captureFile), data)
-}
-
-// loadCapture reads the persisted capture of a base, from the JSON file of a
-// base created before the binary format when that is all it has.
+// loadCapture reads the capture file of a base created before the capture
+// index: the binary one, else the JSON one of bases older still.
 func loadCapture(stateDir string) (*source.Result, error) {
 	var res source.Result
-	data, err := os.ReadFile(filepath.Join(stateDir, captureFile))
+	data, err := os.ReadFile(filepath.Join(stateDir, legacyCaptureFile))
 	if errors.Is(err, os.ErrNotExist) {
-		data, err := os.ReadFile(filepath.Join(stateDir, legacyCaptureFile))
+		data, err := os.ReadFile(filepath.Join(stateDir, jsonCaptureFile))
 		if err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(data, &res); err != nil {
-			return nil, fmt.Errorf("%s: %w", legacyCaptureFile, err)
+			return nil, fmt.Errorf("%s: %w", jsonCaptureFile, err)
 		}
 		return &res, nil
 	}
@@ -393,33 +423,14 @@ func loadCapture(stateDir string) (*source.Result, error) {
 		return nil, err
 	}
 	if err := res.UnmarshalBinary(data); err != nil {
-		return nil, fmt.Errorf("%s: %w", captureFile, err)
+		return nil, fmt.Errorf("%s: %w", legacyCaptureFile, err)
 	}
 	return &res, nil
 }
 
-// writeFile replaces metadata atomically and syncs it before publication.
-func writeFile(p string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(p), ".meta-")
-	if err != nil {
-		return err
+// removeLegacyCaptures deletes the capture files a published capture index replaced.
+func removeLegacyCaptures(stateDir string) {
+	for _, name := range []string{legacyCaptureFile, jsonCaptureFile} {
+		os.Remove(filepath.Join(stateDir, name))
 	}
-	defer os.Remove(f.Name())
-	if err = f.Chmod(0o600); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = durable.Sync(f)
-	}
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err = os.Rename(f.Name(), p); err != nil {
-		return err
-	}
-	return syncDirectory(filepath.Dir(p))
 }

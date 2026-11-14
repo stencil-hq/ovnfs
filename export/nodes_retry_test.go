@@ -20,9 +20,7 @@ func TestLateColdReadFault(t *testing.T) {
 	nt.addLeaf(nt.find("co"), "new")
 	nt.find("co").dir.coldDirty = true
 	nt.mu.Unlock()
-	if err := os.Remove(nt.coldPath(nt.find("co"))); err != nil {
-		t.Fatal(err)
-	}
+	breakOwners(t, nt.pack.path, ownerHead(t, nt, nt.find("co").key))
 	nt.cacheLimit = 0
 	if id := nt.id("pressure/entry"); id != 0 || nt.cacheErr == nil {
 		t.Fatalf("late fault returned %x, %v", id, nt.cacheErr)
@@ -106,25 +104,8 @@ func TestColdStoreLifecycle(t *testing.T) {
 	if filepath.Dir(nt.coldRoot) != name+".cache" {
 		t.Fatal(nt.coldRoot)
 	}
-	var size int64
-	err := filepath.WalkDir(nt.coldRoot, func(path string, e os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !e.IsDir() {
-			info, err := e.Info()
-			if err != nil {
-				return err
-			}
-			size += info.Size()
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if size == 0 || size != nt.coldBytes {
-		t.Fatalf("index size %d != %d", size, nt.coldBytes)
+	if nt.pack == nil || nt.pack.end == 0 || nt.pack.end != nt.coldBytes {
+		t.Fatalf("index size %v != %d", nt.pack, nt.coldBytes)
 	}
 	other := openLogged(t, filepath.Join(t.TempDir(), "nodes.log"), ns)
 	defer closeLogged(t, other)

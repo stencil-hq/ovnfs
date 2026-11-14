@@ -5,8 +5,16 @@ import (
 	"sync"
 )
 
-// deltaBaseCacheLimit matches git's default core.deltaBaseCacheLimit.
-const deltaBaseCacheLimit = 96 << 20
+// deltaBaseCacheLimit bounds the delta bases every [DB] in the process keeps
+// together. git's per-process default (core.deltaBaseCacheLimit) is 96 MiB,
+// but a daemon keeps one DB per work tree open for its whole life; bases
+// mostly serve tree walks and short read bursts, which a few MiB cover.
+const deltaBaseCacheLimit = 16 << 20
+
+// deltaBases is the process-wide delta base cache all databases share, so the
+// budget does not grow with the number of open repositories. Keys name the
+// pack, which is unique to its DB.
+var deltaBases = newDeltaCache(deltaBaseCacheLimit)
 
 // baseKey names a pack entry.
 type baseKey struct {
@@ -53,6 +61,9 @@ func (c *deltaCache) put(k baseKey, kind Kind, data []byte) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if k.pack.dropped {
+		return // a read finishing after its pack was retired
+	}
 	if e, ok := c.byKey[k]; ok {
 		c.lru.MoveToFront(e)
 		return
@@ -66,11 +77,12 @@ func (c *deltaCache) put(k baseKey, kind Kind, data []byte) {
 	}
 }
 
-// dropPack forgets the entries of a pack that is going away, so the cache
-// does not pin its memory.
+// dropPack forgets the entries of a pack that is going away, and refuses its
+// later ones, so the shared cache does not pin a closed database's memory.
 func (c *deltaCache) dropPack(p *pack) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	p.dropped = true
 	for e := c.lru.Front(); e != nil; {
 		next := e.Next()
 		if b := e.Value.(*cachedBase); b.key.pack == p {

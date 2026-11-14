@@ -1,8 +1,8 @@
 package export
 
 import (
-	"bufio"
 	"bytes"
+	"cmp"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -21,7 +21,17 @@ import (
 // and retired hash (ownersHeader).
 const ownersName = "owners"
 
-var ownersMagic = []byte("ovnfs owners 3\n")
+var ownersMagic = []byte("ovnfs owners 4\n")
+
+// Manifests of earlier layouts start with these. An open rebuilds what they
+// describe (rebuildReason), carrying its owners over. Version 3's owner
+// indexes and records could be files of their own; version 1 had no logged
+// node index, so its manifest lists every directory's owner index itself,
+// each a file of its own or a segment of its pack.
+var (
+	legacyOwnersMagic = []byte("ovnfs owners 3\n")
+	firstOwnersMagic  = []byte("ovnfs owners 1\n")
+)
 
 // takeOwners reads the manifest a clean close left and removes it durably
 // before the open changes anything, so that a crash from then on discards
@@ -79,31 +89,34 @@ func (t *nodeTable) openColdStore(head *ownersHeader) (*priorIndex, error) {
 	return prior, nil
 }
 
-// adoptColdStore resumes the owner index instance the manifest head names,
-// and detaches every other entry of the store but the closed logged node
-// index, which the open adopts, or reads and detaches when it rebuilds. It
-// returns nil when the store does not hold what head names.
+// adoptColdStore finds the owner index instance and the closed logged node
+// index the manifest head names, which the open adopts, or reads and
+// detaches when it rebuilds, and detaches every other entry of the store.
+// It returns nil when the store does not hold what head names.
 func (t *nodeTable) adoptColdStore(head *ownersHeader, discard string) *priorIndex {
 	if !t.detachExcept(t.coldParent, discard, head.instance, head.nodes) {
 		return nil
 	}
-	prior := &priorIndex{nodes: filepath.Join(t.coldParent, head.nodes)}
+	prior := &priorIndex{owners: head.owners, legacy: head.legacy}
+	if head.nodes != "" {
+		prior.nodes = filepath.Join(t.coldParent, head.nodes)
+	}
 	if head.instance != "" {
-		root := filepath.Join(t.coldParent, head.instance)
-		if !t.detachExcept(root, discard, head.pack) {
+		prior.instance = filepath.Join(t.coldParent, head.instance)
+		// A legacy instance keeps its owner index files until the rebuild
+		// discards it whole.
+		if !head.legacy && !t.detachExcept(prior.instance, discard, head.pack) {
 			return nil
 		}
-		t.coldRoot = root
 		if head.pack != "" {
-			prior.pack = filepath.Join(root, head.pack)
+			prior.pack = filepath.Join(prior.instance, head.pack)
 		}
 	}
 	return prior
 }
 
-// detachExcept moves into discard every entry of dir that is not kept, apart
-// from the index shards, and reports whether every kept name exists. An
-// empty name exists trivially.
+// detachExcept moves into discard every entry of dir that is not kept, and
+// reports whether every kept name exists. An empty name exists trivially.
 func (t *nodeTable) detachExcept(dir, discard string, keep ...string) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -119,9 +132,6 @@ func (t *nodeTable) detachExcept(dir, discard string, keep ...string) bool {
 		if slices.Contains(keep, e.Name()) {
 			found++
 			continue
-		}
-		if dir != t.coldParent && e.IsDir() && len(e.Name()) == 2 {
-			continue // a shard of directory index files
 		}
 		if os.Rename(filepath.Join(dir, e.Name()), filepath.Join(discard, "store-"+rand.Text())) != nil {
 			return false
@@ -140,25 +150,32 @@ type ownersHeader struct {
 	records   uint64 // the size of the index's records file
 	built     uint64 // the size of its records file when it was built
 
-	// The index's accounting, as NodeIndexBytes reports it.
-	coldBytes, nodesBytes, runtimeBytes uint64
+	coldBytes    uint64 // of the live owner index segments
+	runtimeBytes uint64 // of the runtime slots
 
 	instance string // the owner index directory below the store, if any
-	pack     string // the pack file in instance, if any directory is packed
+	pack     string // the pack file in instance, if any directory has owners
 	nodes    string // the logged node index below the store
 
-	// Garbage the closed open had yet to reclaim: retired cold keys, whose
-	// index files and those of their subtrees remain, and files, below the
-	// store.
-	dead    []uint64
-	garbage []string
+	// Retired cold keys the closed open had yet to discount from coldBytes.
+	dead []uint64
+
+	legacy bool       // read from a manifest of an earlier layout
+	owners []keyOwner // a version 1 manifest's directories, sorted by key
 }
 
-// parseOwners decodes a manifest written by saveColdStore.
+// parseOwners decodes a manifest written by saveColdStore, or one of an
+// earlier layout, of which it keeps what a rebuild needs.
 func parseOwners(data []byte) (h ownersHeader, ok bool) {
 	rest, ok := bytes.CutPrefix(data, ownersMagic)
+	first := false
 	if !ok {
-		return h, false
+		if rest, ok = bytes.CutPrefix(data, legacyOwnersMagic); !ok {
+			if rest, first = bytes.CutPrefix(data, firstOwnersMagic); !first {
+				return h, false
+			}
+		}
+		h.legacy = true
 	}
 	next := func() (uint64, bool) {
 		v, n := binary.Uvarint(rest)
@@ -177,7 +194,15 @@ func parseOwners(data []byte) (h ownersHeader, ok bool) {
 		rest = rest[length:]
 		return s, true
 	}
-	for _, field := range []*uint64{&h.logSize, &h.compacted, &h.next, &h.epoch, &h.records, &h.built, &h.coldBytes, &h.nodesBytes, &h.runtimeBytes} {
+	if first {
+		return parseFirstOwners(h, next, name)
+	}
+	var nodesBytes uint64
+	fields := []*uint64{&h.logSize, &h.compacted, &h.next, &h.epoch, &h.records, &h.built, &h.coldBytes, &h.runtimeBytes}
+	if h.legacy {
+		fields = slices.Insert(fields, 7, &nodesBytes)
+	}
+	for _, field := range fields {
 		if *field, ok = next(); !ok {
 			return h, false
 		}
@@ -197,16 +222,54 @@ func parseOwners(data []byte) (h ownersHeader, ok bool) {
 			return h, false
 		}
 	}
-	if count, ok = next(); !ok || count > uint64(len(rest)) {
-		return h, false
-	}
-	h.garbage = make([]string, count)
-	for i := range h.garbage {
-		if h.garbage[i], ok = name(); !ok || !filepath.IsLocal(h.garbage[i]) {
+	if h.legacy {
+		if count, ok = next(); !ok || count > uint64(len(rest)) {
 			return h, false
+		}
+		for range count {
+			if _, ok = name(); !ok {
+				return h, false
+			}
 		}
 	}
 	return h, len(rest) == 0 && h.nodes != "" && (h.pack == "" || h.instance != "")
+}
+
+// parseFirstOwners decodes the rest of a version 1 manifest through next
+// and name: the log size, the instance and its pack, then each directory's
+// key, owner index size, and offset in the pack plus one, or zero for a file
+// of its own. A rebuild carries them over like the slots of a closed index.
+func parseFirstOwners(h ownersHeader, next func() (uint64, bool), name func() (string, bool)) (ownersHeader, bool) {
+	var ok bool
+	if h.logSize, ok = next(); !ok {
+		return h, false
+	}
+	if h.instance, ok = name(); !ok || h.instance == "" {
+		return h, false
+	}
+	if h.pack, ok = name(); !ok {
+		return h, false
+	}
+	count, ok := next()
+	if !ok {
+		return h, false
+	}
+	for range count {
+		key, okKey := next()
+		size, okSize := next()
+		base, okBase := next()
+		if !okKey || !okSize || !okBase || base != 0 && h.pack == "" || size == 0 || size > sizeMask || base > offsetMask {
+			return h, false
+		}
+		o := keyOwner{key: key, owner: nodeOwner{size: int64(size), prior: true}, file: base == 0}
+		if base != 0 {
+			o.owner.base = int64(base - 1)
+		}
+		h.owners = append(h.owners, o)
+	}
+	slices.SortFunc(h.owners, func(a, b keyOwner) int { return cmp.Compare(a.key, b.key) })
+	_, more := next()
+	return h, !more
 }
 
 // growthSlack is the garbage an index may carry beyond its live size and
@@ -223,6 +286,8 @@ const growthSlack = 64 << 10
 // the size of the pack head names.
 func (h *ownersHeader) rebuildReason(pack int64) string {
 	switch {
+	case h.legacy:
+		return "index of an earlier layout"
 	case h.logSize > 2*h.compacted+growthSlack:
 		return fmt.Sprintf("log grew from %d to %d bytes since its compaction", h.compacted, h.logSize)
 	case h.records > 2*h.built+growthSlack:
@@ -235,130 +300,66 @@ func (h *ownersHeader) rebuildReason(pack int64) string {
 	return ""
 }
 
-// completeIndex writes every resident owner and retired hash the index lacks,
-// at close. A directory with an index file of its own has it rewritten in
-// place, in parallel; the others are appended to the pack, so closing costs
-// one file rather than one per directory. The caller holds mu throughout:
-// nothing changes or reads the index meanwhile, and a crash before the
-// manifest discards it all anyway. It reports whether the index now holds
-// every owner.
+// completeIndex appends every resident owner and retired hash the index
+// lacks, at close, as spills would, in one write. The caller holds mu
+// throughout: nothing changes or reads the index meanwhile, and a crash
+// before the manifest discards it all anyway. It reports whether the index
+// now holds every owner.
 func (t *nodeTable) completeIndex() bool {
 	type job struct {
-		d       *node
-		from    coldIndex // the published index, if cold
-		read    bool      // from holds evicted owners to merge with resident ones
-		names   map[uint32]string
-		retired []uint32
-		data    []byte // a rewritten file of the directory's own
-		base    int64  // in the pack
-		size    int64
-		err     error
+		d     *node
+		at    int64 // in data
+		size  int64
+		grown int64
 	}
 	if t.cacheErr != nil {
 		return false
 	}
-	var jobs []*job
+	var jobs []job
+	var data []byte
 	for _, d := range t.byKey {
 		s := d.dir
 		if s == nil || s.cold && !s.coldDirty {
 			continue
 		}
-		j := &job{d: d, read: s.cold && !s.coldLoaded}
-		if s.cold {
-			j.from = t.coldIndexOf(d)
-		}
-		jobs = append(jobs, j)
-	}
-	inParallel(jobs, func(j *job) {
-		if j.read {
-			j.names, j.retired, j.err = readColdNames(j.from)
-		}
-	})
-	var files, packs []*job
-	for _, j := range jobs {
-		s := j.d.dir
-		if j.err != nil {
-			if !s.prior {
-				t.cacheFailure(j.err)
-				return false
-			}
-			t.forgetPrior(j.d)
-			j.names, j.retired = nil, nil
-		}
-		if j.names == nil {
-			j.names = make(map[uint32]string)
-		}
-		if !t.ownersToWrite(j.d, j.names, j.retired) {
-			continue // unchanged owners stay in place
-		}
-		if s.cold && !s.packed {
-			j.data = encodeColdNames(j.names, s.retired)
-			files = append(files, j)
-		} else {
-			packs = append(packs, j)
-		}
-	}
-	inParallel(files, func(j *job) { j.err = os.WriteFile(j.from.file, j.data, 0600) })
-	for _, j := range files {
-		if j.err != nil {
+		seg, grown, ok := t.ownerSegment(d)
+		if !ok {
 			return false
 		}
-		s := j.d.dir
-		t.coldBytes += int64(len(j.data)) - s.coldBytes
-		s.coldBytes, s.coldDirty, s.prior = int64(len(j.data)), false, false
-		t.ownerFiles[j.d.key] = struct{}{}
-		s.coldLoaded = s.coldLoaded || !j.read
+		if seg == nil {
+			s.coldDirty = false
+			continue
+		}
+		jobs = append(jobs, job{d, int64(len(data)), int64(len(seg)), grown})
+		data = append(data, seg...)
 	}
-	if len(packs) == 0 {
+	if len(jobs) == 0 {
 		return true
 	}
-	var pack *os.File
-	var size int64
+	pack := t.pack
 	var err error
-	if t.coldPack != "" {
-		if pack, err = os.OpenFile(t.coldPack, os.O_WRONLY, 0); err == nil {
-			size, err = pack.Seek(0, io.SeekEnd)
-		}
-	} else {
-		if t.coldRoot == "" {
-			root, err := os.MkdirTemp(t.coldParent, "instance-")
-			if err != nil {
-				return false
-			}
-			t.coldRoot = root
-		}
-		pack, err = os.CreateTemp(t.coldRoot, "pack-")
-	}
-	if err != nil {
-		if pack != nil {
-			pack.Close()
-		}
-		return false
-	}
-	defer pack.Close()
-	w := bufio.NewWriterSize(pack, 1<<20)
-	for _, j := range packs {
-		data := encodeColdNames(j.names, j.d.dir.retired)
-		if _, err := w.Write(data); err != nil {
+	if pack == nil {
+		if pack, err = t.createPack(); err != nil {
 			return false
 		}
-		j.base, j.size = size, int64(len(data))
-		size += j.size
 	}
-	if w.Flush() != nil || pack.Close() != nil {
+	base, err := pack.reserve(int64(len(data)))
+	if err != nil {
 		return false
 	}
-	t.coldPack = pack.Name()
-	for _, j := range packs {
+	if _, err := pack.file.WriteAt(data, base); err != nil {
+		return false
+	}
+	for _, j := range jobs {
 		s := j.d.dir
-		s.coldLoaded = s.coldLoaded || !j.read
-		t.coldBytes += j.size - s.coldBytes
-		s.coldBytes, s.cold, s.coldDirty, s.prior, s.packed, s.base = j.size, true, false, false, true, j.base
+		t.coldBytes += j.grown
+		nodeOwner{size: j.size, base: base + j.at}.apply(s)
+		s.coldDirty = false
 	}
 	return true
 }
 
-// indexWorkers bounds the index files completeIndex reads or writes at once.
+// indexWorkers bounds the index writes and flushes close runs at once.
 const indexWorkers = 16
 
 // inParallel calls f on every item with at most indexWorkers goroutines.
@@ -386,16 +387,6 @@ func (t *nodeTable) saveColdStore(logSize int64) error {
 	if t.index == nil {
 		return nil // nothing was ever indexed
 	}
-	for _, g := range t.coldGarbage {
-		// Garbage the next open inherits is no longer counted.
-		if g.record {
-			t.nodesBytes -= g.dir.dir.recordSize
-		} else {
-			t.coldBytes -= g.dir.dir.coldBytes
-		}
-		t.deadFiles = append(t.deadFiles, g.path)
-	}
-	t.coldGarbage = nil
 	h := ownersHeader{
 		logSize:      uint64(logSize),
 		compacted:    uint64(t.compacted),
@@ -404,7 +395,6 @@ func (t *nodeTable) saveColdStore(logSize int64) error {
 		records:      uint64(t.recordsEnd),
 		built:        uint64(t.built),
 		coldBytes:    uint64(max(t.coldBytes, 0)),
-		nodesBytes:   uint64(max(t.nodesBytes, 0)),
 		runtimeBytes: uint64(t.runtimeBytes),
 		nodes:        filepath.Base(t.index.dir),
 		dead:         t.deadKeys,
@@ -412,13 +402,8 @@ func (t *nodeTable) saveColdStore(logSize int64) error {
 	if t.coldRoot != "" {
 		h.instance = filepath.Base(t.coldRoot)
 	}
-	if t.coldPack != "" {
-		h.pack = filepath.Base(t.coldPack)
-	}
-	for _, file := range t.deadFiles {
-		if rel, err := filepath.Rel(t.coldParent, file); err == nil && filepath.IsLocal(rel) {
-			h.garbage = append(h.garbage, rel)
-		}
+	if t.pack != nil {
+		h.pack = filepath.Base(t.pack.path)
 	}
 	f, err := os.CreateTemp(t.coldParent, ".owners-*")
 	if err != nil {
@@ -444,7 +429,7 @@ func (t *nodeTable) saveColdStore(logSize int64) error {
 
 // append encodes h after the magic, as parseOwners decodes it.
 func (h *ownersHeader) append(b []byte) []byte {
-	for _, v := range []uint64{h.logSize, h.compacted, h.next, h.epoch, h.records, h.built, h.coldBytes, h.nodesBytes, h.runtimeBytes} {
+	for _, v := range []uint64{h.logSize, h.compacted, h.next, h.epoch, h.records, h.built, h.coldBytes, h.runtimeBytes} {
 		b = binary.AppendUvarint(b, v)
 	}
 	for _, name := range []string{h.instance, h.pack, h.nodes} {
@@ -453,10 +438,6 @@ func (h *ownersHeader) append(b []byte) []byte {
 	b = binary.AppendUvarint(b, uint64(len(h.dead)))
 	for _, key := range h.dead {
 		b = binary.AppendUvarint(b, key)
-	}
-	b = binary.AppendUvarint(b, uint64(len(h.garbage)))
-	for _, name := range h.garbage {
-		b = appendName(b, name)
 	}
 	return b
 }

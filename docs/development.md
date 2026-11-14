@@ -79,6 +79,29 @@ run BUILD without cross-tree caches such as sccache, which would hide the
 filesystem's effect. `bench.sh --clean REPO` removes `BENCH_DIR` and its
 worktree.
 
+`scripts/buildbench` compares ovnfs binaries on build-shaped IO and memory.
+Each `-ovnfs` binary gets a private daemon (temporary state, mount and HOME,
+so default settings) and a checkout of one fixture repository: the
+`-project`'s files (or a synthetic crate) plus `-files` bulk files (default
+100,000) for a realistically large base, committed with one `git fast-import`
+stream in about five seconds. Every round runs the same work in a host
+directory and in each checkout, rotating the order: `io` (the default)
+replays the filesystem traffic of a cold `cargo build` of a 149-package
+workspace (82 rlibs, build scripts, fingerprints, 256 codegen objects, a 24 MB
+linked binary hard-linked into place), a no-op build, a relink after a touch,
+and a clean; `cargo` runs `cargo build --offline` cold in the first round and
+no-op and after a touch in every round. It prints each phase's median, its
+ratio to the host and its range, the capture time, and each daemon's
+footprint (macOS) or RSS (Linux), its peak and the cache use from
+`ovnfs status`, after capture and after the work (and after `-idle`, if set).
+The default run, two binaries and three `io` rounds, takes about 25 seconds:
+
+```sh
+(cd "$(ovnfs new --name old --rev main --json | jq -r .checkout.path)" && go build -o /tmp/ovnfs-old .)
+go build -o /tmp/ovnfs-new .
+go run ./scripts/buildbench -ovnfs /tmp/ovnfs-old -ovnfs /tmp/ovnfs-new -project ~/src/some-crate -modes io,cargo -runs 5
+```
+
 ## Node cache stress test
 
 `scripts/stress-nodes.py` starts a private Linux daemon and source repository,

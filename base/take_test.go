@@ -148,7 +148,8 @@ func TestTakeNestedRepositoryBlobOriginsSurviveReopen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			oid := b.Capture().Files["nested/file"].ID
+			leaf, _ := b.Leaf("nested/file")
+			oid := leaf.ID
 			if st.Has(oid) {
 				t.Fatal("nested take materialized its selected blob")
 			}

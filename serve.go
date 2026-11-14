@@ -32,8 +32,22 @@ import (
 )
 
 // memoryFileMax is the largest written file kept in memory; bigger files go
-// to disk, where writes already land in the page cache.
-const memoryFileMax = 1 << 20
+// to disk, where writes already land in the page cache. 256 KiB keeps a
+// build's small short-lived files in memory (cargo fingerprints, dep-info
+// and temp files, and the median rlib of about 130 KB) while large outputs
+// (rlibs' 90th percentile is 1.7 MB, linked binaries tens of MB) leave
+// memory at their first 256 KiB instead of being buffered whole, so they do
+// not crowd the budget. 64 KiB made a replayed cold cargo build 16% slower
+// (scripts/buildbench): each mid-sized rlib then paid a spill's host create
+// while being written.
+const memoryFileMax = 256 << 10
+
+// Default serve budgets; see docs/internals.md (memory tiers).
+const (
+	defaultMemory    byteSize = 64 << 20
+	defaultBlobCache byteSize = 16 << 20
+	defaultNodeCache byteSize = export.DefaultNodeCache
+)
 
 // memoryIdle is how long a file sits untouched in memory before it is written
 // back to its upper, bounding what a snapshot must flush and a crash loses.
@@ -44,8 +58,8 @@ const memoryIdle = 2 * time.Second
 type byteSize int64
 
 // String renders the byte count in the largest suffix that divides it ("1G").
-func (b *byteSize) String() string {
-	n := int64(*b)
+func (b byteSize) String() string {
+	n := int64(b)
 	for _, u := range []struct {
 		shift  uint
 		suffix string
@@ -93,10 +107,10 @@ func (b *byteSize) UnmarshalText(text []byte) error {
 func serveDefaults(conf manifest.Daemon) kong.Option {
 	return kong.Vars{
 		"default_proto":       cmp.Or(conf.Proto, defaultProto()),
-		"memory_default":      cmp.Or(os.Getenv("OVNFS_MEMORY"), conf.Memory, "1G"),
+		"memory_default":      cmp.Or(os.Getenv("OVNFS_MEMORY"), conf.Memory, defaultMemory.String()),
 		"fsync_default":       cmp.Or(os.Getenv("OVNFS_FSYNC"), conf.Fsync, "false"),
-		"node_cache_default":  cmp.Or(os.Getenv("OVNFS_NODE_CACHE"), conf.NodeCache, "512M"),
-		"blob_cache_default":  cmp.Or(os.Getenv("OVNFS_BLOB_CACHE"), conf.BlobCache, "512M"),
+		"node_cache_default":  cmp.Or(os.Getenv("OVNFS_NODE_CACHE"), conf.NodeCache, defaultNodeCache.String()),
+		"blob_cache_default":  cmp.Or(os.Getenv("OVNFS_BLOB_CACHE"), conf.BlobCache, defaultBlobCache.String()),
 		"atime_default":       cmp.Or(os.Getenv("OVNFS_ATIME"), conf.Atime, "false"),
 		"git_remotes_default": cmp.Or(os.Getenv("OVNFS_GIT_REMOTES"), conf.GitRemotes, "true"),
 	}
@@ -164,6 +178,7 @@ func (cmd *serveCmd) Run(c *cli) error {
 	if proto == "" {
 		proto = defaultProto()
 	}
+	go releaseIdle()
 	var mem *overlay.Memory
 	if cmd.Memory > 0 {
 		mem = overlay.NewMemory(int64(cmd.Memory), memoryFileMax, memoryIdle)

@@ -67,6 +67,7 @@ func (h *opsHandler) Call(ctx context.Context, op string, raw json.RawMessage) (
 		return dispatch(ctx, raw, func(context.Context, struct{}) (api.Status, error) {
 			s := api.Status{Version: protocolVersion, PID: os.Getpid(), Uptime: time.Since(h.started).Seconds(), Proto: h.welcome.Proto, Port: h.welcome.Port, Mount: h.welcome.Mount, State: h.welcome.State, Socket: socketPath(h.welcome.State)}
 			h.reg.Counts(&s)
+			reportHeap(&s)
 			if h.nodeCache != nil {
 				s.NodeCache = h.nodeCache()
 				if h.nodeIndexBytes != nil {

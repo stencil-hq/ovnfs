@@ -53,7 +53,7 @@ func TestColdSubtreeInvalidation(t *testing.T) {
 			if slices.Contains(recalled, sibling) {
 				t.Fatal("recalled a sibling")
 			}
-			if nt.find("co/t").dir.entries != nil || nt.find("co/s").dir.entries == nil {
+			if nt.find("co/t").dir.list != nil || nt.find("co/s").dir.list == nil {
 				t.Fatal("invalidated the wrong listings")
 			}
 			if got := nt.id("co/t/" + collideB); got == old {

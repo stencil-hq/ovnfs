@@ -35,7 +35,7 @@ type bottom struct {
 
 // Lstat returns current metadata for unchanged and live paths, captured metadata otherwise.
 func (v bottom) Lstat(p string) (os.FileInfo, error) {
-	_, info, err := v.b.resolve(overlay.Clean(p), v.fence)
+	_, info, _, err := v.b.resolve(overlay.Clean(p), v.fence)
 	return info, err
 }
 
@@ -44,43 +44,47 @@ func (v bottom) Lstat(p string) (os.FileInfo, error) {
 func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 	b := v.b
 	p = overlay.Clean(p)
-	_, info, err := b.resolve(p, v.fence)
+	_, info, dir, err := b.resolve(p, v.fence)
 	if err != nil {
 		return nil, err
 	}
 	if !info.IsDir() {
 		return nil, &fs.PathError{Op: "readdir", Path: p, Err: syscall.ENOTDIR}
 	}
-	if root, live := b.derivedRoot(p); live {
-		return b.liveDir(p, b.cacheFence(root, v.fence))
+	if root, class := b.derivedRoot(p); root != "" {
+		return b.liveDir(p, cacheFence(class, v.fence))
 	}
 	// Both lists are sorted. Native metadata serves every present child;
 	// captured names missing from the host still retain their fork-time info.
-	children := b.children[p]
+	// Names the capture never saw are not in the view.
+	x := b.index
+	i, end := x.children(dir)
 	lower, listErr := fsys.ReadDir(b.lower(p))
-	out := make([]os.FileInfo, 0, len(children))
-	for i, j := 0, 0; i < len(children) || j < len(lower); {
-		var child string
+	out := make([]os.FileInfo, 0, end-i)
+	for j := 0; i < end || j < len(lower); {
+		n := i
 		var entry os.DirEntry
 		switch {
-		case j == len(lower) || i < len(children) && path.Base(children[i]) < lower[j].Name():
-			child = children[i]
+		case j == len(lower) || i < end && x.compareName(i, lower[j].Name()) < 0:
 			i++
-		case i == len(children) || lower[j].Name() < path.Base(children[i]):
-			entry = lower[j]
-			child = path.Join(p, entry.Name())
+		case i == end || x.compareName(i, lower[j].Name()) > 0:
 			j++
+			continue
 		default:
 			entry = lower[j]
-			child = children[i]
 			i++
 			j++
 		}
-		if child == ".git" || source.IsJJPath(child) {
+		// A root is listed while the folder holds it; a captured path either way.
+		captured, class := x.kind(n) != kindNone, x.class(n)
+		if !captured && (entry == nil || !isLive(class)) {
 			continue
 		}
-		e, captured := b.sources[child]
-		if !captured && b.classes[child] != rules.Cache && b.classes[child] != rules.Local {
+		child := x.nameOf(n)
+		if p != "" {
+			child = p + "/" + child
+		}
+		if child == ".git" || source.IsJJPath(child) {
 			continue
 		}
 		var current os.FileInfo
@@ -92,10 +96,10 @@ func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 			}
 		}
 		if listErr != nil || err != nil {
-			_, current, err = b.resolve(child, v.fence)
+			_, current, _, err = b.resolve(child, v.fence)
 		} else if captured {
-			current, _ = b.sourceInfo(child, e, current)
-		} else if !b.lowerAncestorsAreDirs(child) || changedAfter(b.lower(child), current, b.cacheFence(child, v.fence)) {
+			current, _ = b.sourceInfo(child, n, current)
+		} else if !b.lowerAncestorsAreDirs(child) || changedAfter(b.lower(child), current, cacheFence(class, v.fence)) {
 			continue
 		}
 		if err != nil {
@@ -116,7 +120,7 @@ func (v bottom) ReadDir(p string) ([]os.FileInfo, error) {
 func (v bottom) Open(p string) (overlay.Content, error) {
 	b := v.b
 	p = overlay.Clean(p)
-	host, info, err := b.resolve(p, v.fence)
+	host, info, n, err := b.resolve(p, v.fence)
 	if err != nil {
 		return nil, err
 	}
@@ -133,11 +137,11 @@ func (v bottom) Open(p string) (overlay.Content, error) {
 			}
 			f.Close()
 		}
-		if _, live := b.derivedRoot(p); live {
+		if root, _ := b.derivedRoot(p); root != "" {
 			return nil, absent(p)
 		}
 	}
-	return b.blobFile(p, b.sources[p].oid)
+	return b.blobFile(p, b.index.oid(n))
 }
 
 // Readlink returns a symlink's target from the folder or the captured blob. A
@@ -147,7 +151,7 @@ func (v bottom) Open(p string) (overlay.Content, error) {
 func (v bottom) Readlink(p string) (string, error) {
 	b := v.b
 	p = overlay.Clean(p)
-	host, info, err := b.resolve(p, v.fence)
+	host, info, n, err := b.resolve(p, v.fence)
 	if err != nil {
 		return "", err
 	}
@@ -159,13 +163,13 @@ func (v bottom) Readlink(p string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if _, live := b.derivedRoot(p); live {
+		if root, _ := b.derivedRoot(p); root != "" {
 			target = b.relocate(host, target)
 		}
 		// Windows stores and reports targets with backslashes; views use slashes.
 		return filepath.ToSlash(target), nil
 	}
-	data, err := b.Blob(p, b.sources[p].oid)
+	data, err := b.Blob(p, b.index.oid(n))
 	return string(data), err
 }
 
@@ -187,7 +191,7 @@ func (b *Base) relocate(host, target string) string {
 // CopyTo materializes p (a whole directory tree, for renames) at the new path dst for copy-up.
 func (v bottom) CopyTo(p, dst string) error {
 	p = overlay.Clean(p)
-	_, info, err := v.b.resolve(p, v.fence)
+	_, info, _, err := v.b.resolve(p, v.fence)
 	if err != nil {
 		return err
 	}
@@ -234,30 +238,35 @@ func (v bottom) CopyTo(p, dst string) error {
 }
 
 // resolve finds what serves p: a host path (the folder's own entry) with its
-// current metadata, or "" with captured metadata when the captured blob serves it.
-// fence is the view's (see [bottom]).
-func (b *Base) resolve(p string, fence int64) (string, os.FileInfo, error) {
+// current metadata, or "" with captured metadata when the captured blob serves
+// it; n is p's index node when p is a captured source path. fence is the
+// view's (see [bottom]).
+func (b *Base) resolve(p string, fence int64) (host string, info os.FileInfo, n uint32, err error) {
 	if p == ".git" || strings.HasPrefix(p, ".git/") || source.IsJJPath(p) {
-		return "", nil, absent(p)
+		return "", nil, 0, absent(p)
 	}
-	if e, ok := b.sources[p]; ok {
+	n, root, class := b.find(p)
+	if root == "" {
 		host := b.lower(p)
 		current, _ := hostfile.Lstat(host)
-		info, live := b.sourceInfo(p, e, current)
+		info, live := b.sourceInfo(p, n, current)
 		if live {
-			return host, info, nil
+			return host, info, n, nil
 		}
-		return "", info, nil
+		return "", info, n, nil
 	}
-	if root, live := b.derivedRoot(p); root != "" && live {
-		return b.live(p, b.cacheFence(root, fence))
+	if isLive(class) {
+		host, info, err := b.live(p, cacheFence(class, fence))
+		return host, info, 0, err
 	}
-	return "", nil, absent(p)
+	return "", nil, 0, absent(p)
 }
 
-// sourceInfo selects current or captured metadata after a stat or bulk listing.
-func (b *Base) sourceInfo(p string, e entry, current os.FileInfo) (os.FileInfo, bool) {
-	if e.mode.IsDir() {
+// sourceInfo selects current or captured metadata of source path p, index
+// node n, after a stat or bulk listing.
+func (b *Base) sourceInfo(p string, n uint32, current os.FileInfo) (os.FileInfo, bool) {
+	mode := b.index.fileMode(n)
+	if mode.IsDir() {
 		if current != nil && current.IsDir() {
 			return current, true
 		}
@@ -265,13 +274,13 @@ func (b *Base) sourceInfo(p string, e entry, current os.FileInfo) (os.FileInfo, 
 		if p == "" {
 			name = "/"
 		}
-		return capturedInfo{name: name, mode: e.mode, mtime: b.meta.ForkTime}, false
+		return capturedInfo{name: name, mode: mode, mtime: b.meta.ForkTime}, false
 	}
-	captured := b.capture.Info[p]
-	if current != nil && b.unchanged(p, current, e, captured) {
+	captured, _ := b.index.info(n)
+	if current != nil && b.unchanged(p, current, mode, captured) {
 		return current, true
 	}
-	return capturedInfo{name: path.Base(p), mode: e.mode, size: captured.Size, mtime: presentedMtime(captured, b.meta.ForkTime)}, false
+	return capturedInfo{name: path.Base(p), mode: mode, size: captured.Size, mtime: presentedMtime(captured, b.meta.ForkTime)}, false
 }
 
 // presentedMtime is the mtime of a source file served from its capture: the
@@ -286,8 +295,8 @@ func presentedMtime(captured source.Info, fork time.Time) time.Time {
 // unchanged reports a folder entry that still is the captured file: same type,
 // size, mtime and inode. The inode check keeps a swapped-in lookalike (an
 // ancestor directory replaced by a copy) from being served as captured content.
-func (b *Base) unchanged(p string, current os.FileInfo, e entry, captured source.Info) bool {
-	if current.Mode().Type() != e.mode.Type() || current.Size() != captured.Size || !current.ModTime().Equal(captured.Mtime) {
+func (b *Base) unchanged(p string, current os.FileInfo, mode os.FileMode, captured source.Info) bool {
+	if current.Mode().Type() != mode.Type() || current.Size() != captured.Size || !current.ModTime().Equal(captured.Mtime) {
 		return false
 	}
 	if captured.Ino == 0 {
@@ -362,14 +371,17 @@ func (b *Base) live(p string, fence int64) (string, os.FileInfo, error) {
 	return host, info, nil
 }
 
-// cacheFence returns fence for a path below cache root root, else 0: local
-// paths (secrets, large files) keep following the folder.
-func (b *Base) cacheFence(root string, fence int64) int64 {
-	if b.classes[root] != rules.Cache {
+// cacheFence returns fence for a path below a root of class, if a cache root,
+// else 0: local paths (secrets, large files) keep following the folder.
+func cacheFence(class rules.Class, fence int64) int64 {
+	if class != rules.Cache {
 		return 0
 	}
 	return fence
 }
+
+// isLive reports a class of roots the view serves from the folder.
+func isLive(class rules.Class) bool { return class == rules.Cache || class == rules.Local }
 
 // changedAfter reports a folder entry a fenced view hides: a non-directory
 // whose change time (content, metadata or name; no tool sets it back, unlike
@@ -392,8 +404,8 @@ func (b *Base) Live(p string) bool {
 	if b.remote != nil {
 		return false
 	}
-	_, live := b.derivedRoot(overlay.Clean(p))
-	return live
+	root, _ := b.derivedRoot(overlay.Clean(p))
+	return root != ""
 }
 
 // Affects reports whether an edit at folder path p can make the folder differ
@@ -406,16 +418,8 @@ func (b *Base) Affects(p string) bool {
 	if b.remote != nil || source.IsJJPath(p) {
 		return false
 	}
-	for end := 0; end < len(p); {
-		end = nextPrefixEnd(p, end)
-		prefix := p[:end]
-		if _, ok := b.sources[prefix]; ok {
-			continue
-		}
-		_, known := b.classes[prefix]
-		return !known
-	}
-	return true
+	_, root, class := b.find(p)
+	return root == "" || class == ""
 }
 
 // nextPrefixEnd returns the end of the root-relative clean path p's component
@@ -431,24 +435,53 @@ func nextPrefixEnd(p string, from int) int {
 	return len(p)
 }
 
-// derivedRoot finds the first path prefix absent from the captured tree; live
-// reports a cache or local root, which the view serves from the folder. Any
-// other absent prefix (a hidden root, or a name that appeared after the
-// capture) does not exist in the view.
-func (b *Base) derivedRoot(p string) (root string, live bool) {
-	if p == "" {
-		return "", false
+// derivedRoot returns the cache or local root p is at or below, which the
+// view serves from the folder, and its class; "" for any other path.
+func (b *Base) derivedRoot(p string) (root string, class rules.Class) {
+	if _, root, class = b.find(p); isLive(class) {
+		return root, class
 	}
-	for end := 0; end < len(p); {
-		end = nextPrefixEnd(p, end)
-		prefix := p[:end]
-		if _, ok := b.sources[prefix]; ok {
-			continue
+	return "", ""
+}
+
+// find locates p in the captured tree. A captured source path yields its
+// index node and root "". Otherwise root is the first prefix of p absent from
+// the source paths, with the class the capture recorded for it: a cache or
+// local root is served from the folder; any other absent prefix (a hidden
+// root, or a name that appeared after the capture) does not exist in the view.
+func (b *Base) find(p string) (n uint32, root string, class rules.Class) {
+	x := b.index
+	// Mostly p is captured, or its parent is: two exact lookups settle it.
+	n, ok := x.lookup(p)
+	if ok && x.kind(n) != kindNone {
+		return n, "", ""
+	}
+	if ok && x.kind(x.parent(n)) != kindNone {
+		return 0, p, x.class(n)
+	}
+	if !ok {
+		if dir, found := x.lookup(parentOf(p)); found && x.kind(dir) != kindNone {
+			return 0, p, ""
 		}
-		class := b.classes[prefix]
-		return prefix, class == rules.Cache || class == rules.Local
 	}
-	return "", false
+	// Deeper below the first absent prefix: walk down to it.
+	n = 0
+	for end := 0; end < len(p); {
+		start := end
+		if start > 0 {
+			start++
+		}
+		end = nextPrefixEnd(p, end)
+		child, ok := x.child(n, p[start:end])
+		if !ok {
+			return 0, p[:end], ""
+		}
+		if x.kind(child) == kindNone {
+			return 0, p[:end], x.class(child)
+		}
+		n = child
+	}
+	return n, "", ""
 }
 
 // liveDir lists live directory p from the folder's own listing, minus entries

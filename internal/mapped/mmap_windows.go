@@ -1,6 +1,6 @@
 //go:build windows
 
-package object
+package mapped
 
 import (
 	"os"

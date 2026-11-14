@@ -34,34 +34,12 @@ const (
 	prefetchBatchBytes = 16 << 20
 )
 
-// remoteState is the lazily fetched side of a remote base.
+// remoteState is the lazily fetched side of a remote base. Cache roots, which
+// the source machine never sends, are present as empty directories.
 type remoteState struct {
 	b          *Base
-	emptyDirs  map[string]bool // cache roots: present as empty directories on this machine
 	mu         sync.Mutex
 	prefetched map[string]bool // directories whose siblings were already requested
-}
-
-// newRemoteState indexes cache roots as empty directories visible in listings.
-func newRemoteState(b *Base) *remoteState {
-	r := &remoteState{b: b, emptyDirs: map[string]bool{}, prefetched: map[string]bool{}}
-	for root, class := range b.classes {
-		if class != rules.Cache {
-			continue
-		}
-		if _, isFile := b.capture.Info[root]; isFile {
-			continue
-		}
-		r.emptyDirs[root] = true
-		parent := path.Dir(root)
-		if parent == "." {
-			parent = ""
-		}
-		if _, ok := b.sources[parent]; ok {
-			b.children[parent] = append(b.children[parent], root)
-		}
-	}
-	return r
 }
 
 // CreateRemote records a snapshot attached from another machine. res carries
@@ -73,11 +51,8 @@ func CreateRemote(c Config, res source.Result, r Remote) (*Base, error) {
 	if err := os.MkdirAll(c.StateDir, 0o700); err != nil {
 		return nil, err
 	}
-	if err := saveCapture(c.StateDir, &res); err != nil {
-		return nil, err
-	}
 	m := Meta{ID: c.ID, ForkTime: time.Now().UTC(), Tree: res.Tree, Remote: &r}
-	return load(c, m, &res)
+	return create(c, m, &res)
 }
 
 // ensure fetches one blob unless the store already holds it.
@@ -90,7 +65,8 @@ func (r *remoteState) ensure(p string, id store.OID) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
-	if err := r.b.config.Fetch(ctx, []Want{{ID: id, Path: p, Size: r.b.capture.Info[p].Size}}); err != nil {
+	info, _ := r.b.Info(p)
+	if err := r.b.config.Fetch(ctx, []Want{{ID: id, Path: p, Size: info.Size}}); err != nil {
 		if r.b.config.OnFault != nil {
 			r.b.config.OnFault(fmt.Sprintf("fetch %s from %s: %v", p, r.b.meta.Remote.Source, err))
 		}
@@ -142,31 +118,42 @@ func (r *remoteState) prefetch(p string) {
 	var wants []Want
 	var total int64
 	full := false
+	x := r.b.index
 	for queue := []string{dir}; len(queue) > 0 && !full; queue = queue[1:] {
 		d := queue[0]
 		if r.prefetched[d] {
 			continue
 		}
 		var subdirs []string
-		for _, q := range r.b.children[d] {
-			e, ok := r.b.sources[q]
-			if !ok {
+		dn, _ := x.lookup(d)
+		first, end := x.children(dn)
+		for n := first; n < end; n++ {
+			kind := x.kind(n)
+			if kind != kindDir && kind != kindFile {
 				continue
 			}
-			if e.mode.IsDir() {
+			q := x.nameOf(n)
+			if d != "" {
+				q = d + "/" + q
+			}
+			if kind == kindDir {
 				subdirs = append(subdirs, q)
 				continue
 			}
-			size := r.b.capture.Info[q].Size
-			if q == p || !e.mode.IsRegular() || size > prefetchFileLimit || r.b.config.Store.Has(e.oid) || r.b.mirrored(e.oid) {
+			info, _ := x.info(n)
+			if q == p || info.Size > prefetchFileLimit {
 				continue
 			}
-			if len(wants) == prefetchBatchFiles || total+size > prefetchBatchBytes {
+			id := x.oid(n)
+			if r.b.config.Store.Has(id) || r.b.mirrored(id) {
+				continue
+			}
+			if len(wants) == prefetchBatchFiles || total+info.Size > prefetchBatchBytes {
 				full = true
 				break
 			}
-			wants = append(wants, Want{ID: e.oid, Path: q, Size: size})
-			total += size
+			wants = append(wants, Want{ID: id, Path: q, Size: info.Size})
+			total += info.Size
 		}
 		if !full {
 			r.prefetched[d] = true
@@ -190,12 +177,11 @@ func (b *Base) Uncached(p string) (Want, bool) {
 	if b.remote == nil {
 		return Want{}, false
 	}
-	p = overlay.Clean(p)
-	e, ok := b.sources[p]
-	if !ok || !e.mode.IsRegular() {
+	n, ok := b.index.lookup(overlay.Clean(p))
+	if !ok || b.index.kind(n) != kindFile {
 		return Want{}, false
 	}
-	return b.want(p, e)
+	return b.want(overlay.Clean(p), n)
 }
 
 // Missing lists, in no particular order, the blobs a remote base would still
@@ -207,24 +193,26 @@ func (b *Base) Missing() []Want {
 		return nil
 	}
 	var wants []Want
-	for p, e := range b.sources {
-		if !e.mode.IsRegular() && e.mode&os.ModeSymlink == 0 {
-			continue
+	b.index.walk(func(p string, n uint32) bool {
+		if kind := b.index.kind(n); kind == kindFile || kind == kindSymlink {
+			if w, ok := b.want(p, n); ok {
+				wants = append(wants, w)
+			}
 		}
-		if w, ok := b.want(p, e); ok {
-			wants = append(wants, w)
-		}
-	}
+		return true
+	})
 	return wants
 }
 
-// want is the fetch the blob of entry e at p needs, unless the store or the
-// git mirror already holds it.
-func (b *Base) want(p string, e entry) (Want, bool) {
-	if b.config.Store.Has(e.oid) || b.mirrored(e.oid) {
+// want is the fetch the blob of p, index node n, needs, unless the store or
+// the git mirror already holds it.
+func (b *Base) want(p string, n uint32) (Want, bool) {
+	id := b.index.oid(n)
+	if b.config.Store.Has(id) || b.mirrored(id) {
 		return Want{}, false
 	}
-	return Want{ID: e.oid, Path: p, Size: b.capture.Info[p].Size}, true
+	info, _ := b.index.info(n)
+	return Want{ID: id, Path: p, Size: info.Size}, true
 }
 
 // FetchMatching fetches, in one batch, every uncached regular file of a
@@ -235,13 +223,14 @@ func (b *Base) FetchMatching(ctx context.Context, keep func(p string) bool) erro
 		return nil
 	}
 	var wants []Want
-	for p := range b.sources {
-		if keep(p) {
-			if w, ok := b.Uncached(p); ok {
+	b.index.walk(func(p string, n uint32) bool {
+		if b.index.kind(n) == kindFile && keep(p) {
+			if w, ok := b.want(p, n); ok {
 				wants = append(wants, w)
 			}
 		}
-	}
+		return true
+	})
 	if len(wants) == 0 {
 		return nil
 	}
@@ -253,18 +242,28 @@ type remoteBottom struct{ b *Base }
 
 // info describes p from the offer, without fetching anything.
 func (v remoteBottom) info(p string) (os.FileInfo, error) {
-	b := v.b
 	p = overlay.Clean(p)
-	if e, ok := b.sources[p]; ok {
-		meta := b.capture.Info[p]
+	n, ok := v.b.index.lookup(p)
+	if !ok {
+		return nil, absent(p)
+	}
+	return v.nodeInfo(p, n)
+}
+
+// nodeInfo describes p, index node n: an offered path, or a cache root
+// (one that is no file) as an empty directory.
+func (v remoteBottom) nodeInfo(p string, n uint32) (os.FileInfo, error) {
+	x := v.b.index
+	meta, hasInfo := x.info(n)
+	if x.kind(n) != kindNone {
 		mtime := meta.Mtime
 		if mtime.IsZero() {
-			mtime = b.meta.ForkTime
+			mtime = v.b.meta.ForkTime
 		}
-		return capturedInfo{name: path.Base("/" + p), mode: e.mode, size: meta.Size, mtime: mtime}, nil
+		return capturedInfo{name: path.Base("/" + p), mode: x.fileMode(n), size: meta.Size, mtime: mtime}, nil
 	}
-	if b.remote.emptyDirs[p] {
-		return capturedInfo{name: path.Base(p), mode: os.ModeDir | 0o755, mtime: b.meta.ForkTime}, nil
+	if x.class(n) == rules.Cache && !hasInfo {
+		return capturedInfo{name: path.Base(p), mode: os.ModeDir | 0o755, mtime: v.b.meta.ForkTime}, nil
 	}
 	return nil, absent(p)
 }
@@ -282,10 +281,12 @@ func (v remoteBottom) ReadDir(p string) ([]os.FileInfo, error) {
 	if !info.IsDir() {
 		return nil, &fs.PathError{Op: "readdir", Path: p, Err: syscall.ENOTDIR}
 	}
-	children := v.b.children[p]
-	out := make([]os.FileInfo, 0, len(children))
-	for _, name := range children {
-		if child, err := v.info(name); err == nil {
+	x := v.b.index
+	dir, _ := x.lookup(p)
+	first, end := x.children(dir)
+	out := make([]os.FileInfo, 0, end-first)
+	for n := first; n < end; n++ {
+		if child, err := v.nodeInfo(path.Join(p, x.nameOf(n)), n); err == nil {
 			out = append(out, child)
 		}
 	}
@@ -296,37 +297,38 @@ func (v remoteBottom) ReadDir(p string) ([]os.FileInfo, error) {
 // from memory when the store caches it.
 func (v remoteBottom) Open(p string) (overlay.Content, error) {
 	p = overlay.Clean(p)
-	e, ok := v.b.sources[p]
-	if !ok {
+	n, ok := v.b.index.lookup(p)
+	if !ok || v.b.index.kind(n) == kindNone {
 		return nil, absent(p)
 	}
-	if !e.mode.IsRegular() {
+	if v.b.index.kind(n) != kindFile {
 		return nil, &fs.PathError{Op: "open", Path: p, Err: syscall.EISDIR}
 	}
-	if !v.b.config.Store.Has(e.oid) {
+	id := v.b.index.oid(n)
+	if !v.b.config.Store.Has(id) {
 		// Siblings ride along on a link miss's round trip; a hit, or a blob the
 		// mirror holds, has none to share.
-		if !v.b.mirrored(e.oid) {
+		if !v.b.mirrored(id) {
 			v.b.remote.prefetch(p)
 		}
-		if err := v.b.remote.ensure(p, e.oid); err != nil {
+		if err := v.b.remote.ensure(p, id); err != nil {
 			return nil, err
 		}
 	}
-	if data, ok := v.b.config.Store.Cached(e.oid); ok {
+	if data, ok := v.b.config.Store.Cached(id); ok {
 		return overlay.ByteContent(data), nil
 	}
-	return v.b.config.Store.Open(e.oid)
+	return v.b.config.Store.Open(id)
 }
 
 // Readlink returns a symlink's target, fetching it if needed.
 func (v remoteBottom) Readlink(p string) (string, error) {
 	p = overlay.Clean(p)
-	e, ok := v.b.sources[p]
-	if !ok || e.mode&os.ModeSymlink == 0 {
+	n, ok := v.b.index.lookup(p)
+	if !ok || v.b.index.kind(n) != kindSymlink {
 		return "", &fs.PathError{Op: "readlink", Path: p, Err: syscall.EINVAL}
 	}
-	data, err := v.b.Blob(p, e.oid)
+	data, err := v.b.Blob(p, v.b.index.oid(n))
 	return string(data), err
 }
 
@@ -342,8 +344,12 @@ func (v remoteBottom) CopyTo(p, dst string) error {
 		if err := os.Mkdir(dst, info.Mode().Perm()|0o700); err != nil {
 			return err
 		}
-		for _, child := range v.b.children[p] {
-			if err := v.CopyTo(child, filepath.Join(dst, path.Base(child))); err != nil && !os.IsNotExist(err) {
+		x := v.b.index
+		dir, _ := x.lookup(p)
+		first, end := x.children(dir)
+		for n := first; n < end; n++ {
+			name := x.nameOf(n)
+			if err := v.CopyTo(path.Join(p, name), filepath.Join(dst, name)); err != nil && !os.IsNotExist(err) {
 				return err
 			}
 		}
@@ -359,11 +365,12 @@ func (v remoteBottom) CopyTo(p, dst string) error {
 			return err
 		}
 	default:
-		e := v.b.sources[p]
-		if err := v.b.remote.ensure(p, e.oid); err != nil {
+		n, _ := v.b.index.lookup(p)
+		id := v.b.index.oid(n)
+		if err := v.b.remote.ensure(p, id); err != nil {
 			return err
 		}
-		if err := v.b.config.Store.CloneBlob(e.oid, dst, info.Mode().Perm()); err != nil {
+		if err := v.b.config.Store.CloneBlob(id, dst, info.Mode().Perm()); err != nil {
 			return err
 		}
 	}

@@ -265,10 +265,11 @@ func Open(c Config) (*Registry, error) {
 	return r, nil
 }
 
-// openBases restores the persisted bases into r.bases, several at a time:
-// each reads its capture and flattens its tree, which dominates restoring a
-// registry of many large bases. On failure it closes the bases it opened and
-// returns the first error in metas' order.
+// openBases restores the persisted bases into r.bases, several at a time: a
+// base from an older build migrates its capture into a capture index once,
+// which dominates the first restore of a registry of many large bases. On
+// failure it closes the bases it opened and returns the first error in metas'
+// order.
 func (r *Registry) openBases(metas []base.Meta) error {
 	records := make([]*baseRecord, len(metas))
 	errs := make([]error, len(metas))

@@ -2,7 +2,6 @@ package checkout
 
 import (
 	"context"
-	"maps"
 	"path"
 	"path/filepath"
 	"strings"
@@ -32,7 +31,7 @@ func (r *Registry) folder(dir string, extra []string) (string, manifest.Manifest
 	if repo, err := git.Open(root); err == nil && repo.Top == root {
 		repos = append(repos, source.Repo{Path: ""})
 	}
-	domains, err := source.NewDomains(root, repos)
+	domains, err := source.NewDomains(root, repos, nil)
 	if err != nil {
 		return "", manifest.Manifest{}, nil, coded(err)
 	}
@@ -122,15 +121,17 @@ func (r *Registry) Plan(ctx context.Context, args api.PlanArgs) (api.PlanReply, 
 		if err != nil {
 			return api.PlanReply{}, coded(err)
 		}
-		captured := h.base.view.Capture()
-		info := make(map[string]source.Info, len(captured.Info)+len(now.layers))
-		maps.Copy(info, captured.Info)
-		for p, l := range now.layers {
-			if e, ok := l.Get(p); ok && e.Info != nil {
-				info[p] = source.Info{Mtime: e.Info.ModTime(), Size: e.Info.Size()}
+		view := h.base.view
+		info := func(p string) source.Info {
+			if l, ok := now.layers[p]; ok {
+				if e, ok := l.Get(p); ok && e.Info != nil {
+					return source.Info{Mtime: e.Info.ModTime(), Size: e.Info.Size()}
+				}
 			}
+			info, _ := view.Info(p)
+			return info
 		}
-		in.Root, in.Files, in.Info, in.Roots, in.Domains, in.Lock = h.base.view.Meta().Dir, now.files, info, captured.Roots, h.base.view.Domains(), h.base.lock
+		in.Root, in.Files, in.Info, in.Roots, in.Domains, in.Lock = view.Meta().Dir, now.files, info, view.Roots(), view.Domains(), h.base.lock
 	} else {
 		root, m, _, err := r.folder(args.Dir, args.Rules)
 		if err != nil {
@@ -140,7 +141,7 @@ func (r *Registry) Plan(ctx context.Context, args api.PlanArgs) (api.PlanReply, 
 		if err != nil {
 			return api.PlanReply{}, coded(err)
 		}
-		in.Root, in.Files, in.Info, in.Roots, in.Domains, in.Lock = root, res.Files, res.Info, res.Roots, res.Domains, m.Lock()
+		in.Root, in.Files, in.Info, in.Roots, in.Domains, in.Lock = root, res.Files, func(p string) source.Info { return res.Info[p] }, res.Roots, res.Domains, m.Lock()
 		warnings = res.Warnings
 	}
 	reply, err := source.Plan(ctx, in)

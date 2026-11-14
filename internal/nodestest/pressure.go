@@ -2,8 +2,10 @@
 package nodestest
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -61,7 +63,8 @@ func New(t testing.TB, files map[string]string) (*export.Export, string) {
 }
 
 // Cold checks the exact derived owner in the disposable index, not just that
-// some directory spilled.
+// some directory spilled: the slot of the id's directory key locates its
+// owner index chain in the instance's pack (see export/nodes_cold.go).
 func Cold(t testing.TB, state string, id uint64, name string) {
 	t.Helper()
 	if id&(1<<52) == 0 {
@@ -69,25 +72,95 @@ func Cold(t testing.TB, state string, id uint64, name string) {
 	}
 	key := id >> 22 & ((1 << 30) - 1)
 	hash := uint32(id & ((1 << 22) - 1))
-	files, _ := filepath.Glob(filepath.Join(state, "nodes.log.cache", "instance-*", fmt.Sprintf("%02x", key&255), fmt.Sprint(key)))
+	cache := filepath.Join(state, "nodes.log.cache")
+	slot := coldSlot(t, cache, key)
+	size, at := binary.LittleEndian.Uint64(slot[24:])&(1<<40-1), binary.LittleEndian.Uint64(slot[32:])&(1<<62-1)
+	pack := readOne(t, filepath.Join(cache, "instance-*", "pack-*"))
+	for size > 0 {
+		if at+size > uint64(len(pack)) {
+			t.Fatalf("owner index of %x beyond its pack", id)
+		}
+		seg := pack[at : at+size]
+		size = 0
+		for i := range binary.LittleEndian.Uint32(seg) {
+			row := seg[4+16*i:]
+			length, offset := binary.LittleEndian.Uint32(row[4:]), binary.LittleEndian.Uint64(row[8:])
+			switch binary.LittleEndian.Uint32(row) {
+			case hash:
+				if string(seg[offset:offset+uint64(length)]) == name {
+					return
+				}
+				t.Fatalf("index has no owner %s for %x", name, id)
+			case 1<<32 - 1: // the link to the segment this one extends
+				size, at = uint64(length), offset
+			}
+		}
+	}
+	t.Fatalf("index has no owner %s for %x", name, id)
+}
+
+// coldSlot returns the logged node index slot of key.
+func coldSlot(t testing.TB, cache string, key uint64) []byte {
+	t.Helper()
+	nodes, _ := filepath.Glob(filepath.Join(cache, "nodes-*"))
+	if len(nodes) != 1 {
+		t.Fatalf("logged node indexes: %v", nodes)
+	}
+	table := readOne(t, filepath.Join(nodes[0], "table"))
+	base, count := binary.LittleEndian.Uint64(table[16:]), binary.LittleEndian.Uint64(table[24:])
+	if key >= base {
+		runtime := readOne(t, filepath.Join(nodes[0], "runtime"))
+		if at := (key - base) * 40; at+40 <= uint64(len(runtime)) {
+			return runtime[at : at+40]
+		}
+	}
+	for i := range count {
+		if slot := table[32+40*i:]; binary.LittleEndian.Uint64(slot) == key {
+			return slot[:40]
+		}
+	}
+	t.Fatalf("no slot for key %d", key)
+	return nil
+}
+
+// readOne reads the one file matching pattern.
+func readOne(t testing.TB, pattern string) []byte {
+	t.Helper()
+	files, _ := filepath.Glob(pattern)
 	if len(files) != 1 {
-		t.Fatalf("cold index for %x: %v", id, files)
+		t.Fatalf("%s: %v", pattern, files)
 	}
 	data, err := os.ReadFile(files[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range binary.LittleEndian.Uint32(data[:4]) {
-		row := data[4+16*i:]
-		if binary.LittleEndian.Uint32(row) == hash {
-			size := binary.LittleEndian.Uint32(row[4:])
-			off := binary.LittleEndian.Uint64(row[8:])
-			if string(data[off:off+uint64(size)]) == name {
-				return
-			}
+	return data
+}
+
+// BreakCold makes every cold owner the export spilled unreadable, as a
+// damaged index would: the owner index segments claim more rows than they
+// hold, so the next lookup of a cold owner latches the identity fault.
+func BreakCold(t testing.TB, state string) {
+	t.Helper()
+	packs, _ := filepath.Glob(filepath.Join(state, "nodes.log.cache", "instance-*", "pack-*"))
+	if len(packs) == 0 {
+		t.Fatal("no cold owner index")
+	}
+	for _, pack := range packs {
+		info, err := os.Stat(pack)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(pack, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Overwritten in place: the export reads the pack through a mapping.
+		_, err = f.WriteAt(bytes.Repeat([]byte{0xff}, int(info.Size())), 0)
+		if err := errors.Join(err, f.Close()); err != nil {
+			t.Fatal(err)
 		}
 	}
-	t.Fatalf("index has no owner %s for %x", name, id)
 }
 
 // Client performs protocol operations without pinning the stateless handles

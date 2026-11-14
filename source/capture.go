@@ -115,7 +115,7 @@ func Capture(ctx context.Context, o Options) (Result, error) {
 			w.warn(fmt.Sprintf("repository has an unfinished %s; its index was captured as is", busy))
 		}
 	}
-	domains, err := NewDomains(o.Root, repos)
+	domains, err := NewDomains(o.Root, repos, nil)
 	if err != nil {
 		return Result{}, err
 	}
@@ -475,7 +475,7 @@ func (w *walker) resolvePending(ctx context.Context) {
 func (w *walker) resolve(ctx context.Context, j hashJob) {
 	dom := w.domains.For(j.p)
 	rel := dom.rel(j.p)
-	entry, tracked := dom.index[rel]
+	entry, tracked := dom.indexed(rel)
 	if e, ok := w.cacheIn[j.p]; ok && e.matches(j.info, j.key, j.mode) {
 		indexed := tracked && entry.OID == string(e.OID)
 		if indexed || w.o.Store == nil || w.cacheStored || w.o.Store.Has(e.OID) {
@@ -487,9 +487,9 @@ func (w *walker) resolve(ctx context.Context, j hashJob) {
 			return
 		}
 	}
-	if tracked && indexClean(entry, j.info, j.key, j.mode, dom.indexAt.Modified) {
+	if tracked && indexClean(entry, j.info, j.key, j.mode, dom.index.Modified) {
 		// Tracked and unchanged: the user's repository holds the content unless git converts it.
-		w.verifier(dom.path, dom.repo, &dom.indexAt).add(ctx, rel, entry.OID, j)
+		w.verifier(dom.path, dom.repo, &dom.index).add(ctx, rel, entry.OID, j)
 		return
 	}
 	w.jobs <- j

@@ -117,13 +117,13 @@ func (r *Registry) Offer(ctx context.Context, name, remoteName string) (peer.Off
 	if err != nil {
 		return peer.Offer{}, nil, api.Snapshot{}, coded(err)
 	}
-	captured := h.base.view.Capture()
+	view := h.base.view
 	entries := make([]peer.Entry, 0, len(files))
 	for _, p := range source.SortedPaths(files) {
 		f := files[p]
 		e := peer.Entry{Path: p, Mode: f.Mode, ID: f.ID, Mtime: snap.Snapshot.Created.UnixNano()}
 		if f.Mode != store.ModeDir {
-			if info, ok := captured.Info[p]; ok && captured.Files[p] == f {
+			if info, ok := view.Info(p); ok && leafIs(view, p, f) {
 				e.Size, e.Mtime = info.Size, info.Mtime.UnixNano()
 			} else if size, err := st.Size(f.ID); err == nil {
 				e.Size = size
@@ -136,9 +136,15 @@ func (r *Registry) Offer(ctx context.Context, name, remoteName string) (peer.Off
 	if remoteName == "" {
 		remoteName = name
 	}
-	offer := peer.Offer{Node: r.node, Source: host + ":" + meta.Dir, Name: remoteName, Tree: store.OID(snap.Snapshot.Tree), Lock: h.base.lock, Files: entries, Roots: captured.Roots, Created: snap.Snapshot.Created,
+	offer := peer.Offer{Node: r.node, Source: host + ":" + meta.Dir, Name: remoteName, Tree: store.OID(snap.Snapshot.Tree), Lock: h.base.lock, Files: entries, Roots: view.Roots(), Created: snap.Snapshot.Created,
 		Origins: offerOrigins(ctx, h.base.view.Domains())}
 	return offer, baseBlobs{h.base.view}, snap.Snapshot, nil
+}
+
+// leafIs reports whether f is the leaf the base captured at p.
+func leafIs(view *base.Base, p string, f store.File) bool {
+	leaf, ok := view.Leaf(p)
+	return ok && leaf == f
 }
 
 // baseBlobs serves an offered snapshot's content: from the store, else from the source folder's git objects.

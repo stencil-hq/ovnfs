@@ -20,8 +20,50 @@ func forceCold(t *testing.T, nt *nodeTable, ns *namespace, dir string) {
 	})
 	nt.cacheLimit = 0
 	nt.id("pressure/entry")
-	if d := nt.find(dir); d != nil && (d.dir == nil || d.dir.entries != nil || len(d.dir.leaves) != 0) {
+	if d := nt.find(dir); d != nil && (d.dir == nil || d.dir.list != nil || len(d.dir.leaves) != 0) {
 		t.Fatalf("%s was not evicted", dir)
+	}
+}
+
+// ownerHead returns where key's owner index starts in the pack: its head
+// segment, as its resident directory or its slot locates it.
+func ownerHead(t *testing.T, nt *nodeTable, key uint64) int64 {
+	t.Helper()
+	nt.mu.Lock()
+	defer nt.mu.Unlock()
+	if d := nt.byKey[key]; d != nil {
+		if d.dir == nil || !d.dir.cold {
+			t.Fatalf("key %d has no owner index", key)
+		}
+		return d.dir.base
+	}
+	s, _, err := nt.index.slot(key)
+	if err != nil || s.key != key || s.owner.size == 0 {
+		t.Fatalf("key %d has no owner index: %v", key, err)
+	}
+	return s.owner.base
+}
+
+// breakOwners claims more rows than the segment at at in pack holds, making
+// its owner index unreadable, and returns a function restoring it.
+func breakOwners(t *testing.T, pack string, at int64) (restore func()) {
+	t.Helper()
+	f, err := os.OpenFile(pack, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	var saved [4]byte
+	if _, err := f.ReadAt(saved[:], at); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xff, 0xff, 0xff, 0xff}, at); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if _, err := f.WriteAt(saved[:], at); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -168,7 +210,7 @@ func TestColdListingGeneration(t *testing.T) {
 	infos, _ := ns.list("co")
 	forceCold(t, nt, ns, "co")
 	nt.observe(l, infos)
-	if nt.find("co").dir.entries != nil {
+	if nt.find("co").dir.list != nil {
 		t.Fatal("late listing resurrected cache")
 	}
 }
@@ -288,21 +330,12 @@ func TestColdGuardRejectsReadFailure(t *testing.T) {
 	old := nt.id("co/file")
 	forceCold(t, nt, ns, "co")
 	d := nt.find("co")
-	file := nt.coldPath(d)
-	data, err := os.ReadFile(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(file); err != nil {
-		t.Fatal(err)
-	}
+	restore := breakOwners(t, nt.pack.path, ownerHead(t, nt, d.key))
 	if release, err := nt.guard(false, "co/file"); err == nil {
 		release()
 		t.Fatal("unreadable ownership allowed a mutation")
 	}
-	if err := os.WriteFile(file, data, 0600); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 	nt.cacheErr = nil
 	nt.fault.Store(nil)
 	release, err := nt.guard(false, "co/file")
@@ -339,7 +372,7 @@ func TestObservationRejectsRelocation(t *testing.T) {
 	nt.rename("co/moved", "co/d")
 	nt.observe(l, infos)
 	s := nt.find("co/d").dir
-	if s.entries[nameHash("replacement")] == "replacement" {
+	if s.list != nil && s.list.index("replacement") >= 0 {
 		t.Fatal("installed another directory's listing")
 	}
 }
@@ -392,20 +425,15 @@ func TestColdReadFailureDoesNotAllocate(t *testing.T) {
 	key := nt.find("co").key
 	nt.cacheLimit = 0
 	nt.id("pressure/entry")
-	name := coldIndexPath(nt.coldRoot, key)
+	restore := breakOwners(t, nt.pack.path, ownerHead(t, nt, key))
 	before, next := logSize(t, nt.log.Name()), nt.next
-	if err := os.Rename(name, name+".saved"); err != nil {
-		t.Fatal(err)
-	}
 	if id := nt.id("co/file"); id != 0 {
 		t.Fatalf("failed read allocated %x", id)
 	}
 	if nt.cacheErr == nil || nt.next != next || logSize(t, nt.log.Name()) != before {
 		t.Fatal("read failure changed logged identities")
 	}
-	if err := os.Rename(name+".saved", name); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 	// A recovered host read cannot clear the fault or permit promotion.
 	ns.del("co/file")
 	nt.unlist("co", true)

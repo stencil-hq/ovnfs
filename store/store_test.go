@@ -34,13 +34,17 @@ func openStoreCache(t *testing.T, cache int64) *Store {
 func age(t *testing.T, s *Store, id OID, at time.Time) {
 	t.Helper()
 	r := rawOf(id)
+	s.packs.touchMu.Lock()
 	s.packs.mu.Lock()
-	e, ok := s.packs.index[r]
-	if ok {
+	x, i, e, ok := s.packs.locate(r)
+	if x != nil {
+		x.setAt(i, at.UnixNano())
+	} else if ok {
 		e.at = at.UnixNano()
-		s.packs.index[r] = e
+		s.packs.entries[r] = e
 	}
 	s.packs.mu.Unlock()
+	s.packs.touchMu.Unlock()
 	if !ok {
 		if err := os.Chtimes(s.objectPath(id), at, at); err != nil {
 			t.Fatal(err)
@@ -48,13 +52,17 @@ func age(t *testing.T, s *Store, id OID, at time.Time) {
 	}
 }
 
-// forget drops stored object id's packed or loose copy, leaving any cached body.
+// forget drops stored object id's copy in the active pack or its loose copy,
+// leaving any cached body.
 func forget(t *testing.T, s *Store, id OID) {
 	t.Helper()
 	s.packs.mu.Lock()
-	_, ok := s.packs.index[rawOf(id)]
-	delete(s.packs.index, rawOf(id))
+	x, _, _, ok := s.packs.locate(rawOf(id))
+	delete(s.packs.entries, rawOf(id))
 	s.packs.mu.Unlock()
+	if x != nil {
+		t.Fatalf("%s is in a sealed pack", id)
+	}
 	if !ok {
 		if err := removeFile(s.objectPath(id)); err != nil {
 			t.Fatal(err)
@@ -63,6 +71,28 @@ func forget(t *testing.T, s *Store, id OID) {
 	if s.Has(id) {
 		t.Fatalf("%s still stored", id)
 	}
+}
+
+// packedObjects returns every packed object as lookups find it.
+func packedObjects(s *Store) map[rawID]packed {
+	s.packs.mu.RLock()
+	defer s.packs.mu.RUnlock()
+	objects := map[rawID]packed{}
+	for _, x := range s.packs.sources() {
+		for i := range x.n {
+			if _, ok := objects[x.id(i)]; !ok {
+				e := x.entry(i)
+				e.at = x.at(i)
+				objects[x.id(i)] = e
+			}
+		}
+	}
+	for id, e := range s.packs.entries {
+		if _, ok := objects[id]; !ok {
+			objects[id] = e
+		}
+	}
+	return objects
 }
 
 // gitRepo creates a SHA-1 repository in a temp directory, skipping when git is unavailable.

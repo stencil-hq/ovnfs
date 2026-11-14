@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 	"sync/atomic"
+
+	"github.com/stencil-hq/ovnfs/internal/mapped"
 )
 
 // Pack entry types beyond the four object kinds.
@@ -25,8 +27,10 @@ const maxDeltaChain = 10000
 type pack struct {
 	path string // the .pack file
 	idx  *packIndex
-	data *mappedFile
+	data *mapped.File
 	refs atomic.Int64
+	// dropped is set once the pack is retired; guarded by deltaBases.mu.
+	dropped bool
 }
 
 func openPack(idxPath string, f Format) (*pack, error) {
@@ -35,15 +39,15 @@ func openPack(idxPath string, f Format) (*pack, error) {
 		return nil, err
 	}
 	path := strings.TrimSuffix(idxPath, ".idx") + ".pack"
-	data, err := openMapped(path)
+	data, err := mapped.Open(path)
 	if err != nil {
-		idx.m.close()
+		idx.m.Close()
 		return nil, err
 	}
 	p := &pack{path: path, idx: idx, data: data}
 	if err := p.check(); err != nil {
-		idx.m.close()
-		data.close()
+		idx.m.Close()
+		data.Close()
 		return nil, fmt.Errorf("pack %s: %w", path, err)
 	}
 	p.refs.Store(1)
@@ -53,10 +57,10 @@ func openPack(idxPath string, f Format) (*pack, error) {
 // check verifies the pack header and that the index was built for this pack.
 func (p *pack) check() error {
 	hs := int64(p.idx.format.Size())
-	if p.data.size < 12+hs {
+	if p.data.Size() < 12+hs {
 		return fmt.Errorf("file too short")
 	}
-	hdr, err := p.data.slice(0, 12)
+	hdr, err := p.data.Slice(0, 12)
 	if err != nil {
 		return err
 	}
@@ -69,7 +73,7 @@ func (p *pack) check() error {
 	if n := binary.BigEndian.Uint32(hdr[8:]); int(n) != p.idx.count {
 		return fmt.Errorf("pack has %d objects, index %d", n, p.idx.count)
 	}
-	sum, err := p.data.slice(p.data.size-hs, hs)
+	sum, err := p.data.Slice(p.data.Size()-hs, hs)
 	if err != nil {
 		return err
 	}
@@ -96,8 +100,8 @@ func (p *pack) acquire() bool {
 // owning object directory holds one reference until it retires the pack.
 func (p *pack) release() {
 	if p.refs.Add(-1) == 0 {
-		p.idx.m.close()
-		p.data.close()
+		p.idx.m.Close()
+		p.data.Close()
 	}
 }
 
@@ -113,11 +117,11 @@ type entryHeader struct {
 
 func (p *pack) entryAt(off int64) (entryHeader, error) {
 	f := p.idx.format
-	end := p.data.size - int64(f.Size())
+	end := p.data.Size() - int64(f.Size())
 	if off < 12 || off >= end {
 		return entryHeader{}, fmt.Errorf("pack %s: entry offset %d out of range", p.path, off)
 	}
-	b, err := p.data.slice(off, min(end-off, int64(20+f.Size())))
+	b, err := p.data.Slice(off, min(end-off, int64(20+f.Size())))
 	if err != nil {
 		return entryHeader{}, err
 	}
@@ -187,10 +191,10 @@ func parseEntryHeader(b []byte, off int64, f Format) (entryHeader, error) {
 
 // inflateAt decompresses an entry's data.
 func (p *pack) inflateAt(h entryHeader) ([]byte, error) {
-	if h.size > (p.data.size-h.data)*maxDeflateRatio+64 {
+	if h.size > (p.data.Size()-h.data)*maxDeflateRatio+64 {
 		return nil, fmt.Errorf("pack %s: entry at %d claims impossible size %d", p.path, h.off, h.size)
 	}
-	b, err := inflate(p.data.reader(h.data), h.size)
+	b, err := inflate(p.data.Reader(h.data), h.size)
 	if err != nil {
 		return nil, fmt.Errorf("pack %s: entry at %d: %w", p.path, h.off, err)
 	}
@@ -211,7 +215,7 @@ walk:
 		if len(chain) > maxDeltaChain {
 			return 0, nil, fmt.Errorf("pack %s: delta chain too long at %d", p.path, off)
 		}
-		if k, d, ok := db.cache.get(baseKey{p, off}); ok {
+		if k, d, ok := deltaBases.get(baseKey{p, off}); ok {
 			kind, data, shared = k, d, true
 			break
 		}
@@ -247,7 +251,7 @@ walk:
 				return 0, nil, err
 			}
 			if len(chain) > 0 {
-				db.cache.put(baseKey{p, off}, kind, data)
+				deltaBases.put(baseKey{p, off}, kind, data)
 				shared = true
 			}
 			break walk
@@ -263,7 +267,7 @@ walk:
 		}
 		shared = false
 		if i > 0 {
-			db.cache.put(baseKey{p, chain[i].off}, kind, data)
+			deltaBases.put(baseKey{p, chain[i].off}, kind, data)
 			shared = true
 		}
 	}
@@ -290,7 +294,7 @@ func (p *pack) header(db *DB, off int64, depth int) (Kind, int64, error) {
 	}
 	// A chain of maxDeltaChain deltas takes one more step to reach its base.
 	for range maxDeltaChain + 1 {
-		if k, _, ok := db.cache.get(baseKey{p, h.off}); ok {
+		if k, _, ok := deltaBases.get(baseKey{p, h.off}); ok {
 			return k, size, nil
 		}
 		switch h.typ {
@@ -323,7 +327,7 @@ func (p *pack) header(db *DB, off int64, depth int) (Kind, int64, error) {
 
 // deltaResultSize inflates just enough of a delta to read its result size.
 func (p *pack) deltaResultSize(h entryHeader) (int64, error) {
-	z, err := openZlib(p.data.reader(h.data))
+	z, err := openZlib(p.data.Reader(h.data))
 	if err != nil {
 		return 0, fmt.Errorf("pack %s: entry at %d: zlib: %w", p.path, h.off, err)
 	}

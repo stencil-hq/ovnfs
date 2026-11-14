@@ -82,7 +82,6 @@ func openNodeTable(name string, list func(dir string) ([]os.FileInfo, error)) (*
 		if err := t.replay(name, prior); err != nil {
 			return nil, err
 		}
-		t.deadFiles = append(t.deadFiles, garbageFiles(t.coldParent, head)...)
 	}
 	t.log, err = os.OpenFile(name, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -94,19 +93,6 @@ func openNodeTable(name string, list func(dir string) ([]os.FileInfo, error)) (*
 	go t.syncLoop()
 	t.opened.total = time.Since(start)
 	return t, nil
-}
-
-// garbageFiles returns the files below the store at parent that the manifest
-// head, if any, left to reclaim.
-func garbageFiles(parent string, head *ownersHeader) []string {
-	if head == nil {
-		return nil
-	}
-	files := make([]string, len(head.garbage))
-	for i, name := range head.garbage {
-		files[i] = filepath.Join(parent, name)
-	}
-	return files
 }
 
 // replay loads the identity log name into t, compacts it and builds the
@@ -689,6 +675,9 @@ func (t *nodeTable) close() error {
 		}
 		if t.index != nil {
 			t.index.close()
+		}
+		if t.pack != nil {
+			t.pack.close()
 		}
 		if t.coldParent == "" && t.coldRoot != "" {
 			// Tables without a log own a private temporary store, not state.

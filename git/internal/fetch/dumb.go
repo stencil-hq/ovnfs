@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/stencil-hq/ovnfs/git/internal/object"
+	"github.com/stencil-hq/ovnfs/internal/mapped"
 )
 
 // dumb fetches from a dumb HTTP server (gitprotocol-http), a plain file
@@ -365,7 +366,7 @@ func (d *dumbSource) loadIndex(st *dumbStore, p *dumbPack) (found bool, err erro
 	var data []byte
 	var unmap func() error
 	if err == nil {
-		data, unmap, err = object.MapFile(tmp.Name())
+		data, unmap, err = mapped.Map(tmp.Name())
 	}
 	if err == nil {
 		if p.idx, err = object.ParseIndex(data, d.dst.Format()); err != nil {

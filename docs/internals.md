@@ -88,12 +88,12 @@ a crash forgets the writes since.
 
 | path under state | holds |
 | --- | --- |
-| `bases/<id>/` | a capture (`capture.bin`: compressed binary per-file stat data; bases from older builds keep `capture.json`), its lock, index copies, the git objects its checkouts commit, and `git-template/`, the private git directory its prepared checkouts copy |
+| `bases/<id>/` | a capture (`capture.idx`: every captured path with its mode, blob id, stat data, root class and tracking repository, memory-mapped read-only; a start replaces the `capture.bin` or `capture.json` of a base from an older build with one), its lock, index copies, the git objects its checkouts commit, and `git-template/`, the private git directory its prepared checkouts copy |
 | `layers/` | frozen uppers until hashed, then only their non-source files and, above 1 KiB, the layer's compressed manifest; smaller manifests live in `state.json`, so such a stored-only layer needs no file or directory |
 | `uppers/` | each checkout's writable copy-on-write layer, named after the checkout, or `_p<id>` for one prepared before it had a name |
 | `git/` | private git directories, named like the uppers; a snapshot keeps its checkout's as a store tree, so an unchanged index costs nothing per snapshot |
 | `jj/` | jj workspaces made for checkouts being created, until their `.jj` moves into the checkout's upper |
-| `store/` | git-format objects in append-only `packs/<n>.pack` (a full pack also gets `<n>.idx`); large blobs use content-defined chunks, or plain files under `objects/` when reflinks work |
+| `store/` | git-format objects in append-only `packs/<n>.pack` (a full pack also gets a sorted index, `<n>.idx`, and every eight of those are merged into one `<g>.midx`); large blobs use content-defined chunks, or plain files under `objects/` when reflinks work |
 | `sources/` | each source folder's stat cache: which files still match the blob ids of its last capture's tree |
 | `trash/` | leftovers a start found no checkout, snapshot or base naming (a removal a crash interrupted, a create it rolled back): each is moved here with one rename and deleted while the daemon serves, so a start never waits on deleting files |
 | `nodes.log` | stable node ids (NFS handles, inode numbers); survive restarts and follow renames. A file's id is derived from its directory and name, so reading a tree logs only its directories; moved files and the rare name-hash collision are logged too. Ids stay below 2^53 so JavaScript runtimes see exact inode numbers |
@@ -156,6 +156,14 @@ replaces `store/epoch` before it removes anything; a folder's stat cache trusts 
 object ids without checking the store only while that epoch is unchanged. A
 pack is rewritten, its live frames copied without recompressing, only once a
 quarter of it is garbage.
+Pack lookups binary-search memory-mapped index files sorted by object id, so
+the index costs page cache rather than daemon memory; only the pack being
+appended to is indexed in memory, and it is sealed at 32 MiB or 16384
+objects. Storing an object again records its freshness in its index file,
+in batches of 4096. Collection marks live objects in a bitmap over the index
+records and walks trees in place, so its peak memory grows by a bit per object
+plus the ids of loose objects. Indexes written by releases before sorted
+indexes are rewritten sorted when the store opens.
 
 On restart the server binds its persisted port, or the NFS socket a macOS mount
 dials, and serves before touching the mount path, so hard-mounted NFS I/O
@@ -272,9 +280,9 @@ identify an already-open parent by its handle.
 ## Memory tiers
 
 Written files start in memory, not in the upper: new and truncated files, and
-files of at most 1 MiB copied up for writing, share one budget across all
-checkouts (`--memory`). A file moves into its upper once it has been left
-untouched for 2 s, when it outgrows 1 MiB, when newer files need the budget
+files of at most 256 KiB copied up for writing, share one budget across all
+checkouts (`--memory`, default 64 MiB). A file moves into its upper once it has been left
+untouched for 2 s, when it outgrows 256 KiB, when newer files need the budget
 (least recently used first), before a hard link, `chown` or lock, and before
 `snap`, `fork`, `diff` and a planned stop, which therefore cost one host create
 per file written in the last 2 s; files deleted sooner never reach the disk.
@@ -283,22 +291,63 @@ Directories, symlinks and whiteouts always live in the upper. With
 the default leaves it in memory. NFS does not forward application fsync calls.
 This sync does not include the parent directory or snapshot data.
 
+The 256 KiB limit keeps a build's small short-lived files (cargo fingerprints,
+dep-info files, temporary files, most rlibs) in memory, while large outputs
+(big rlibs, linked binaries) reach the disk after their first 256 KiB instead
+of being buffered whole and copied out later. 64 KiB measured 16% slower on a
+replayed cold cargo build: mid-sized rlibs then spill while being written.
+
+A base's per-path state is not in memory at all: lookups, listings and
+tracked-path facts read its `capture.idx` through a read-only mapping, whose
+pages the kernel shares with its file cache and can drop at any time. A path is
+found through a hash table of full paths, a directory lists as one contiguous
+range of children sorted by name, and git indexes are read only while a capture
+runs.
+
 Small store blobs (at most 1 MiB) are served from a second budget
-(`--blob-cache`) instead of their object files. `ovnfs status` shows both. A
+(`--blob-cache`, default 16 MiB) instead of their object files. `ovnfs status` shows both. A
 crash or `kill -9` loses the files still in memory; `--memory 0` writes every
 file to the upper as it happens.
 
+Two smaller caches have fixed budgets: reconstructed git delta bases, 16 MiB
+shared by every repository the daemon reads (git's default is 96 MiB per
+process, and the daemon keeps one object database per work tree open), and
+the NFS READDIR snapshots that keep a paged listing stable, 8 MiB by estimated
+size; the newest snapshot stays even when it alone exceeds that.
+
+The Go collector runs with its defaults (`GOGC=100`: the heap may grow to twice
+the live heap between collections; `GOGC` and `GOMEMLIMIT` apply as usual). A
+daemon that allocated less than 16 MiB in the last 10 s returns its garbage
+and free heap to the OS, so its footprint falls back to its live heap after a
+burst. `ovnfs status` shows the Go heap (live, in use, held from the OS) and the
+process footprint the OS charges (`heap_live`, `heap_in_use`, `go_held`,
+`footprint` in JSON).
+
 Node ids and their directories' cached listings share a third budget,
-`--node-cache` (default 512 MiB; `OVNFS_NODE_CACHE`, user-file `node_cache`).
-The least recently used directory loses its listing, duplicate-name table,
-unlogged leaves and unlogged nodes. Issued names move to a sorted disk index,
+`--node-cache` (default 16 MiB; `OVNFS_NODE_CACHE`, user-file `node_cache`).
+The least recently used directory loses its listing, unlogged leaves, retired
+hashes and unlogged nodes. Its issued names move to a sorted disk index first,
 beside the hashes of names removed through the export. A cold handle keeps its
 exact name even if a later creation has the same hash, and so does every handle
 across a clean restart, which adopts the index. After a crash, handles issued
 before it resolve by listing their logged parent, so a name that replaced theirs
-behind the export with the same 22-bit hash can take them over. Listing I/O never holds the
-node-table mutex; recovery reads stay resident until their I/O returns and reject
-results read across a directory relocation.
+behind the export with the same 22-bit hash can take them over. Listing I/O never
+holds the node-table mutex, and a listing read across a change or relocation of
+its directory is not installed.
+
+A directory's owner index is a chain of segments in its instance's one
+append-only `pack-*` file: each a sorted array of 16-byte (hash, name length,
+offset) rows followed by the names, a zero length marking a retired hash, and
+a last link row locating the segment it extends. A spill appends only what the
+chain lacks, as one write, or merges the chain into one segment once its
+extensions would outgrow its base or it spans four segments, so a directory's
+live and superseded segments stay within a few times its live size. Lookups
+binary-search the chain through a read-only memory map of the pack under the
+node mutex: a cold name costs a few page reads and no heap, the pages belong to
+the file cache rather than the daemon's footprint, and no directory is ever
+loaded whole. An operation admits only the names it touches: a lookup the name
+itself, a mutation whatever owns or retired the hash of the name it changes, so
+that the change can complete from memory even after an index fault.
 
 Logged ids page out too, to an index `nodes.log.cache/nodes-*`: a record per
 logged key with its id, parent key and name, its logged children and the logged
@@ -316,43 +365,35 @@ its cold logged children, so lookups and new derived ids never wait for the
 index. A logged node leaves memory after its listing, as least recently used,
 once it has no resident children, holds or operations in flight; using a path
 uses its ancestors, so they leave last, and the root never does. A node whose
-record changed while resident (a creation, move or removal below or of it) is
-rewritten as a record file of its own when it leaves; eviction never renames,
-reuses or retires an id. Removing a directory logs the removal without paging
-in its cold subtree: a record is only paged in under a parent that still names
-it, so its descendants stop resolving at once, and their index files are
-reclaimed a batch per operation. A record that cannot be read or contradicts
-its parent latches the identity fault below; a failed record write backs off
-like a failed spill.
+record changed while resident (a creation, move or removal below or of it) has
+it appended to the index's `records` file when it leaves; eviction never
+renames, reuses or retires an id. Slots of the keys the index was built with
+are read through a memory map of the table. Removing a directory logs the
+removal without paging in its cold subtree: a record is only paged in under a
+parent that still names it, so its descendants stop resolving at once, and
+their owner indexes are discounted from the live index size a batch per
+operation. A record that cannot be read or contradicts its parent latches the
+identity fault below; a failed record write backs off like a failed spill.
 
 The index lives in an instance directory below `STATE/nodes.log.cache`, on
 its state volume, rather than `$TMPDIR`: system temporary storage may be tmpfs
 and consume RAM, or be removed by temporary-file cleaners during a long run.
 Keep the state directory on a disk-backed filesystem to bound memory use.
 
-A clean close completes the index under the node mutex. Directories whose
-names were only in memory are appended to the instance's one `pack-*` file
-rather than written to a file each; directories evicted and changed since have
-their own file rewritten in place. The record of every resident logged node
-that changed since it paged in, the root's included, is appended to the index's
-`records` file, and its slot, like that of every node whose owner index moved,
-is rewritten in place. A record file of its own that this supersedes stays
-where it is, unread, until the key's next eviction overwrites it, its
-retirement removes it or a rebuild drops the index. Closing
-thus writes two files plus the changed evicted directories: a million names in
-20,000 directories take about 0.1 s on APFS, and a million changed resident
-logged directories add about half a second. Close then flushes everything the
-manifest will vouch for: the index files, the pack, every record and owner
-index file of its own written since the open (earlier ones were flushed by
-earlier closes), and the directories naming them, in parallel: about 0.4 s
-on APFS for the 40,000 files 20,000 evictions write. Only then is the manifest
-`nodes.log.cache/owners` written durably: the identity log's size, its size
-when last compacted, the counter watermark, the open's epoch, the index's
-sizes, the instance, its pack, the logged node index, and the garbage still to
-reclaim (retired keys and the files of dropped nodes), which the next open
-resumes. A close that finds an index write or reclamation still running, or a
-failed index or flush, leaves no manifest, and nothing is reclaimed after
-close.
+A clean close completes the index under the node mutex. The owners and
+retired hashes still only in memory are appended to the pack in one write, the
+record of every resident logged node that changed since it paged in, the
+root's included, is appended to `records`, and every slot whose record or
+owner index moved is rewritten in place; spills and evictions rewrote theirs
+already. Closing thus writes two files whatever the number of directories.
+Close then flushes the index files, the pack, trimmed to what was appended, and
+their directories, in parallel, and only then writes the manifest
+`nodes.log.cache/owners` durably: the identity log's size, its size when last
+compacted, the counter watermark, the open's epoch, the index's sizes, the
+instance, its pack, the logged node index, and the retired keys whose owner
+indexes are still counted live, which the next open discounts. A close that
+finds an index write or discount still running, or a failed index or flush,
+leaves no manifest.
 
 The next open removes the manifest durably before changing anything, so a
 crash from then on discards the index, and keeps the store only when the
@@ -364,8 +405,13 @@ directories with a 186 MB log open in under a millisecond instead of about six
 seconds. Past those bounds it replays, compacts and rebuilds, copying the pack
 segments the slots of live keys locate into a new pack, merged with any hashes
 the log retired since; this drops the garbage adoptions accumulate (log records
-of moved and retired keys, superseded records, slots of retired keys, rewritten
-pack segments). Each adopting open advances an epoch that slots record with
+of moved and retired keys, superseded records, slots of retired keys, superseded
+and retired pack segments). A store an earlier layout left, with owner index
+and record files of their own, or with a manifest from before the logged node
+index that lists every directory's owner index itself, is always rebuilt: its
+owner indexes are carried into the new pack wherever they were, so derived
+handles keep their names across the upgrade, and the old instance and index are
+discarded whole. Each adopting open advances an epoch that slots record with
 every owner index location they are given: one written by an earlier open, like
 one carried into a rebuilt index, is prior. A prior owner index that cannot be
 read counts as missing for its directory, which then resolves by listing as
@@ -380,38 +426,34 @@ reclaims detached trees in bounded batches and resumes abandoned cleanup on the
 next start. Close cancels that worker without waiting and leaves its instance
 for the next open. Cleanup errors leave garbage for a later start without
 faulting live owners. Independent logs have independent cache and discard trees.
-Owner files are sharded into 256 directories by the low eight bits of the
-logged directory key, so consecutive keys spread evenly. Each file and its
-replacement temporary file stay in the same shard; no index file stays open
-between operations. These files hold names only, never file contents, and are
-not part of the identity log. Status reports the current instance's and the
-logged node index's bytes as `node index`
+The index files hold names only, never file contents, and are not part of the
+identity log; they stay open, and mapped, while the export runs. Status reports
+the pack's and the logged node index's bytes as `node index`
 (`node_index_bytes` in JSON), separately from the resident estimate and RSS.
-Rewalks restore one directory's issued owners with one index read, accounted
-against the same budget. Retained handles and already-issued names batch when
-the owners fit the remaining budget; under pressure they binary-search a single
-owner and admit only that name, avoiding repeated reconstruction of wide cold
-directories. Consecutive distinct misses in one directory promote recovery to a
-batch even under pressure, so handle and name rewalks still amortize index I/O.
-Index reads and replacement writes release the node mutex, retain operation
-state and revalidate the
-namespace generation, ownership version and ancestor locations before eviction.
-NFSv4 prepares identity holds before its state transaction and releases them
-after unlocking; slow index I/O does not hold the global protocol state lock.
+Index writes and record reads release the node mutex and retain operation
+state; a write is published only if its directory is still live, and leaves it
+dirty if its ownership changed meanwhile. NFSv4 prepares identity holds before
+its state transaction and releases them after unlocking; slow index I/O does
+not hold the global protocol state lock.
 
-The 512 MiB default accommodates a few million paths (about 138 estimated bytes
-per path in the mounted fixture), including multi-checkout working sets that
-would repeatedly overflow 64 MiB. It still bounds reconstructible state far
-below the several GiB an unbounded walk can retain; smaller machines can lower
-it with the same knob. It does not bound total daemon RSS.
+The 16 MiB default holds a build's working set: about 170,000 issued names
+(a leaf costs about 64 bytes plus its name), or listings of about 400,000
+entries (8 bytes plus the name each). Past it, a directory costs a mapped index
+search on its next use rather than memory: walking a 475,000-file tree under
+the default, a name or handle the cache had evicted resolves in about 0.5 µs,
+against 0.1 µs resident (and 26 µs when the earlier per-directory index files
+were read whole), while the table's heap stays near the budget instead of about
+70 MB for the whole tree. A larger budget only saves those searches. It does
+not bound total daemon RSS.
 
 Resident name lookups walk their parent path once without paging or retaining
 unneeded operation state. Listed child identities accept a directory and
-basename separately, avoiding full-path construction. Unchanged identity
-listings reuse their existing maps and names. New names share directory-owned
-storage; materialized children own their basenames so held files cannot retain
-an evicted directory's arena. Cold names borrow the immutable index read buffer,
-whose entire size stays charged while resident owners retain it.
+basename separately, avoiding full-path construction. A listing is a row of 8
+bytes per entry (name hash, length and offset into the listing's names),
+sorted by hash and bucketed by its top bits, so a READDIR checks each entry in
+a few comparisons; an unchanged listing stays as it is, a changed one is
+replaced whole. Leaves and nodes own copies of their names, so no listing or
+index buffer outlives its directory's eviction.
 
 An in-flight node operation snapshots the node and its maximum ancestral move
 stamp, not an allocated ancestor list. Each relocation receives a table-wide
@@ -424,12 +466,12 @@ release. Operations that may release the node mutex reuse pooled pin sets;
 release clears node references, and oversized sets are not retained by the pool.
 
 The budget estimates map, node and name bytes (about 320 per resident logged
-node, 64 per cold logged child of a resident directory), rather than measuring
-the Go heap. The current directory stays cached even when it exceeds the budget,
+node, 160 per unlogged node, 64 per leaf or cold logged child of a resident
+directory, 16 per retired hash in memory, 8 per listed entry, besides names),
+rather than measuring the Go heap. The current directory stays cached even when it exceeds the budget,
 so identifying a large READDIR's entries does not reread the directory for every
 entry. Retained reconstructible state is at most the budget or one directory
-with its ancestors, whichever is larger; zero keeps just those. Concurrent
-recovery reads temporarily retain their directories. `ovnfs status` reports the estimate and
+with its ancestors, whichever is larger; zero keeps just those. `ovnfs status` reports the estimate and
 budget as `node cache` (`node_cache` in JSON). Failed spill writes leave the
 old index and resident ownership intact, report a degraded `node_cache_error`,
 and retry on subsequent operations with exponential backoff (100 ms to 30 s).

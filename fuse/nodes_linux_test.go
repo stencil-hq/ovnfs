@@ -60,7 +60,8 @@ func TestSpillWriteFailureKeepsOpenFile(t *testing.T) {
 		t.Fatal(st)
 	}
 	defer x.Release(nil, &gofuse.ReleaseIn{Fh: opened.Fh})
-	e.SetNodeCache(0)
+	// The first spill creates the owner index pack, so replace its store
+	// before any, then fill the budget exactly: the next LOOKUP's trim spills.
 	parent := filepath.Join(state, "nodes.log.cache")
 	if err := os.RemoveAll(parent); err != nil {
 		t.Fatal(err)
@@ -68,6 +69,7 @@ func TestSpillWriteFailureKeepsOpenFile(t *testing.T) {
 	if err := os.WriteFile(parent, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
+	e.SetNodeCache(e.NodeCache().Used)
 	var out gofuse.EntryOut
 	if st := x.entry("co/b/file", &out); st != gofuse.OK || out.NodeId == 0 {
 		t.Fatalf("LOOKUP: %v %x", st, out.NodeId)
@@ -106,15 +108,7 @@ func TestLookupColdFaultInsideOperation(t *testing.T) {
 	e.SetNodeCache(0)
 	x.nodes.ID("co/a/file")
 	x.nodes.ID("co/b/file")
-	files, err := filepath.Glob(filepath.Join(state, "nodes.log.cache", "instance-*", "*", "*"))
-	if err != nil || len(files) == 0 {
-		t.Fatal(files, err)
-	}
-	for _, file := range files {
-		if err := os.Remove(file); err != nil {
-			t.Fatal(err)
-		}
-	}
+	nodestest.BreakCold(t, state)
 	if x.nodes.IdentityError() != nil {
 		t.Fatal("fault latched before operation")
 	}

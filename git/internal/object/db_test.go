@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stencil-hq/ovnfs/internal/mapped"
 )
 
 // checkAllObjects compares Has, Header and Read on every object git lists.
@@ -174,14 +176,14 @@ func countEntries(t *testing.T, p *pack, typ byte) int {
 }
 
 func TestReadWithoutMmap(t *testing.T) {
-	mapFiles = false
-	t.Cleanup(func() { mapFiles = true })
+	mapped.Enabled = false
+	t.Cleanup(func() { mapped.Enabled = true })
 	r := newRepo(t)
 	r.fastImport(history(r.format, 30, "nommap"))
 	r.git(nil, "gc", "--aggressive", "--quiet")
 	r.fastImportLoose(strings.ReplaceAll(history(r.format, 3, "loose"), "refs/heads/main", "refs/heads/loose"))
 	db := r.open()
-	if p := (*db.dirs[0].packs.Load())[0]; p.data.data != nil || p.idx.m.data != nil {
+	if p := (*db.dirs[0].packs.Load())[0]; p.data.Mapped() != nil || p.idx.m.Mapped() != nil {
 		t.Fatal("pack is mapped")
 	}
 	objs := r.allObjects()
@@ -190,31 +192,6 @@ func TestReadWithoutMmap(t *testing.T) {
 		if got, err := db.FindPrefix(id.String()[:7], 0); err != nil || !slices.Contains(got, id) {
 			t.Fatalf("FindPrefix(%s) = %v %v", id.String()[:7], got, err)
 		}
-	}
-}
-
-func TestMapFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "f")
-	want := bytes.Repeat([]byte("mapped "), 100000)
-	os.WriteFile(path, want, 0o644)
-	empty := filepath.Join(t.TempDir(), "empty")
-	os.WriteFile(empty, nil, 0o644)
-	for _, mapped := range []bool{true, false} {
-		mapFiles = mapped
-		for p, w := range map[string][]byte{path: want, empty: {}} {
-			data, unmap, err := MapFile(p)
-			if err != nil || !bytes.Equal(data, w) {
-				t.Errorf("MapFile(%s) mapped=%v: %d bytes, %v", p, mapped, len(data), err)
-				continue
-			}
-			if err := unmap(); err != nil {
-				t.Errorf("unmap: %v", err)
-			}
-		}
-	}
-	mapFiles = true
-	if _, _, err := MapFile(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("MapFile(missing) error %v", err)
 	}
 }
 

@@ -28,7 +28,7 @@ func TestBaseReuseFolderAndRestart(t *testing.T) {
 	if second.Capture == nil || second.Capture.Hashed != 0 {
 		t.Fatalf("unchanged source content was rehashed: %+v", second.Capture)
 	}
-	captures, err := filepath.Glob(filepath.Join(f.state, "bases", "*", "capture.bin"))
+	captures, err := filepath.Glob(filepath.Join(f.state, "bases", "*", "capture.idx"))
 	if err != nil || len(captures) != 1 {
 		t.Fatalf("capture files = %v, %v", captures, err)
 	}

@@ -1,6 +1,6 @@
 //go:build unix
 
-package object
+package mapped
 
 import (
 	"os"

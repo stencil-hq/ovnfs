@@ -62,7 +62,7 @@ func TestColdStoreOpenedBeforeReclamation(t *testing.T) {
 	defer next.close()
 	next.id("co/file")
 	forceCold(t, next, ns, "co")
-	file := next.coldPath(next.find("co"))
+	file := next.pack.path
 	release.Do(func() { close(resume) })
 	<-finished
 	if err := reclaimCold(nt.coldParent+".discard", nil, nil); err != nil {
@@ -99,7 +99,9 @@ func TestColdReclamationResumed(t *testing.T) {
 	}
 }
 
-func TestColdIndexShards(t *testing.T) {
+// TestColdIndexIsOnePack keeps the owners of many evicted directories in
+// one file of the instance, rather than a file per directory.
+func TestColdIndexIsOnePack(t *testing.T) {
 	ns := newNamespace("pressure/entry")
 	nt := newNodeTable(ns.list)
 	defer nt.close()
@@ -111,27 +113,14 @@ func TestColdIndexShards(t *testing.T) {
 	}
 	nt.cacheLimit = 0
 	nt.id("pressure/entry")
-	shards := make(map[string]int)
+	entries, err := os.ReadDir(nt.coldRoot)
+	if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(nt.pack.path) {
+		t.Fatalf("instance holds %v, %v", entries, err)
+	}
 	for i, id := range ids {
-		d := nt.find(fmt.Sprintf("co/d%d", i))
-		file := nt.coldPath(d)
-		shard := filepath.Base(filepath.Dir(file))
-		if filepath.Dir(filepath.Dir(file)) != nt.coldRoot || shard != fmt.Sprintf("%02x", d.key&255) {
-			t.Fatal("unexpected shard path", file)
-		}
-		shards[shard]++
-		if shards[shard] > 2 {
-			t.Fatal("consecutive keys did not distribute evenly", shards)
-		}
-		if _, err := os.Stat(file); err != nil {
-			t.Fatal(err)
-		}
 		if got := pathOf(t, nt, id); got != fmt.Sprintf("co/d%d/file", i) {
 			t.Fatal(got)
 		}
-	}
-	if len(shards) != 256 {
-		t.Fatal("shards", len(shards))
 	}
 }
 

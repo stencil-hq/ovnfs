@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"container/list"
 	"os"
 	"sync"
 )
@@ -99,35 +100,79 @@ func verifier(dir, first uint64, infos []os.FileInfo) uint64 {
 	return max(h, 1)
 }
 
-// dirCache keeps the most recent listings, evicting the oldest.
+// dirCacheBytes bounds the estimated bytes of the listings dirCache keeps:
+// room for tens of thousands of entries, enough for every directory clients
+// are paging through at once.
+const dirCacheBytes = 8 << 20
+
+// Estimated memory of a listing beyond its names: the struct and its slice,
+// and per entry the interface word pair plus the FileInfo behind it (a host
+// os.FileInfo with its stat data measured about 250 bytes on macOS).
+const (
+	listingBytes = 128
+	entryBytes   = 256
+)
+
+// bytes estimates the memory l holds.
+func (l *listing) bytes() int {
+	n := listingBytes + len(l.entries)*entryBytes
+	for _, info := range l.entries {
+		n += len(info.Name())
+	}
+	return n
+}
+
+// dirCache keeps the most recently used listings within dirCacheBytes,
+// evicting the least recently used. The newest listing always stays, so a
+// directory too big for the budget still pages through its own snapshot.
+// The zero value is empty and ready.
 type dirCache struct {
 	mu     sync.Mutex
-	byVerf map[uint64]*listing
-	order  [1024]uint64
-	pos    int
+	byVerf map[uint64]*list.Element // of *cachedListing
+	lru    list.List                // most recently used first
+	size   int
+}
+
+// cachedListing is a dirCache entry with its estimated size.
+type cachedListing struct {
+	*listing
+	size int
 }
 
 // get returns the listing verf names if it belongs to directory dir.
 func (c *dirCache) get(dir, verf uint64) *listing {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if l := c.byVerf[verf]; l != nil && l.dir == dir {
-		return l
+	if e := c.byVerf[verf]; e != nil {
+		if l := e.Value.(*cachedListing); l.dir == dir {
+			c.lru.MoveToFront(e)
+			return l.listing
+		}
 	}
 	return nil
 }
 
 // put records l, replacing any listing with the same verifier.
 func (c *dirCache) put(l *listing) {
+	n := l.bytes()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.byVerf == nil {
-		c.byVerf = make(map[uint64]*listing)
+		c.byVerf = make(map[uint64]*list.Element)
 	}
-	if _, ok := c.byVerf[l.verf]; !ok {
-		delete(c.byVerf, c.order[c.pos])
-		c.order[c.pos] = l.verf
-		c.pos = (c.pos + 1) % len(c.order)
+	if e := c.byVerf[l.verf]; e != nil {
+		c.remove(e)
 	}
-	c.byVerf[l.verf] = l
+	c.byVerf[l.verf] = c.lru.PushFront(&cachedListing{listing: l, size: n})
+	c.size += n
+	for c.size > dirCacheBytes && c.lru.Len() > 1 {
+		c.remove(c.lru.Back())
+	}
+}
+
+// remove forgets entry e. The caller holds c.mu.
+func (c *dirCache) remove(e *list.Element) {
+	l := c.lru.Remove(e).(*cachedListing)
+	delete(c.byVerf, l.verf)
+	c.size -= l.size
 }

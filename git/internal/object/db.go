@@ -38,7 +38,6 @@ func (e *notFoundError) Unwrap() error { return fs.ErrNotExist }
 type DB struct {
 	format Format
 	dirs   []*objectDir // the repository's own store first, then alternates
-	cache  *deltaCache
 	closed atomic.Bool
 	// generation counts pack list changes, so a lookup that missed while
 	// another goroutine's rescan swapped packs knows to look again.
@@ -72,7 +71,7 @@ func Open(objectsDir string, f Format) (*DB, error) {
 	if !fi.IsDir() {
 		return nil, fmt.Errorf("object directory %s is not a directory", abs)
 	}
-	db := &DB{format: f, cache: newDeltaCache(deltaBaseCacheLimit)}
+	db := &DB{format: f}
 	db.addDir(abs, 0, map[string]bool{})
 	db.rescan()
 	return db, nil
@@ -104,7 +103,7 @@ func (db *DB) Close() error {
 		d.closed = true
 		d.mu.Unlock()
 		for _, p := range old {
-			db.cache.dropPack(p)
+			deltaBases.dropPack(p)
 			p.release()
 		}
 	}
@@ -229,7 +228,7 @@ func (db *DB) rescanDir(d *objectDir) {
 	d.packs.Store(&next)
 	db.generation.Add(1)
 	for _, p := range gone {
-		db.cache.dropPack(p)
+		deltaBases.dropPack(p)
 		p.release()
 	}
 }

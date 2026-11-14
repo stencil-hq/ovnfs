@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+
+	"github.com/stencil-hq/ovnfs/internal/mapped"
 )
 
 // idxMagic starts a version 2 or later pack index; as a version 1 fan-out
@@ -14,7 +16,7 @@ var idxMagic = []byte{0xff, 't', 'O', 'c'}
 // packIndex is an open .idx file: version 1, or version 2 with its 31-bit
 // offset table and 64-bit large-offset table.
 type packIndex struct {
-	m      *mappedFile
+	m      *mapped.File
 	format Format
 	fanout [256]uint32
 	count  int
@@ -38,7 +40,7 @@ func ParseIndex(data []byte, f Format) (*PackIndex, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("pack index: file too short")
 	}
-	x, err := parseIndex(&mappedFile{data: data, size: int64(len(data))}, f)
+	x, err := parseIndex(mapped.Bytes(data), f)
 	if err != nil {
 		return nil, fmt.Errorf("pack index: %w", err)
 	}
@@ -55,22 +57,22 @@ func (p *PackIndex) Has(id ID) bool {
 }
 
 func openIndex(path string, f Format) (*packIndex, error) {
-	m, err := openMapped(path)
+	m, err := mapped.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	x, err := parseIndex(m, f)
 	if err != nil {
-		m.close()
+		m.Close()
 		return nil, fmt.Errorf("pack index %s: %w", path, err)
 	}
 	return x, nil
 }
 
-func parseIndex(m *mappedFile, f Format) (*packIndex, error) {
+func parseIndex(m *mapped.File, f Format) (*packIndex, error) {
 	hs := int64(f.Size())
 	x := &packIndex{m: m, format: f}
-	head, err := m.slice(0, min(m.size, 8+256*4))
+	head, err := m.Slice(0, min(m.Size(), 8+256*4))
 	if err != nil || len(head) < 256*4 {
 		return nil, fmt.Errorf("file too short")
 	}
@@ -98,21 +100,21 @@ func parseIndex(m *mappedFile, f Format) (*packIndex, error) {
 	if version == 1 {
 		x.names = 256*4 + 4
 		x.stride = 4 + hs
-		if m.size != 256*4+n*x.stride+trailer {
-			return nil, fmt.Errorf("size %d does not match %d objects", m.size, n)
+		if m.Size() != 256*4+n*x.stride+trailer {
+			return nil, fmt.Errorf("size %d does not match %d objects", m.Size(), n)
 		}
 	} else {
 		x.names = 8 + 256*4
 		x.stride = hs
 		x.offsets = x.names + n*hs + n*4
 		x.large = x.offsets + n*4
-		rest := m.size - trailer - x.large
+		rest := m.Size() - trailer - x.large
 		if rest < 0 || rest%8 != 0 || rest/8 > n {
-			return nil, fmt.Errorf("size %d does not match %d objects", m.size, n)
+			return nil, fmt.Errorf("size %d does not match %d objects", m.Size(), n)
 		}
 		x.nLarge = rest / 8
 	}
-	sum, err := m.slice(m.size-trailer, hs)
+	sum, err := m.Slice(m.Size()-trailer, hs)
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +126,8 @@ func parseIndex(m *mappedFile, f Format) (*packIndex, error) {
 func (x *packIndex) rawName(i int, buf *[32]byte) ([]byte, error) {
 	hs := int64(x.format.Size())
 	off := x.names + int64(i)*x.stride
-	if x.m.data != nil {
-		return x.m.data[off : off+hs], nil
+	if x.m.Mapped() != nil {
+		return x.m.Mapped()[off : off+hs], nil
 	}
 	if _, err := x.m.ReadAt(buf[:hs], off); err != nil {
 		return nil, err

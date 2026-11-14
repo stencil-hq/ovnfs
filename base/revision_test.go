@@ -237,7 +237,7 @@ func TestRevisionHiddenRootsStayHidden(t *testing.T) {
 				t.Errorf("root lists %v, want %v", names, wantNames)
 			}
 			if tc.live == nil {
-				if class := b.classes["tmp"]; class != rules.Hidden {
+				if class, _ := b.Class("tmp"); class != rules.Hidden {
 					t.Errorf("tmp recorded as %q, want a hidden root", class)
 				}
 			}

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stencil-hq/ovnfs/export"
 )
 
 func TestServeOptions(t *testing.T) {
@@ -26,7 +28,7 @@ func TestServeOptions(t *testing.T) {
 	}
 
 	cmd, err := parse()
-	if err != nil || cmd.Proto != defaultProto() || cmd.Memory != 1<<30 || cmd.BlobCache != 512<<20 || cmd.Atime || cmd.Fsync {
+	if err != nil || cmd.Proto != defaultProto() || cmd.Memory != 64<<20 || cmd.BlobCache != 16<<20 || cmd.Atime || cmd.Fsync {
 		t.Fatalf("defaults: %+v, %v", cmd, err)
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".o2"), 0o755); err != nil {
@@ -116,7 +118,7 @@ func TestNodeCacheOptions(t *testing.T) {
 		}
 		return commands.Serve.NodeCache, err
 	}
-	if n, err := parse(); err != nil || n != 512<<20 {
+	if n, err := parse(); err != nil || n != export.DefaultNodeCache {
 		t.Fatalf("default %d: %v", n, err)
 	}
 	if err := os.WriteFile(filepath.Join(home, ".o2", "ovnfs.yml"), []byte("node_cache: 2M\n"), 0644); err != nil {

@@ -344,7 +344,7 @@ func (t *fold) classify(p string, info os.FileInfo) (rules.Class, error) {
 	if _, ok, err := t.set.leaf(p); ok || err != nil {
 		return rules.Source, err
 	}
-	if class, ok := t.base.view.Capture().Roots[p]; ok {
+	if class, ok := t.base.view.Class(p); ok {
 		return class, nil
 	}
 	if rule, ok := t.base.rules.Match(p, t.base.view.Domains().Facts(t.view, p, info)); ok {

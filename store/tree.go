@@ -99,17 +99,9 @@ func (s *Store) ReadTree(id OID) ([]Entry, error) {
 	if id == EmptyTree {
 		return nil, nil
 	}
-	if id.Valid() {
-		if e, ok := s.packs.lookup(rawOf(id)); ok && e.flags&(frameChunk|frameManifest) != 0 {
-			return nil, fmt.Errorf("read tree %s: %w", id, errCorrupt)
-		}
-	}
-	data, err := s.ReadBlob(id)
+	data, err := s.treeBody(id)
 	if err != nil {
-		return nil, fmt.Errorf("read tree: %w", err)
-	}
-	if HashBytes("tree", data) != id {
-		return nil, fmt.Errorf("read tree %s: %w", id, errCorrupt)
+		return nil, err
 	}
 	entries, err := parseTree(data)
 	if err != nil {
@@ -118,32 +110,70 @@ func (s *Store) ReadTree(id OID) ([]Entry, error) {
 	return entries, nil
 }
 
+// treeBody returns the verified body of stored tree id, possibly the cache's
+// copy, which must not be modified.
+func (s *Store) treeBody(id OID) ([]byte, error) {
+	if !id.Valid() {
+		return nil, fmt.Errorf("read tree: read object %q: malformed id", id)
+	}
+	if e, ok := s.packs.lookup(rawOf(id)); ok && e.flags&(frameChunk|frameManifest) != 0 {
+		return nil, fmt.Errorf("read tree %s: %w", id, errCorrupt)
+	}
+	data, ok := s.cache.get(id)
+	if !ok {
+		var err error
+		if data, err = s.load(id); err != nil {
+			return nil, fmt.Errorf("read tree: read object %s: %w", id, err)
+		}
+	}
+	if HashBytes("tree", data) != id {
+		return nil, fmt.Errorf("read tree %s: %w", id, errCorrupt)
+	}
+	return data, nil
+}
+
 // parseTree decodes a git tree body, validating every entry.
 func parseTree(data []byte) ([]Entry, error) {
 	var entries []Entry
+	err := walkTree(data, func(mode uint32, name []byte, id rawID) error {
+		if err := checkName(string(name)); err != nil {
+			return err
+		}
+		entries = append(entries, Entry{Name: string(name), Mode: mode, ID: id.oid()})
+		return nil
+	})
+	return entries, err
+}
+
+// walkTree calls fn with each entry of a git tree body in order, its name a
+// view of data; it validates modes and framing, not names.
+func walkTree(data []byte, fn func(mode uint32, name []byte, id rawID) error) error {
 	for len(data) > 0 {
 		sp := bytes.IndexByte(data, ' ')
 		if sp < 0 {
-			return nil, fmt.Errorf("truncated entry mode")
+			return fmt.Errorf("truncated entry mode")
 		}
-		mode, err := strconv.ParseUint(string(data[:sp]), 8, 32)
-		if err != nil || !validMode(uint32(mode)) {
-			return nil, fmt.Errorf("bad entry mode %q", data[:sp])
+		var mode uint32
+		for _, c := range data[:sp] {
+			if c < '0' || c > '7' || mode > 0o7777777 {
+				return fmt.Errorf("bad entry mode %q", data[:sp])
+			}
+			mode = mode<<3 | uint32(c-'0')
+		}
+		if !validMode(mode) {
+			return fmt.Errorf("bad entry mode %q", data[:sp])
 		}
 		data = data[sp+1:]
 		nul := bytes.IndexByte(data, 0)
 		if nul < 0 || len(data) < nul+1+20 {
-			return nil, fmt.Errorf("truncated entry")
+			return fmt.Errorf("truncated entry")
 		}
-		name := string(data[:nul])
-		if err := checkName(name); err != nil {
-			return nil, err
+		if err := fn(mode, data[:nul], rawID(data[nul+1:nul+21])); err != nil {
+			return err
 		}
-		id := OID(hex.EncodeToString(data[nul+1 : nul+21]))
 		data = data[nul+21:]
-		entries = append(entries, Entry{Name: name, Mode: uint32(mode), ID: id})
 	}
-	return entries, nil
+	return nil
 }
 
 // Flatten lists every leaf below root by slash path; non-empty directories are implied by their leaves.

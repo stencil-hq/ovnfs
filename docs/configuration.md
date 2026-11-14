@@ -23,8 +23,8 @@ profile, so 16-colour terminals and pagers see no stray escapes. `diff -p` and
 cyan hunk headers, and every verb that prints a table aligns it by visible
 width.
 
-`serve --memory SIZE` (`OVNFS_MEMORY`, default `1G`) and `serve --blob-cache
-SIZE` (`OVNFS_BLOB_CACHE`, default `512M`) size the memory tiers described in
+`serve --memory SIZE` (`OVNFS_MEMORY`, default `64M`) and `serve --blob-cache
+SIZE` (`OVNFS_BLOB_CACHE`, default `16M`) size the memory tiers described in
 [internals](internals.md#memory-tiers); `start` passes the environment on.
 `serve --fsync` (or `OVNFS_FSYNC=1`) makes a sync of a named memory-backed
 file spill it to the upper and sync its host file. It is off by default: sync
@@ -174,10 +174,10 @@ env:
 | `state` | path | `~/.o2/ovnfs.yml` only: where the daemon keeps its state |
 | `mount` | path | `~/.o2/ovnfs.yml` only: where checkouts appear |
 | `proto` | string | user file only: default file server protocol (`nfs`, `smb`, `fuse`, or `winfsp`) |
-| `memory` | size | user file only: memory budget for written files |
+| `memory` | size | user file only: memory budget for written files (default 64M) |
 | `fsync` | boolean | user file only: spill and sync memory-backed files on fsync |
-| `node_cache` | size | user file only: estimated cache budget for derived ids and directory listings (default 512M) |
-| `blob_cache` | size | user file only: memory budget for content-addressed blobs |
+| `node_cache` | size | user file only: estimated cache budget for derived ids and directory listings (default 16M) |
+| `blob_cache` | size | user file only: memory budget for content-addressed blobs (default 16M) |
 | `atime` | boolean | user file only: allow access time updates |
 | `git_remotes` | boolean | user file only: give a repository a git remote `ovnfs/NAME` per checkout (default true) |
 
@@ -203,8 +203,8 @@ daemon launched by `start`):
 proto: smb
 memory: 2G
 fsync: true
-blob_cache: 512M
-node_cache: 512M
+blob_cache: 64M
+node_cache: 64M
 atime: false
 git_remotes: true
 ```

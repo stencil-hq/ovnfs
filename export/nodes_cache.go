@@ -99,7 +99,7 @@ func (t *nodeTable) admitListing(p string) error {
 	if t.spillErr != nil {
 		t.trimCache()
 		if t.spillErr != nil {
-			if d := t.find(p); d == nil || d.dir == nil || d.dir.entries == nil {
+			if d := t.find(p); d == nil || d.dir == nil || d.dir.list == nil {
 				return syscall.ENOSPC
 			}
 		}
@@ -121,8 +121,18 @@ func (e *Export) NodeCacheError() string {
 	return ""
 }
 
-// DefaultNodeCache is the estimated byte budget for reconstructible identities.
-const DefaultNodeCache = 512 << 20
+// DefaultNodeCache is the estimated byte budget for reconstructible
+// identities. Evicted ones cost one append to the index and come back
+// through a memory map, so a small budget only bounds the working set.
+const DefaultNodeCache = 16 << 20
+
+// Estimated resident bytes of a leaf, of an unlogged node, and of a retired
+// hash, beside their names.
+const (
+	leafBytes     = 64
+	unloggedBytes = 160
+	retiredBytes  = 16
+)
 
 // SetNodeCache sets the reconstructible identity budget. Zero keeps only the
 // current directory and its ancestors, so a READDIR can still identify its
@@ -143,13 +153,20 @@ func (e *Export) NodeCache() api.Usage {
 	return api.Usage{Used: t.cacheUsed, Limit: t.cacheLimit}
 }
 
-// NodeIndexBytes reports the ownership and logged node index files,
-// separately from RSS.
+// NodeIndexBytes reports the size of the ownership and logged node index
+// files, which are mapped or read on demand rather than resident.
 func (e *Export) NodeIndexBytes() int64 {
 	t := e.fs.nodes
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.coldBytes + t.nodesBytes
+	var n int64
+	if t.pack != nil {
+		n += t.pack.end
+	}
+	if x := t.index; x != nil {
+		n += tableHeader + x.count*slotSize + t.recordsEnd + t.runtimeBytes
+	}
+	return n
 }
 
 // touch marks a cached directory and its ancestors most recently used, under
@@ -201,27 +218,6 @@ func (t *nodeTable) addLogged(d *node, delta int64) {
 	t.account(d, delta)
 }
 
-// listBytes estimates listing maps and names. The shared name arena remains
-// separately charged until eviction, even when invalidation drops the listing.
-func (s *dirState) listBytes() int64 {
-	var n int64
-	for _, name := range s.entries {
-		n += int64(64 + len(name))
-	}
-	for h := range s.dups {
-		n += s.dupBytes(h)
-	}
-	return n
-}
-
-func (s *dirState) dupBytes(h uint32) int64 {
-	var n int64
-	for _, name := range s.dups[h] {
-		n += int64(32 + len(name))
-	}
-	return n
-}
-
 // uncache removes a deleted or evicted node from the LRU without changing its
 // identity.
 func (t *nodeTable) uncache(d *node) {
@@ -251,12 +247,13 @@ func (t *nodeTable) spillFailed(err error) {
 // once per returned entry: retained cache is bounded by the budget plus one
 // directory and its ancestors, even when that directory exceeds the budget.
 func (t *nodeTable) trimCache() {
-	if len(t.coldGarbage) > 0 || len(t.deadKeys) > 0 || len(t.deadFiles) > 0 {
-		t.cleanCold()
+	if len(t.deadKeys) > 0 {
+		t.cleanDead()
 	}
 	if t.cacheUsed <= t.cacheLimit && t.spillErr == nil {
 		return
 	}
+	defer t.shrinkMaps()
 	// Invalidation can free the failed candidate without another eviction.
 	// Resume normal admission and start a new spill attempt if it fills again.
 	if t.cacheUsed <= t.cacheLimit {
@@ -303,9 +300,8 @@ func (t *nodeTable) trimCache() {
 			s.recent = nil
 		}
 		s.gen++ // an in-flight listing must not resurrect the evicted snapshot
-		s.entries, s.dups, s.leaves = nil, nil, nil
-		s.names = ""
-		s.coldLoaded = false
+		// The index holds the leaves and retired hashes now.
+		s.list, s.leaves, s.retired = nil, nil, nil
 		for name, k := range d.kids {
 			if k.key == 0 && k.holds == 0 {
 				// A node with children is logged. An unlogged directory may
@@ -319,13 +315,33 @@ func (t *nodeTable) trimCache() {
 		if len(d.kids) == 0 {
 			d.kids = nil
 		} else {
-			kids := make(map[string]*node, len(d.kids))
-			for name, k := range d.kids {
-				kids[name] = k
-			}
-			d.kids = kids
+			d.kids = rebuilt(d.kids)
 		}
 	}
+}
+
+// shrinkMaps rebuilds byID or byKey once eviction left a quarter of the
+// entries it once held: a map keeps its peak memory as entries leave.
+func (t *nodeTable) shrinkMaps() {
+	t.byIDPeak = max(t.byIDPeak, len(t.byID))
+	if t.byIDPeak > 1024 && len(t.byID) < t.byIDPeak/4 {
+		t.byID = rebuilt(t.byID)
+		t.byIDPeak = len(t.byID)
+	}
+	t.byKeyPeak = max(t.byKeyPeak, len(t.byKey))
+	if t.byKeyPeak > 1024 && len(t.byKey) < t.byKeyPeak/4 {
+		t.byKey = rebuilt(t.byKey)
+		t.byKeyPeak = len(t.byKey)
+	}
+}
+
+// rebuilt copies m into a map sized for its entries.
+func rebuilt[K comparable, V any](m map[K]V) map[K]V {
+	out := make(map[K]V, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // retain holds a handle used for protocol state. Such identities must remain in
@@ -345,7 +361,7 @@ func (t *nodeTable) retain(id uint64) func() {
 		// Retain that exact identity; never derive a second id at its new path.
 		n = t.byID[id]
 		if n == nil && d != nil && derivedID(d.key, nameHash(name)) == id && d.kids[name] == nil {
-			if !t.takenExceptCold(d, nameHash(name)) {
+			if !t.takenResident(d, nameHash(name)) {
 				t.addLeaf(d, name)
 			}
 			n = t.child(d, name)
@@ -355,7 +371,7 @@ func (t *nodeTable) retain(id uint64) func() {
 		return func() {}
 	}
 	if n.key == 0 && n.holds == 0 {
-		t.charge(n.parent, -int64(160+len(n.name)))
+		t.charge(n.parent, -int64(unloggedBytes+len(n.name)))
 	}
 	n.holds++
 	return func() {
@@ -363,7 +379,7 @@ func (t *nodeTable) retain(id uint64) func() {
 		defer t.mu.Unlock()
 		n.holds--
 		if n.key == 0 && n.holds == 0 && t.byID[id] == n {
-			t.charge(n.parent, int64(160+len(n.name)))
+			t.charge(n.parent, int64(unloggedBytes+len(n.name)))
 		}
 		t.trimCache()
 	}

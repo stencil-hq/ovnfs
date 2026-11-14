@@ -1,7 +1,7 @@
 // Package store keeps git-format objects (blobs and trees) content-addressed
 // under one directory, without git's "<type> <len>\x00" header. Objects up to
 // cloneFile bytes are appended, zstd-compressed where that shrinks them, to
-// pack files indexed in memory. Larger blobs stay loose when reflinked, or
+// pack files indexed by sorted, memory-mapped index files (see index.go). Larger blobs stay loose when reflinked, or
 // use content-defined packed chunks when copying; loose blobs contain exactly
 // the file's bytes and can be cloned into a checkout. Ids are Git SHA-1 ids,
 // so a snapshot tree built
@@ -11,6 +11,7 @@
 //
 //	<dir>/packs/<n>.pack            appended object frames (see pack.go)
 //	<dir>/packs/<n>.idx             index of a sealed (full) pack
+//	<dir>/packs/<g>.midx            index merged from the indexes of many sealed packs
 //	<dir>/objects/<2 hex>/<38 hex>  loose object body, read-only (0444)
 //	<dir>/tmp/<unique>              private staging files, renamed into objects
 //	<dir>/epoch                     token Sweep replaces before it removes objects
@@ -119,8 +120,7 @@ type Store struct {
 	rootsMu sync.Mutex
 	// trees holds trees known stored in the current epoch, so Build need not
 	// touch them again; Sweep empties it when it starts removing.
-	trees   map[OID]struct{}
-	treesMu sync.Mutex
+	trees treeSet
 	// noReflink holds source devices whose files cannot be cloned into the store.
 	noReflink sync.Map
 	// reflink remembers successful clones, allowing dictionary deltas on that device.
@@ -136,7 +136,7 @@ type Store struct {
 // Open prepares (creating if needed) the object store rooted at dir; cache bounds
 // the bytes of small blobs kept in memory (0 disables the cache).
 func Open(dir string, cache int64) (*Store, error) {
-	s := &Store{objects: filepath.Join(dir, "objects"), tmp: filepath.Join(dir, "tmp"), epochAt: filepath.Join(dir, "epoch"), roots: map[OID]time.Time{}, trees: map[OID]struct{}{}, cache: newBlobCache(cache)}
+	s := &Store{objects: filepath.Join(dir, "objects"), tmp: filepath.Join(dir, "tmp"), epochAt: filepath.Join(dir, "epoch"), roots: map[OID]time.Time{}, cache: newBlobCache(cache)}
 	if err := os.MkdirAll(s.tmp, 0o755); err != nil {
 		return nil, fmt.Errorf("open store %s: %w", dir, err)
 	}
@@ -736,9 +736,7 @@ func (s *Store) stored(id OID, keep []byte, tree bool) {
 		s.cache.add(id, keep)
 	}
 	if tree {
-		s.treesMu.Lock()
-		s.trees[id] = struct{}{}
-		s.treesMu.Unlock()
+		s.trees.add(rawOf(id))
 	}
 }
 
@@ -757,11 +755,47 @@ func (s *Store) touch(id OID, keep []byte, tree bool) bool {
 
 // knownTree reports a tree stored during the current epoch, so it is still stored
 // unless the epoch has changed since.
-func (s *Store) knownTree(id OID) bool {
-	s.treesMu.Lock()
-	defer s.treesMu.Unlock()
-	_, ok := s.trees[id]
-	return ok
+func (s *Store) knownTree(id OID) bool { return s.trees.has(rawOf(id)) }
+
+// treeGeneration is the number of trees a treeSet generation holds; the set
+// remembers between one and two generations, the most recently stored.
+const treeGeneration = 1 << 15
+
+// treeSet remembers recently stored trees within a fixed bound: a full
+// generation becomes the old one, dropping the generation before. Forgetting
+// a tree only costs Build a freshness touch.
+type treeSet struct {
+	mu       sync.Mutex
+	cur, old map[rawID]struct{}
+}
+
+// add remembers id.
+func (t *treeSet) add(id rawID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cur == nil {
+		t.cur = map[rawID]struct{}{}
+	}
+	t.cur[id] = struct{}{}
+	if len(t.cur) >= treeGeneration {
+		t.old, t.cur = t.cur, nil
+	}
+}
+
+// has reports whether id is remembered.
+func (t *treeSet) has(id rawID) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, cur := t.cur[id]
+	_, old := t.old[id]
+	return cur || old
+}
+
+// clear forgets every tree.
+func (t *treeSet) clear() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cur, t.old = nil, nil
 }
 
 // register records root as just built and so kept by Sweep, unless the epoch is

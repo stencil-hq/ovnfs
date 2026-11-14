@@ -5,101 +5,56 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestColdRecoveryBatchesOwners(t *testing.T) {
-	for _, budget := range []int64{0, 1 << 20} {
-		t.Run(fmt.Sprint(budget), func(t *testing.T) {
-			ns := newNamespace()
-			nt := newNodeTable(ns.list)
-			var ids []uint64
-			for i := range 256 {
-				p := fmt.Sprintf("co/f%d", i)
-				ns.add(p)
-				ids = append(ids, nt.id(p))
-			}
-			forceCold(t, nt, ns, "co")
-			nt.cacheLimit = budget
-			var reads atomic.Int32
-			nt.indexIO = func() { reads.Add(1) }
-			for i, id := range ids {
-				if got := pathOf(t, nt, id); got != fmt.Sprintf("co/f%d", i) {
-					t.Fatal(got)
-				}
-			}
-			maxReads := int32(1)
-			if budget == 0 {
-				maxReads = 5 // four recovery reads and one pressure-directory spill
-			}
-			if reads.Load() > maxReads {
-				t.Fatalf("%d index operations for one directory, want <= %d", reads.Load(), maxReads)
-			}
-		})
+func TestIndexWriteDoesNotHoldNodeMutex(t *testing.T) {
+	ns := newNamespace("co/file", "other/file", "pressure/entry")
+	nt := newNodeTable(ns.list)
+	id := nt.id("co/file")
+	other := nt.id("other/file")
+	defer nt.close()
+	nt.cacheLimit = 0
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	nt.indexIO = func() { once.Do(func() { close(entered); <-resume }) }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		nt.id("pressure/entry")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("index write did not start")
 	}
-}
-
-func TestIndexIODoesNotHoldNodeMutex(t *testing.T) {
-	for _, op := range []string{"read", "write"} {
-		t.Run(op, func(t *testing.T) {
-			ns := newNamespace("co/file", "other/file", "pressure/entry")
-			nt := newNodeTable(ns.list)
-			id := nt.id("co/file")
-			other := nt.id("other/file")
-			if op == "read" {
-				forceCold(t, nt, ns, "co")
-				nt.cacheLimit = 1 << 20
-			} else {
-				defer nt.close()
-				nt.cacheLimit = 0
-			}
-			entered, resume := make(chan struct{}), make(chan struct{})
-			var once sync.Once
-			nt.indexIO = func() { once.Do(func() { close(entered); <-resume }) }
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				if op == "read" {
-					nt.path(id)
-				} else {
-					nt.id("pressure/entry")
-				}
-			}()
-			select {
-			case <-entered:
-			case <-time.After(time.Second):
-				t.Fatal("index operation did not start")
-			}
-			unrelated := make(chan struct{})
-			go func() { nt.mu.Lock(); _ = nt.byID[other]; nt.mu.Unlock(); close(unrelated) }()
-			select {
-			case <-unrelated:
-			case <-time.After(time.Second):
-				close(resume)
-				t.Fatal("index I/O held node mutex")
-			}
-			// Move the owning directory while the snapshot is in flight. Publication
-			// must revalidate location and ownership instead of evicting stale state.
-			nt.mu.Lock()
-			d := nt.find("co")
-			nt.moved(d)
-			delete(d.parent.kids, d.name)
-			d.name = "moved"
-			d.parent.kids[d.name] = d
-			d.state().gen++
-			nt.mu.Unlock()
-			close(resume)
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				t.Fatal("index I/O did not finish")
-			}
-			if got := pathOf(t, nt, id); got != "moved/file" {
-				t.Fatal(got)
-			}
-		})
+	unrelated := make(chan struct{})
+	go func() { nt.mu.Lock(); _ = nt.byID[other]; nt.mu.Unlock(); close(unrelated) }()
+	select {
+	case <-unrelated:
+	case <-time.After(time.Second):
+		close(resume)
+		t.Fatal("index I/O held node mutex")
+	}
+	// Move the owning directory while the write is in flight. Publication
+	// must revalidate ownership instead of evicting stale state.
+	nt.mu.Lock()
+	d := nt.find("co")
+	nt.moved(d)
+	delete(d.parent.kids, d.name)
+	d.name = "moved"
+	d.parent.kids[d.name] = d
+	d.state().gen++
+	nt.mu.Unlock()
+	close(resume)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("index I/O did not finish")
+	}
+	if got := pathOf(t, nt, id); got != "moved/file" {
+		t.Fatal(got)
 	}
 }
 
@@ -223,69 +178,15 @@ func TestRecoveryAllowsDeepColdPaths(t *testing.T) {
 	release()
 }
 
-func TestDegradedConcurrentRetain(t *testing.T) {
-	for _, byPath := range []bool{false, true} {
-		t.Run(fmt.Sprint(byPath), func(t *testing.T) {
-			ns := newNamespace("co/file", "pressure/entry")
-			nt := newNodeTable(ns.list)
-			id := nt.id("co/file")
-			forceCold(t, nt, ns, "co")
-			nt.spillErr = fmt.Errorf("unavailable")
-			nt.spillRetry = time.Now().Add(time.Hour)
-			entered, resume := make(chan struct{}), make(chan struct{})
-			var once sync.Once
-			nt.indexIO = func() { once.Do(func() { close(entered); <-resume }) }
-			waiting := make(chan struct{})
-			nt.indexWait = func() { close(waiting) }
-			held := make(chan func(), 1)
-			go func() { held <- nt.retain(id) }()
-			<-entered
-			found := make(chan bool, 1)
-			go func() {
-				if byPath {
-					found <- nt.id("co/file") == id
-				} else {
-					p, ok := nt.path(id)
-					found <- ok && p == "co/file"
-				}
-			}()
-			select {
-			case <-waiting:
-			case <-time.After(time.Second):
-				close(resume)
-				t.Fatal("lookup did not wait for index")
-			}
-			close(resume)
-			release := <-held
-			defer release()
-			select {
-			case ok := <-found:
-				if !ok {
-					t.Fatal("concurrent retain made existing identity stale")
-				}
-			case <-time.After(time.Second):
-				t.Fatal("lookup did not finish")
-			}
-		})
-	}
-}
-
-func TestRetiredIndexReclaimed(t *testing.T) {
+func TestRetiredIndexDiscounted(t *testing.T) {
 	ns := newNamespace("co/file", "pressure/entry")
 	nt := newNodeTable(ns.list)
 	nt.id("co/file")
 	forceCold(t, nt, ns, "co")
-	file := nt.coldPath(nt.find("co"))
 	size := nt.find("co").dir.coldBytes
 	before := nt.coldBytes
 	nt.remove("co")
-	if _, err := os.Stat(file); !os.IsNotExist(err) {
-		t.Fatal("retired index survived", err)
-	}
-	if nt.coldGarbage != nil {
-		t.Fatal("drained cleanup queue retained nodes")
-	}
-	if nt.coldBytes != before-size {
+	if size == 0 || nt.coldBytes != before-size {
 		t.Fatalf("index bytes %d != %d", nt.coldBytes, before-size)
 	}
 }
@@ -454,7 +355,7 @@ func TestPreparedDestinationRemainsResident(t *testing.T) {
 			nt.cacheLimit = 0
 			nt.id("pressure/entry")
 			d := nt.find("co/dst")
-			if d.dir == nil || d.dir.reading == 0 || d.dir.entries == nil {
+			if d.dir == nil || d.dir.reading == 0 || d.dir.list == nil {
 				release()
 				t.Fatal("prepared destination escaped guard")
 			}
@@ -481,171 +382,6 @@ func TestPreparedDestinationRemainsResident(t *testing.T) {
 			defer nt.close()
 			if got := pathOf(t, nt, old); got != "co/dst/moved" {
 				t.Fatal(got)
-			}
-		})
-	}
-}
-
-func TestRetainResumesAfterRename(t *testing.T) {
-	ns := newNamespace("co/src", "co/dst", "pressure/entry")
-	log := filepath.Join(t.TempDir(), "nodes.log")
-	nt := openLogged(t, log, ns)
-	dst := nt.id("co/dst")
-	closeLogged(t, nt)
-	nt = openLogged(t, log, ns)
-	src := nt.id("co/src")
-	forceCold(t, nt, ns, "co")
-	nt.cacheLimit = 1 << 20
-	entered, resume := make(chan struct{}), make(chan struct{})
-	waiting, resumeWait := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	nt.indexIO = func() { once.Do(func() { close(entered); <-resume }) }
-	nt.indexWait = func() { close(waiting); <-resumeWait }
-	heldB, heldA := make(chan func(), 1), make(chan func(), 1)
-	go func() { heldB <- nt.retain(src) }()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("first retain did not read")
-	}
-	go func() { heldA <- nt.retain(src) }()
-	select {
-	case <-waiting:
-	case <-time.After(time.Second):
-		t.Fatal("second retain did not wait")
-	}
-	close(resume)
-	releaseB := <-heldB
-	defer releaseB()
-	releaseMove, err := nt.prepareRename("co/src", "co/dst")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ns.move("co/src", "co/dst")
-	nt.rename("co/src", "co/dst")
-	releaseMove()
-	close(resumeWait)
-	var releaseA func()
-	select {
-	case releaseA = <-heldA:
-	case <-time.After(time.Second):
-		t.Fatal("second retain did not resume")
-	}
-	defer releaseA()
-	if nt.find("co").leaf("dst") {
-		t.Fatal("retainer created a second destination identity")
-	}
-	if got := pathOf(t, nt, src); got != "co/dst" {
-		t.Fatal(got)
-	}
-	if _, ok := nt.path(dst); ok {
-		t.Fatal("overwritten destination handle names source")
-	}
-}
-
-func TestCompletedIndexReadIsShared(t *testing.T) {
-	for _, action := range []string{"path", "id", "lookup", "subtree"} {
-		t.Run(action, func(t *testing.T) {
-			ns := newNamespace("co/file", "pressure/entry")
-			nt := newNodeTable(ns.list)
-			old := nt.id("co/file")
-			forceCold(t, nt, ns, "co")
-			nt.spillErr = os.ErrPermission
-			nt.spillRetry = time.Now().Add(time.Hour)
-			first, last := make(chan struct{}), make(chan struct{})
-			resumeFirst, resumeLast := make(chan struct{}), make(chan struct{})
-			var reads atomic.Int32
-			nt.indexIO = func() {
-				switch reads.Add(1) {
-				case 1:
-					close(first)
-					<-resumeFirst
-				case 5:
-					close(last)
-					<-resumeLast
-				}
-			}
-			waiting, resumeWait := make(chan struct{}), make(chan struct{})
-			var once sync.Once
-			nt.indexWait = func() { once.Do(func() { close(waiting); <-resumeWait }) }
-			reader := func() chan struct{} {
-				done := make(chan struct{})
-				go func() { nt.path(old); close(done) }()
-				return done
-			}
-			// The first operation must request the full set: sparse Path reads
-			// intentionally do not provide unrelated owners to subtree waiters.
-			fullDone := make(chan struct{})
-			go func() { nt.mu.Lock(); nt.readOwners(nt.find("co")); nt.mu.Unlock(); close(fullDone) }()
-			b := fullDone
-			select {
-			case <-first:
-			case <-time.After(time.Second):
-				t.Fatal("first read did not start")
-			}
-			looked := make(chan bool, 1)
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				ok := false
-				switch action {
-				case "path":
-					_, ok = nt.path(old)
-				case "id":
-					ok = nt.id("co/file") == old
-				case "lookup":
-					id, found := nt.lookup("co/file")
-					ok = found && id == old
-				case "subtree":
-					for _, ref := range nt.subtree("co") {
-						ok = ok || ref == old
-					}
-				}
-				looked <- ok
-				if ok && (action == "lookup" || action == "subtree") {
-					nt.remove("co/file")
-				}
-			}()
-			select {
-			case <-waiting:
-			case <-time.After(time.Second):
-				t.Fatal("lookup did not wait")
-			}
-			close(resumeFirst)
-			<-b
-			for range 3 {
-				nt.path(old)
-			}
-			b = reader()
-			select {
-			case <-last:
-			case <-time.After(time.Second):
-				t.Fatal("fifth read did not start")
-			}
-			close(resumeWait)
-			select {
-			case ok := <-looked:
-				if !ok {
-					t.Error("serialized read lost an issued owner")
-				}
-			case <-time.After(time.Second):
-				close(resumeLast)
-				t.Fatal("waiter discarded completed read behind later I/O")
-			}
-			close(resumeLast)
-			<-b
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("retirement did not finish")
-			}
-			if action == "lookup" || action == "subtree" {
-				if _, ok := nt.path(old); ok {
-					t.Fatal("invalidation stage skipped retirement")
-				}
-			}
-			if nt.cacheErr != nil {
-				t.Fatal("contention latched a terminal fault")
 			}
 		})
 	}

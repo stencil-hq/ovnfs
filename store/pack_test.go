@@ -3,11 +3,14 @@ package store
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -214,7 +217,7 @@ func TestPackConcurrentWriters(t *testing.T) {
 			frames += n
 		}
 	}
-	if want := len(s.packs.index); frames != want {
+	if want := len(packedObjects(s)); frames != want {
 		t.Errorf("packs hold %d frames for %d objects", frames, want)
 	}
 	files := packFiles(t, s)
@@ -222,8 +225,8 @@ func TestPackConcurrentWriters(t *testing.T) {
 		t.Fatalf("expected several packs with sealed indexes, got %v", files)
 	}
 	again := reopen(t, s)
-	if len(again.packs.index) != len(s.packs.index) {
-		t.Fatalf("reopened index holds %d objects, want %d", len(again.packs.index), len(s.packs.index))
+	if len(packedObjects(again)) != len(packedObjects(s)) {
+		t.Fatalf("reopened index holds %d objects, want %d", len(packedObjects(again)), len(packedObjects(s)))
 	}
 	for i, id := range ids {
 		mustRead(t, again, id, bodies[i])
@@ -273,7 +276,7 @@ func TestSweepPacked(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-time.Hour)
-	for id := range s.packs.index {
+	for id := range packedObjects(s) {
 		age(t, s, id.oid(), old)
 	}
 	cutoff := time.Now().Add(-time.Minute)
@@ -332,7 +335,7 @@ func TestSweepPacked(t *testing.T) {
 		}
 	}
 	var live int64
-	for _, e := range s.packs.index {
+	for _, e := range packedObjects(s) {
 		live += frameHeader + int64(e.stored)
 	}
 	if total != live {
@@ -426,7 +429,7 @@ func TestLegacyLooseObjects(t *testing.T) {
 	if _, err := s.PutBytes(small); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.packs.index) != 0 {
+	if len(packedObjects(s)) != 0 {
 		t.Error("re-storing a loose object packed it")
 	}
 	for _, id := range ids {
@@ -514,8 +517,8 @@ func TestOpenIndexesManyObjects(t *testing.T) {
 	start := time.Now()
 	again := reopen(t, s)
 	took := time.Since(start)
-	if len(again.packs.index) != 100_000 {
-		t.Fatalf("reopened index holds %d objects", len(again.packs.index))
+	if len(packedObjects(again)) != 100_000 {
+		t.Fatalf("reopened index holds %d objects", len(packedObjects(again)))
 	}
 	t.Logf("Open indexed 100k objects in %v", took)
 	if took > 2*time.Second {
@@ -527,7 +530,7 @@ func TestOpenIndexesManyObjects(t *testing.T) {
 func nextPack(t *testing.T, s *Store) {
 	t.Helper()
 	s.packs.appendMu.Lock()
-	err := s.packs.seal(true)
+	err := s.packs.seal()
 	s.packs.appendMu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -637,4 +640,130 @@ func TestSweepKeepsBaseOfStayingDelta(t *testing.T) {
 	}
 	mustRead(t, s, delta, next)
 	mustRead(t, reopen(t, s), delta, next)
+}
+
+// TestOpenMigratesUnsortedIndex replaces the unsorted index an earlier release
+// wrote for a sealed pack with a sorted one at Open, keeping every object and
+// its freshness, and scans a pack whose old index is damaged.
+func TestOpenMigratesUnsortedIndex(t *testing.T) {
+	s := openStoreCache(t, 0)
+	bodies := map[OID][]byte{}
+	for i := range 50 {
+		body := noisy(fmt.Sprint("object ", i), 300)
+		id, err := s.PutBytes(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies[id] = body
+	}
+	old := time.Now().Add(-time.Hour).UnixNano()
+	s.packs.mu.Lock()
+	for id, e := range s.packs.entries {
+		e.at = old
+		s.packs.entries[id] = e
+	}
+	s.packs.mu.Unlock()
+	nextPack(t, s)
+	idx := s.packs.idxPath(0)
+	pack, err := os.Stat(s.packs.packPath(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The earlier format: records in no particular order, then a trailer.
+	var body []byte
+	for id, e := range packedObjects(s) {
+		var rec [legacyRecord]byte
+		copy(rec[:], id[:])
+		binary.LittleEndian.PutUint32(rec[20:], e.off)
+		binary.LittleEndian.PutUint32(rec[24:], e.stored)
+		binary.LittleEndian.PutUint32(rec[28:], e.raw)
+		rec[32] = e.flags
+		binary.LittleEndian.PutUint64(rec[36:], uint64(e.at))
+		body = append(body, rec[:]...)
+	}
+	trailer := binary.LittleEndian.AppendUint64(nil, uint64(pack.Size()))
+	trailer = binary.LittleEndian.AppendUint32(trailer, uint32(len(body)/legacyRecord))
+	trailer = binary.LittleEndian.AppendUint32(trailer, crc32.Checksum(body, castagnoli))
+	legacy := append(body, trailer...)
+	for _, damaged := range []bool{false, true} {
+		data := slices.Clone(legacy)
+		if damaged {
+			data[3] ^= 1
+		}
+		if err := os.WriteFile(idx, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		again := reopen(t, s)
+		for id, want := range bodies {
+			mustRead(t, again, id, want)
+		}
+		for _, e := range packedObjects(again) {
+			// A scan finds the freshness each frame was appended with.
+			if !damaged && e.at != old {
+				t.Fatalf("freshness %d after migration, want %d", e.at, old)
+			}
+		}
+		if got, err := os.ReadFile(idx); !damaged && (err != nil || !bytes.HasPrefix(got, []byte(indexMagic))) {
+			t.Fatalf("index not rewritten sorted: %v", err)
+		}
+	}
+}
+
+// TestPackIndexMerge merges sealed pack indexes into one, keeps freshness
+// written to an index across a reopen, and recovers from an interrupted merge.
+func TestPackIndexMerge(t *testing.T) {
+	s := openStoreCache(t, 0)
+	s.packs.limit = 4 << 10
+	bodies := map[OID][]byte{}
+	for i := range 200 {
+		body := noisy(fmt.Sprint("object ", i), 500)
+		id, err := s.PutBytes(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies[id] = body
+	}
+	files := packFiles(t, s)
+	idxs := 0
+	var merged string
+	for name := range files {
+		switch filepath.Ext(name) {
+		case ".idx":
+			idxs++
+		case ".midx":
+			merged = name
+		}
+	}
+	if merged == "" || idxs >= mergeAfter {
+		t.Fatalf("sealed indexes not merged: %v", files)
+	}
+	var first OID
+	for id := range bodies {
+		first = id
+		break
+	}
+	old := time.Now().Add(-time.Hour)
+	age(t, s, first, old)
+	again := reopen(t, s)
+	for id, want := range bodies {
+		mustRead(t, again, id, want)
+	}
+	if e := packedObjects(again)[rawOf(first)]; e.at != old.UnixNano() {
+		t.Fatalf("freshness %d after reopen, want %d", e.at, old.UnixNano())
+	}
+	// A newer, torn merged index is a leftover of a crash during a merge.
+	data, err := os.ReadFile(filepath.Join(s.packs.dir, merged))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.packs.dir, "99.midx"), data[:len(data)/2], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again = reopen(t, s)
+	if _, ok := packFiles(t, again)["99.midx"]; ok {
+		t.Fatal("torn merged index kept")
+	}
+	for id, want := range bodies {
+		mustRead(t, again, id, want)
+	}
 }

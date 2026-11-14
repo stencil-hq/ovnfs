@@ -9,8 +9,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/fs"
-	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -58,19 +57,14 @@ const (
 	frameInternal = 1 << 5
 )
 
-// Pack index (<n>.idx) layout: one idxRecord-byte record per frame (id,
-// offset, payload length, content length, flags, 3 zero bytes, freshness,
-// delta base id or zeros), then a trailer holding the pack's length
-// (uint64), the record count (uint32) and the CRC-32C of everything before it.
-const (
-	idxRecord  = 64
-	idxTrailer = 16
-)
-
 // packLimit is the length past which the active pack is sealed and a new one
 // started; it bounds both the scan at Open and the bytes Sweep copies to
 // rewrite one pack.
 const packLimit = 32 << 20
+
+// activeLimit is the number of objects past which the active pack is sealed
+// too, bounding the memory its index takes until then.
+const activeLimit = 1 << 14
 
 // castagnoli is the CRC-32C table, hardware-accelerated on amd64 and arm64.
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -78,14 +72,21 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // errCorrupt reports a frame whose checksum or header does not match its index entry.
 var errCorrupt = errors.New("corrupt pack frame")
 
-// encoder compresses pack payloads; EncodeAll is safe for concurrent use.
-var encoder = sync.OnceValue(func() *zstd.Encoder {
-	e, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderCRC(false), zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
+// encoders recycles single-goroutine pack encoders. Payloads are at most
+// cloneFile bytes, so a cloneFile window finds every match the default 8 MiB
+// one would while an encoder keeps 2 MiB of history instead of 16 MiB; pooled,
+// idle encoders go at the next GC instead of one per CPU staying for good.
+var encoders = sync.Pool{New: func() any {
+	e, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderCRC(false), zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(cloneFile))
 	if err != nil {
 		panic(err) // constant options
 	}
 	return e
-})
+}}
+
+// encodeSlots bounds concurrent pack compression, and with it the encoders
+// the pool creates, to the CPUs that can run them.
+var encodeSlots = make(chan struct{}, runtime.GOMAXPROCS(0))
 
 // decoder decompresses pack payloads; DecodeAll is safe for concurrent use and,
 // with the cap limit, never produces more than the content length a frame declares.
@@ -128,15 +129,21 @@ type packed struct {
 	raw    uint32 // content length
 	flags  uint8
 	// at is the object's freshness for Sweep, Unix nanoseconds: when it was
-	// appended or last stored again, whichever is later.
-	at int64
+	// appended or last stored again, whichever is later. Set only for the
+	// active pack's objects; index files keep it apart.
+	at   int64
+	base rawID // the base of a delta
 }
 
 // encodeFrame returns data as a complete frame for id, fresh at at; the
 // payload is zstd-compressed when that makes it smaller.
 func encodeFrame(id rawID, data []byte, at int64, flags uint8) []byte {
 	buf := make([]byte, frameHeader, frameHeader+len(data))
-	buf = encoder().EncodeAll(data, buf)
+	encodeSlots <- struct{}{}
+	enc := encoders.Get().(*zstd.Encoder)
+	buf = enc.EncodeAll(data, buf)
+	encoders.Put(enc)
+	<-encodeSlots
 	if len(buf)-frameHeader >= len(data) {
 		buf = append(buf[:frameHeader], data...)
 	} else {
@@ -231,21 +238,41 @@ func (pf *packFile) release() {
 	}
 }
 
-// packSet holds the store's packs and the in-memory index of their objects.
+// packSet holds the store's packs and the index of their objects: memory-mapped
+// index files for sealed packs (see index.go) and a map for the active pack
+// only. A lookup takes the first copy of an object in the merged index, the
+// sealed packs' indexes in order, then the active pack; duplicate frames, left
+// by a crash during a rewrite, resolve the same way for reads and for Sweep.
 type packSet struct {
 	dir   string
 	limit int64 // packLimit; smaller in tests
-	// mu guards index, bases and files; readers hold it only to look up.
-	mu    sync.RWMutex
-	index map[rawID]packed
-	bases map[rawID]rawID   // base of each indexed delta object
-	links map[rawID][]rawID // dependencies of each indexed manifest
-	files map[uint32]*packFile
-	// appendMu serializes appends, sealing and rewrites and guards the fields below.
+	// mu guards files, merged, sealed and entries; readers hold it only to look up.
+	mu      sync.RWMutex
+	files   map[uint32]*packFile
+	merged  *idxFile         // the index merged from earlier sealed packs; nil before the first merge
+	sealed  []*idxFile       // indexes of the packs sealed since, oldest first
+	entries map[rawID]packed // the objects of the active pack
+	// touchMu serializes freshness updates and guards pending and flushing;
+	// seal and merge hold it while they read freshness into a new index, so
+	// none is lost.
+	touchMu sync.Mutex
+	// pending holds the freshness of sealed objects stored again, until
+	// pendingLimit of them are written to their index files together;
+	// flushing holds the batch being written.
+	pending, flushing map[rawID]int64
+	// flushMu serializes writing batches of pending freshness; it is taken
+	// before touchMu, and merges and Sweep hold it so the index files they
+	// read are current.
+	flushMu sync.Mutex
+	// appendMu serializes appends, sealing, merges and rewrites and guards the fields below.
 	appendMu sync.Mutex
 	active   *packFile // the pack appends go to; nil until the next append creates one
 	end      int64     // active's length
 	next     uint32    // number of the next new pack
+	gen      uint64    // number of the next merged index
+	// pinned defers merges while a Sweep marks objects by their position in
+	// the current index files.
+	pinned bool
 }
 
 // packPath is the file of pack n.
@@ -253,34 +280,43 @@ func (p *packSet) packPath(n uint32) string {
 	return filepath.Join(p.dir, strconv.FormatUint(uint64(n), 10)+".pack")
 }
 
-// idxPath is the index file of pack n.
+// idxPath is the index file of sealed pack n.
 func (p *packSet) idxPath(n uint32) string {
 	return filepath.Join(p.dir, strconv.FormatUint(uint64(n), 10)+".idx")
 }
 
-// openPacks loads the packs under dir (created if needed): a sealed pack from
-// its index, any other by scanning its frames, cutting it at the first
+// midxPath is merged index file number g.
+func (p *packSet) midxPath(g uint64) string {
+	return filepath.Join(p.dir, strconv.FormatUint(g, 10)+".midx")
+}
+
+// openPacks loads the packs under dir (created if needed): sealed packs from
+// the newest intact merged index or their own index, migrating an index of an
+// earlier release, any other by scanning its frames, cutting it at the first
 // incomplete or corrupt one (a torn tail). The newest unsealed pack with room
 // becomes the active one; other unsealed packs are sealed.
 func openPacks(dir string) (*packSet, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	p := &packSet{dir: dir, limit: packLimit, index: map[rawID]packed{}, bases: map[rawID]rawID{}, links: map[rawID][]rawID{}, files: map[uint32]*packFile{}}
+	p := &packSet{dir: dir, limit: packLimit, files: map[uint32]*packFile{}, entries: map[rawID]packed{}}
 	names, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 	var packs []uint32
+	var gens []uint64
 	idxs := map[uint32]bool{}
 	for _, e := range names {
 		base, ext, _ := strings.Cut(e.Name(), ".")
-		n, err := strconv.ParseUint(base, 10, 32)
+		n, err := strconv.ParseUint(base, 10, 64)
 		switch {
-		case err == nil && ext == "pack":
+		case err == nil && n <= math.MaxUint32 && ext == "pack":
 			packs = append(packs, uint32(n))
-		case err == nil && ext == "idx":
+		case err == nil && n <= math.MaxUint32 && ext == "idx":
 			idxs[uint32(n)] = true
+		case err == nil && ext == "midx":
+			gens = append(gens, n)
 		default:
 			// Leftover index staging files and anything else unknown.
 			removeFile(filepath.Join(dir, e.Name()))
@@ -290,59 +326,114 @@ func openPacks(dir string) (*packSet, error) {
 	if len(packs) > 0 {
 		p.next = packs[len(packs)-1] + 1
 	}
-	var unsealed []*packFile
-	var ends []int64
+	sizes := make(map[uint32]int64, len(packs))
 	for _, n := range packs {
-		delete(idxs, n)
 		f, err := hostfile.OpenFile(p.packPath(n), os.O_RDWR, 0)
 		if err != nil {
 			return nil, err
 		}
-		pf := &packFile{n: n, f: f}
-		pf.refs.Store(1)
 		info, err := f.Stat()
 		if err != nil {
 			f.Close()
 			return nil, err
 		}
-		if p.loadIdx(pf, info.Size()) {
-			p.files[n] = pf
-			continue
-		}
-		removeFile(p.idxPath(n))
-		end, err := p.scan(pf)
-		if err == nil && end < info.Size() {
-			err = f.Truncate(end)
-		}
-		if err != nil {
-			f.Close()
-			return nil, fmt.Errorf("pack %d: %w", n, err)
-		}
-		if end == 0 {
-			f.Close()
-			removeFile(p.packPath(n))
-			continue
-		}
+		pf := &packFile{n: n, f: f}
+		pf.refs.Store(1)
 		p.files[n] = pf
-		unsealed, ends = append(unsealed, pf), append(ends, end)
+		sizes[n] = info.Size()
+	}
+	// The newest intact merged index stands; older ones, and the indexes of
+	// packs it covers, are leftovers of an interrupted merge.
+	slices.Sort(gens)
+	for i := len(gens) - 1; i >= 0; i-- {
+		path := p.midxPath(gens[i])
+		if p.merged == nil {
+			x, err := openIndex(path, func(n uint32) (int64, bool) { size, ok := sizes[n]; return size, ok })
+			if err == nil {
+				p.merged = x
+				continue
+			}
+		}
+		removeFile(path)
+	}
+	if len(gens) > 0 {
+		p.gen = gens[len(gens)-1] + 1
+	}
+	var unsealed []uint32
+	for _, n := range packs {
+		has := idxs[n]
+		delete(idxs, n)
+		switch {
+		case p.merged != nil && p.merged.covers(n):
+			if has {
+				removeFile(p.idxPath(n))
+			}
+		case has:
+			if x := p.loadIdx(n, sizes[n]); x != nil {
+				p.sealed = append(p.sealed, x)
+				continue
+			}
+			removeFile(p.idxPath(n))
+			unsealed = append(unsealed, n)
+		default:
+			unsealed = append(unsealed, n)
+		}
 	}
 	for n := range idxs {
 		removeFile(p.idxPath(n))
 	}
-	for i, pf := range unsealed {
-		p.active, p.end = pf, ends[i]
-		if i == len(unsealed)-1 && ends[i] < p.limit {
+	for i, n := range unsealed {
+		pf := p.files[n]
+		end, err := p.scan(pf)
+		if err == nil && end < sizes[n] {
+			err = pf.f.Truncate(end)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("pack %d: %w", n, err)
+		}
+		if end == 0 {
+			delete(p.files, n)
+			pf.f.Close()
+			removeFile(p.packPath(n))
+			continue
+		}
+		p.active, p.end = pf, end
+		if i == len(unsealed)-1 && end < p.limit && len(p.entries) < activeLimit {
 			break
 		}
-		if err := p.seal(true); err != nil {
+		if err := p.seal(); err != nil {
 			return nil, err
 		}
+	}
+	if len(p.sealed) >= mergeAfter {
+		// A failed merge only leaves lookups more indexes to search.
+		p.merge(nil)
 	}
 	return p, nil
 }
 
-// scan indexes the frames of pf from its start, returning the length of its
-// intact prefix; objects already indexed from another pack keep that entry.
+// loadIdx opens the index of sealed pack n of length size, first migrating
+// one an earlier release wrote; nil means it is missing or damaged.
+func (p *packSet) loadIdx(n uint32, size int64) *idxFile {
+	path := p.idxPath(n)
+	check := func(m uint32) (int64, bool) { return size, m == n }
+	x, err := openIndex(path, check)
+	if err != nil && migrateIndex(path, n, size) {
+		x, err = openIndex(path, check)
+	}
+	if err != nil {
+		return nil
+	}
+	if len(x.packs) != 1 {
+		x.close()
+		return nil
+	}
+	return x
+}
+
+// scan indexes the frames of pf from its start as the active pack's,
+// returning the length of its intact prefix; objects already indexed keep
+// that entry.
 func (p *packSet) scan(pf *packFile) (int64, error) {
 	r := bufio.NewReaderSize(io.NewSectionReader(pf.f, 0, 1<<62), 1<<20)
 	var off int64
@@ -369,134 +460,34 @@ func (p *packSet) scan(pf *packFile) (int64, error) {
 			return off, nil
 		}
 		e.pack, e.off = pf.n, uint32(off)
-		if _, dup := p.index[id]; !dup {
-			p.index[id] = e
+		if _, _, _, dup := p.locate(id); !dup {
+			if e.flags&frameManifest != 0 && checkManifest(id, frame) != nil {
+				return off, nil
+			}
 			if e.flags&frameDelta != 0 {
-				p.bases[id] = deltaBase(frame)
+				e.base = deltaBase(frame)
 			}
-			if e.flags&frameManifest != 0 {
-				if err := p.manifestLinks(id, frame); err != nil {
-					delete(p.index, id)
-					return off, nil
-				}
-			}
+			p.entries[id] = e
 		}
 		off += int64(len(frame))
 	}
 }
 
-// loadIdx indexes pack pf of length size from its index file, reporting
-// whether that file was intact and matched the pack.
-func (p *packSet) loadIdx(pf *packFile, size int64) bool {
-	n := pf.n
-	data, err := os.ReadFile(p.idxPath(n))
-	if err != nil || len(data) < idxTrailer || (len(data)-idxTrailer)%idxRecord != 0 {
-		return false
+// checkManifest reports a manifest frame whose references do not parse or,
+// for a private page, whose content does not hash to id.
+func checkManifest(id rawID, frame []byte) error {
+	data := frame[frameHeader:]
+	if _, _, err := parseManifest(data); err != nil || frame[24]&frameInternal != 0 && rawOf(HashBytes("manifest", data)) != id {
+		return errCorrupt
 	}
-	body, trailer := data[:len(data)-idxTrailer], data[len(data)-idxTrailer:]
-	if binary.LittleEndian.Uint64(trailer) != uint64(size) ||
-		int(binary.LittleEndian.Uint32(trailer[8:])) != len(body)/idxRecord ||
-		binary.LittleEndian.Uint32(trailer[12:]) != crc32.Checksum(body, castagnoli) {
-		return false
-	}
-	// Validate bounds before indexing anything or allocating a frame from an
-	// index. A damaged index is discarded and recovered from the pack scan.
-	var h [frameHeader]byte
-	var frame []byte // a manifest's frame, read to index its links
-	for rec := range slices.Chunk(body, idxRecord) {
-		h[24] = rec[32]
-		copy(h[28:32], rec[28:32])
-		copy(h[32:36], rec[24:28])
-		_, e, ok := parseHeader(h[:])
-		if !ok || uint64(binary.LittleEndian.Uint32(rec[20:]))+frameHeader+uint64(e.stored) > uint64(size) {
-			return false
-		}
-		if e.flags&frameManifest != 0 {
-			if frame == nil {
-				frame = make([]byte, 0, frameHeader+manifestHeader+manifestFanout*manifestRecord)
-			}
-			frame = frame[:frameHeader+int(e.stored)]
-			_, err := pf.f.ReadAt(frame, int64(binary.LittleEndian.Uint32(rec[20:])))
-			var id rawID
-			copy(id[:], rec)
-			if err != nil || checkFrame(id, e, frame) != nil || p.manifestLinks(id, frame) != nil {
-				return false
-			}
-		}
-	}
-	for rec := range slices.Chunk(body, idxRecord) {
-		var id rawID
-		copy(id[:], rec)
-		e := packed{
-			pack:   n,
-			off:    binary.LittleEndian.Uint32(rec[20:]),
-			stored: binary.LittleEndian.Uint32(rec[24:]),
-			raw:    binary.LittleEndian.Uint32(rec[28:]),
-			flags:  rec[32],
-			at:     int64(binary.LittleEndian.Uint64(rec[36:])),
-		}
-		if _, dup := p.index[id]; !dup {
-			p.index[id] = e
-			if e.flags&frameDelta != 0 {
-				var base rawID
-				copy(base[:], rec[44:])
-				p.bases[id] = base
-			}
-		}
-	}
-	return true
+	return nil
 }
 
-// writeIdx writes the index file of pack n, of length size, from the in-memory index.
-func (p *packSet) writeIdx(n uint32, size int64) error {
-	p.mu.RLock()
-	var body []byte
-	for id, e := range p.index {
-		if e.pack != n {
-			continue
-		}
-		var rec [idxRecord]byte
-		copy(rec[:], id[:])
-		binary.LittleEndian.PutUint32(rec[20:], e.off)
-		binary.LittleEndian.PutUint32(rec[24:], e.stored)
-		binary.LittleEndian.PutUint32(rec[28:], e.raw)
-		rec[32] = e.flags
-		binary.LittleEndian.PutUint64(rec[36:], uint64(e.at))
-		if base, ok := p.bases[id]; ok {
-			copy(rec[44:], base[:])
-		}
-		body = append(body, rec[:]...)
-	}
-	p.mu.RUnlock()
-	var trailer [idxTrailer]byte
-	binary.LittleEndian.PutUint64(trailer[:], uint64(size))
-	binary.LittleEndian.PutUint32(trailer[8:], uint32(len(body)/idxRecord))
-	binary.LittleEndian.PutUint32(trailer[12:], crc32.Checksum(body, castagnoli))
-	tmp := p.idxPath(n) + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(append(body, trailer[:]...))
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(tmp, p.idxPath(n))
-	}
-	if err != nil {
-		removeFile(tmp)
-	}
-	return err
-}
-
-// seal ends appends to the active pack: it is made durable and, when indexed
-// is set, given an index file so Open need not scan it. A failed index write
-// only costs that scan, so it does not fail the seal. p.appendMu must be held.
-func (p *packSet) seal(indexed bool) error {
+// seal ends appends to the active pack: it is made durable and its objects
+// move from memory to an index file, so Open need not scan it. Should the
+// index fail to write, it is kept in memory, and the next Open scans the pack.
+// Enough sealed indexes are merged. p.appendMu must be held.
+func (p *packSet) seal() error {
 	pf := p.active
 	if pf == nil {
 		return nil
@@ -504,20 +495,95 @@ func (p *packSet) seal(indexed bool) error {
 	if err := pf.f.Sync(); err != nil {
 		return err
 	}
-	if indexed {
-		p.writeIdx(pf.n, p.end)
+	p.touchMu.Lock()
+	data := encodeIndex(p.entries, pf.n, p.end)
+	x := memIndex(data)
+	path := p.idxPath(pf.n)
+	if createAtomic(path, func(f *os.File) error { _, err := f.Write(data); return err }) == nil {
+		if mapped, err := openIndex(path, nil); err == nil {
+			x = mapped
+		}
 	}
+	p.mu.Lock()
+	p.sealed = append(p.sealed, x)
+	p.entries = map[rawID]packed{}
+	p.mu.Unlock()
+	p.touchMu.Unlock()
 	p.active, p.end = nil, 0
+	if !p.pinned && len(p.sealed) >= mergeAfter {
+		// A failed merge only leaves lookups more indexes to search.
+		p.merge(nil)
+	}
+	return nil
+}
+
+// sources lists the index files in lookup order; p.mu is held.
+func (p *packSet) sources() []*idxFile {
+	srcs := make([]*idxFile, 0, len(p.sealed)+1)
+	if p.merged != nil {
+		srcs = append(srcs, p.merged)
+	}
+	return append(srcs, p.sealed...)
+}
+
+// merge replaces the merged index and the sealed packs' indexes with one index
+// of their objects outside the packs in drop, made durable before the old
+// files are removed. p.appendMu must be held.
+func (p *packSet) merge(drop map[uint32]bool) error {
+	p.mu.RLock()
+	srcs := p.sources()
+	p.mu.RUnlock()
+	var packs []packLen
+	for _, x := range srcs {
+		for _, pl := range x.packs {
+			if !drop[pl.n] {
+				packs = append(packs, pl)
+			}
+		}
+	}
+	slices.SortFunc(packs, func(a, b packLen) int { return cmp.Compare(a.n, b.n) })
+	packs = slices.CompactFunc(packs, func(a, b packLen) bool { return a.n == b.n })
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+	p.touchMu.Lock()
+	defer p.touchMu.Unlock()
+	p.flush()
+	var x *idxFile // no index without packs to cover
+	if len(packs) > 0 {
+		path := p.midxPath(p.gen)
+		if err := writeIndex(path, srcs, drop, packs); err != nil {
+			return err
+		}
+		syncDir(p.dir)
+		var err error
+		if x, err = openIndex(path, nil); err != nil {
+			removeFile(path)
+			return err
+		}
+		p.gen++
+	}
+	p.mu.Lock()
+	p.merged, p.sealed = x, nil
+	p.mu.Unlock()
+	for _, old := range srcs {
+		old.close()
+		if old.path != "" {
+			removeFile(old.path)
+		}
+	}
 	return nil
 }
 
 // reserve makes the active pack able to take n more bytes, sealing a full one
 // and starting a new one as needed; p.appendMu must be held.
 func (p *packSet) reserve(n int) error {
-	if p.active != nil && (p.end == 0 || p.end+int64(n) <= p.limit) {
+	p.mu.RLock()
+	full := len(p.entries) >= activeLimit
+	p.mu.RUnlock()
+	if p.active != nil && !full && (p.end == 0 || p.end+int64(n) <= p.limit) {
 		return nil
 	}
-	if err := p.seal(true); err != nil {
+	if err := p.seal(); err != nil {
 		return err
 	}
 	num := p.next
@@ -563,16 +629,31 @@ func (p *packSet) add(frame []byte) (bool, error) {
 	if e.pack, e.off, err = p.write(frame); err != nil {
 		return false, err
 	}
-	p.mu.Lock()
-	p.index[id] = e
 	if e.flags&frameDelta != 0 {
-		p.bases[id] = deltaBase(frame)
+		e.base = deltaBase(frame)
 	}
-	if e.flags&frameManifest != 0 {
-		p.manifestLinks(id, frame)
-	}
+	p.mu.Lock()
+	p.entries[id] = e
 	p.mu.Unlock()
 	return false, nil
+}
+
+// locate finds the copy of id lookups use: x and i name its index record, x
+// nil for the active pack. Only the active pack's e carries its freshness;
+// an index file's is read with x.at(i). p.mu is held.
+func (p *packSet) locate(id rawID) (x *idxFile, i int, e packed, ok bool) {
+	if x := p.merged; x != nil {
+		if i, ok := x.find(id); ok {
+			return x, i, x.entry(i), true
+		}
+	}
+	for _, x := range p.sealed {
+		if i, ok := x.find(id); ok {
+			return x, i, x.entry(i), true
+		}
+	}
+	e, ok = p.entries[id]
+	return nil, 0, e, ok
 }
 
 // depth returns the number of deltas to decode to read packed object id.
@@ -580,90 +661,13 @@ func (p *packSet) depth(id rawID) int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for n := range deltaDepth + 1 {
-		base, ok := p.bases[id]
-		if !ok {
+		_, _, e, ok := p.locate(id)
+		if !ok || e.flags&frameDelta == 0 {
 			return n
 		}
-		id = base
+		id = e.base
 	}
 	return deltaDepth + 1
-}
-
-// keepBases adds to live the dependencies (delta bases, manifest pages and
-// chunks), transitively, of every packed object a Sweep with cutoff before
-// keeps (live, or fresh at or after before), so no kept object loses one.
-// Afterwards live is closed under dependencies.
-func (p *packSet) keepBases(live map[OID]struct{}, before int64) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	var hexID [40]byte
-	isLive := func(id rawID) bool {
-		hex.Encode(hexID[:], id[:])
-		_, ok := live[OID(hexID[:])]
-		return ok
-	}
-	fresh := func(id rawID) bool {
-		e, ok := p.index[id]
-		return ok && e.at >= before
-	}
-	// Every kept object with dependencies is followed from here, so a
-	// dependency already live, or fresh, need not be followed again.
-	var stack []rawID
-	for id := range p.bases {
-		if fresh(id) || isLive(id) {
-			stack = append(stack, id)
-		}
-	}
-	for id := range p.links {
-		if fresh(id) || isLive(id) {
-			stack = append(stack, id)
-		}
-	}
-	p.follow(stack, func(dep rawID) bool {
-		if isLive(dep) {
-			return false
-		}
-		live[OID(hexID[:])] = struct{}{}
-		return !fresh(dep)
-	})
-}
-
-// manifestLinks validates and indexes a manifest's dependencies; p.mu is held
-// or the pack set is not yet shared.
-func (p *packSet) manifestLinks(id rawID, frame []byte) error {
-	data := frame[frameHeader:]
-	refs, _, err := parseManifest(data)
-	if err != nil || frame[24]&frameInternal != 0 && rawOf(HashBytes("manifest", data)) != id {
-		return errCorrupt
-	}
-	deps := make([]rawID, len(refs))
-	for i, ref := range refs {
-		deps[i] = ref.id
-	}
-	p.links[id] = deps
-	return nil
-}
-
-// follow pops objects off stack and passes each of their direct dependencies
-// (a delta's base, a manifest's references) to descend, pushing those it
-// reports should be followed in turn; descend must report each object at most
-// once, so corrupt cycles terminate. p.mu is held.
-func (p *packSet) follow(stack []rawID, descend func(rawID) bool) {
-	for len(stack) > 0 {
-		id := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if base, ok := p.bases[id]; ok {
-			if descend(base) {
-				stack = append(stack, base)
-			}
-			continue
-		}
-		for _, dep := range p.links[id] {
-			if descend(dep) {
-				stack = append(stack, dep)
-			}
-		}
-	}
 }
 
 // chainRoot returns the full object at the bottom of a bounded delta chain.
@@ -671,11 +675,11 @@ func (p *packSet) chainRoot(id rawID) (rawID, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for range deltaDepth + 1 {
-		base, ok := p.bases[id]
-		if !ok {
+		_, _, e, ok := p.locate(id)
+		if !ok || e.flags&frameDelta == 0 {
 			return id, true
 		}
-		id = base
+		id = e.base
 	}
 	return rawID{}, false
 }
@@ -684,26 +688,89 @@ func (p *packSet) chainRoot(id rawID) (rawID, bool) {
 func (p *packSet) lookup(id rawID) (packed, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.index[id]
+	_, _, e, ok := p.locate(id)
 	return e, ok
 }
 
-// touch raises packed object id's freshness to at, reporting whether it is packed.
+// pendingLimit is the number of sealed objects whose new freshness is kept in
+// memory before it is written to their index files.
+const pendingLimit = 1 << 12
+
+// touch raises packed object id's freshness to at, reporting whether it is
+// packed. A sealed object's new freshness is written to its index in batches,
+// so it outlasts a restart once written.
 func (p *packSet) touch(id rawID, at int64) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.index[id]
-	if ok && e.at < at {
-		e.at = at
-		p.index[id] = e
+	p.touchMu.Lock()
+	p.mu.RLock()
+	x, i, e, ok := p.locate(id)
+	if x != nil {
+		e.at = max(x.at(i), p.pending[id], p.flushing[id])
 	}
+	p.mu.RUnlock()
+	switch {
+	case !ok || e.at >= at:
+	case x == nil || x.heap:
+		// Readers see the active pack's map or an index in memory directly.
+		p.mu.Lock()
+		if x != nil {
+			x.setAt(i, at)
+		} else {
+			e.at = at
+			p.entries[id] = e
+		}
+		p.mu.Unlock()
+	default:
+		if p.pending == nil {
+			p.pending = map[rawID]int64{}
+		}
+		p.pending[id] = at
+		if len(p.pending) >= pendingLimit && p.flushing == nil {
+			p.flushing, p.pending = p.pending, nil
+			p.touchMu.Unlock()
+			p.flushBatch()
+			return true
+		}
+	}
+	p.touchMu.Unlock()
 	return ok
+}
+
+// flushBatch writes the flushing batch to the index files, then lets a new
+// batch start.
+func (p *packSet) flushBatch() {
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+	p.writePending(p.flushing)
+	p.touchMu.Lock()
+	p.flushing = nil
+	p.touchMu.Unlock()
+}
+
+// flush writes all pending freshness to the index files; p.flushMu and
+// p.touchMu are held, so no batch is being written.
+func (p *packSet) flush() {
+	p.writePending(p.pending)
+	p.pending = nil
+}
+
+// writePending writes the freshness in batch, which no one modifies, to the
+// index records lookups use; p.flushMu is held, so those stay in place.
+func (p *packSet) writePending(batch map[rawID]int64) {
+	updates := make([]freshUpdate, 0, len(batch))
+	p.mu.RLock()
+	for id, at := range batch {
+		if x, i, _, ok := p.locate(id); x != nil && ok {
+			updates = append(updates, freshUpdate{x, i, at})
+		}
+	}
+	p.mu.RUnlock()
+	writeUpdates(updates)
 }
 
 // frame reads and verifies the frame of packed object id; ok is false when it is not packed.
 func (p *packSet) frame(id rawID) (packed, []byte, bool, error) {
 	p.mu.RLock()
-	e, ok := p.index[id]
+	_, _, e, ok := p.locate(id)
 	var pf *packFile
 	if ok {
 		pf = p.files[e.pack]
@@ -727,176 +794,4 @@ func (p *packSet) frame(id rawID) (packed, []byte, bool, error) {
 		return e, nil, true, fmt.Errorf("pack %d offset %d: %w", e.pack, e.off, err)
 	}
 	return e, frame, true, nil
-}
-
-// rewriteShare is the inverse of the share of a pack's bytes that must be
-// garbage before Sweep rewrites it: below a quarter, dead objects stay in
-// place (and stored) until later sweeps have found enough of them.
-const rewriteShare = 4
-
-// removals lists the packed objects a Sweep removes: those outside live whose
-// freshness predates before, but only from packs where they and frames no
-// longer indexed make up at least 1/rewriteShare of the pack. Dead objects
-// left in other packs stay stored, so their dependencies join live. live
-// must be closed under dependencies, as keepBases leaves it.
-func (p *packSet) removals(live map[OID]struct{}, before int64) ([]rawID, error) {
-	p.appendMu.Lock()
-	defer p.appendMu.Unlock()
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	dead := map[rawID]packed{}
-	indexed := map[uint32]int64{}
-	var hexID [40]byte
-	for id, e := range p.index {
-		indexed[e.pack] += frameHeader + int64(e.stored)
-		if e.at >= before {
-			continue
-		}
-		hex.Encode(hexID[:], id[:])
-		if _, ok := live[OID(hexID[:])]; !ok {
-			dead[id] = e
-		}
-	}
-	isLive := func(id rawID) bool {
-		hex.Encode(hexID[:], id[:])
-		_, ok := live[OID(hexID[:])]
-		return ok
-	}
-	sizes := map[uint32]int64{}
-	var stack []rawID
-	for {
-		deadBytes := map[uint32]int64{}
-		for _, e := range dead {
-			deadBytes[e.pack] += frameHeader + int64(e.stored)
-		}
-		victims := map[uint32]bool{}
-		for n, d := range deadBytes {
-			size, ok := sizes[n]
-			if !ok {
-				if p.active != nil && p.active.n == n {
-					size = p.end
-				} else {
-					info, err := p.files[n].f.Stat()
-					if err != nil {
-						return nil, err
-					}
-					size = info.Size()
-				}
-				sizes[n] = size
-			}
-			victims[n] = (size-(indexed[n]-d))*rewriteShare >= size
-		}
-		// A dead object left in place keeps its dependencies, which may make
-		// other packs hold less garbage: repeat until nothing changes. Its
-		// pack only loses garbage from here on, so it stays in place and is
-		// followed once. Live and fresh dependencies are closed already.
-		stack = stack[:0]
-		for id, e := range dead {
-			if !victims[e.pack] {
-				delete(dead, id)
-				stack = append(stack, id)
-			}
-		}
-		changed := false
-		p.follow(stack, func(dep rawID) bool {
-			if isLive(dep) {
-				return false
-			}
-			live[OID(hexID[:])] = struct{}{}
-			if _, isDead := dead[dep]; isDead {
-				delete(dead, dep)
-				changed = true
-				return true
-			}
-			_, indexed := p.index[dep]
-			return !indexed
-		})
-		if !changed {
-			return slices.Collect(maps.Keys(dead)), nil
-		}
-	}
-}
-
-// remove drops dead from the index and rewrites every pack that held one:
-// its other frames are copied verbatim (still compressed, keeping their
-// freshness) to the active pack, made durable, and only then is the old pack
-// deleted. Reads in flight on an old pack finish on its open file.
-func (p *packSet) remove(dead []rawID) error {
-	p.appendMu.Lock()
-	defer p.appendMu.Unlock()
-	victims := map[uint32]bool{}
-	p.mu.Lock()
-	for _, id := range dead {
-		if e, ok := p.index[id]; ok {
-			victims[e.pack] = true
-			delete(p.index, id)
-			delete(p.bases, id)
-			delete(p.links, id)
-		}
-	}
-	p.mu.Unlock()
-	if p.active != nil && victims[p.active.n] {
-		if err := p.seal(false); err != nil {
-			return err
-		}
-	}
-	for _, n := range slices.Sorted(maps.Keys(victims)) {
-		if err := p.rewrite(n); err != nil {
-			return err
-		}
-	}
-	if p.active != nil {
-		if err := p.active.f.Sync(); err != nil {
-			return err
-		}
-	}
-	for n := range victims {
-		p.mu.Lock()
-		pf := p.files[n]
-		delete(p.files, n)
-		p.mu.Unlock()
-		removeFile(p.idxPath(n))
-		if err := hostfile.Remove(p.packPath(n)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		pf.release()
-	}
-	return nil
-}
-
-// rewrite copies the indexed frames of sealed pack n to the active pack, in
-// their order, repointing the index; p.appendMu must be held.
-func (p *packSet) rewrite(n uint32) error {
-	type moved struct {
-		id rawID
-		e  packed
-	}
-	var frames []moved
-	p.mu.RLock()
-	pf := p.files[n]
-	for id, e := range p.index {
-		if e.pack == n {
-			frames = append(frames, moved{id, e})
-		}
-	}
-	p.mu.RUnlock()
-	slices.SortFunc(frames, func(a, b moved) int { return cmp.Compare(a.e.off, b.e.off) })
-	buf := make([]byte, 0, frameHeader+cloneFile)
-	for _, m := range frames {
-		buf = buf[:frameHeader+int(m.e.stored)]
-		if _, err := pf.f.ReadAt(buf, int64(m.e.off)); err != nil {
-			return fmt.Errorf("rewrite pack %d: %w", n, err)
-		}
-		num, off, err := p.write(buf)
-		if err != nil {
-			return fmt.Errorf("rewrite pack %d: %w", n, err)
-		}
-		p.mu.Lock()
-		if cur, ok := p.index[m.id]; ok && cur.pack == n && cur.off == m.e.off {
-			cur.pack, cur.off = num, off
-			p.index[m.id] = cur
-		}
-		p.mu.Unlock()
-	}
-	return nil
 }

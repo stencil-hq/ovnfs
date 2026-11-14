@@ -362,3 +362,48 @@ func TestHashOnlyCaptureReadsCacheTrees(t *testing.T) {
 		}
 	}
 }
+
+// MarshalBinary encodes a capture in the format UnmarshalBinary migrates from.
+func (r *Result) MarshalBinary() ([]byte, error) {
+	var e encoder
+	e.str(r.Root)
+	e.str(string(r.Tree))
+	e.uvarint(uint64(len(r.Repos)))
+	for _, repo := range r.Repos {
+		e.str(repo.Path)
+		e.str(repo.Head)
+		e.str(repo.Index)
+		e.str(repo.Module)
+	}
+	roots := SortedPaths(r.Roots)
+	e.paths(roots)
+	for _, p := range roots {
+		e.str(string(r.Roots[p]))
+	}
+	taken := SortedPaths(r.BlobRepo)
+	e.paths(taken)
+	for _, p := range taken {
+		e.str(r.BlobRepo[p])
+	}
+	infos := SortedPaths(r.Info)
+	e.paths(infos)
+	var prev int64
+	for _, p := range infos {
+		sec := r.Info[p].Mtime.Unix()
+		e.varint(sec - prev)
+		prev = sec
+	}
+	for _, p := range infos {
+		e.uvarint(uint64(r.Info[p].Mtime.Nanosecond()))
+	}
+	for _, p := range infos {
+		e.varint(r.Info[p].Size)
+	}
+	prev = 0
+	for _, p := range infos {
+		ino := int64(r.Info[p].Ino)
+		e.varint(ino - prev)
+		prev = ino
+	}
+	return pack(resultMagic, e.buf)
+}

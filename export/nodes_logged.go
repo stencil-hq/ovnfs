@@ -6,12 +6,15 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 
 	"github.com/stencil-hq/ovnfs/internal/durable"
+	"github.com/stencil-hq/ovnfs/internal/mapped"
 )
 
 // Logged nodes page out to an index of the identity log: a record per key,
@@ -26,18 +29,17 @@ import (
 // The index lives in a directory nodes-* beside the owner index instance:
 //
 //	table    a header, then a slot per key logged when it was built, sorted by key
-//	records  the records of those keys, then those clean closes appended
+//	records  the records of those keys, then those evictions and clean closes appended
 //	runtime  a slot per key allocated since it was built, at its key minus base
-//	xx/key   a record written when its node left memory, sharded like owner index files
 //
 // A resident logged directory knows its cold logged children (stubs) and
 // every logged holder of its derived ids (held), so lookups and derivation
 // never wait for the index. A logged node leaves memory only after its
 // listing, leaves and unlogged children, and only without resident
 // children, holds or operations, so every resident node's ancestors are
-// resident. A changed record is written to a file of its own when its node
-// leaves memory, and appended to records for the nodes still resident at a
-// clean close (saveIndex).
+// resident. A changed record is appended to records when its node leaves
+// memory, and for the nodes still resident at a clean close (saveIndex); a
+// lookup searches the table's keys through a memory map.
 
 // Estimated resident bytes of a logged node (node, dirState and its map
 // entries), a stub, and a held entry.
@@ -54,13 +56,14 @@ type stub struct{ key, id uint64 }
 var errNodeIndex = errors.New("invalid logged node index")
 
 // Index layout. A slot is five little-endian words: the key; the record's
-// offset in records, or ownFile; the record's length; the owner index size
-// below 2^sizeBits with the epoch that wrote it above; the owner's base in the
-// pack, with packedOwner and priorOwner.
+// offset in records; the record's length; the owner index size below
+// 2^sizeBits with the epoch that wrote it above; the owner's base in the
+// pack, with packedOwner and priorOwner. An index from before owner indexes
+// were all packed (ownersMagic version 3) may leave packedOwner clear for an
+// owner index file of its own, which only a rebuild reads (buildIndex).
 const (
 	slotSize    = 40
 	tableHeader = 32
-	ownFile     = 1 << 63 // a slot's record is a file of its own
 	packedOwner = 1 << 63 // a slot's owner index is a segment of the pack
 	priorOwner  = 1 << 62 // a slot's owner index was adopted when the index was built
 	offsetMask  = 1<<62 - 1
@@ -72,11 +75,11 @@ const (
 
 var tableMagic = []byte("ovnfs keys 2\n\x00\x00\x00")
 
-// nodeOwner is where a key's owner index lives: size 0 for none.
+// nodeOwner is where a key's owner index lives in the pack: size 0 for none.
 type nodeOwner struct {
-	size          int64
-	base          int64
-	packed, prior bool
+	size  int64
+	base  int64
+	prior bool
 }
 
 // ownerOf returns the owner index location d's state records.
@@ -84,32 +87,30 @@ func ownerOf(s *dirState) nodeOwner {
 	if !s.cold {
 		return nodeOwner{}
 	}
-	return nodeOwner{size: s.coldBytes, base: s.base, packed: s.packed, prior: s.prior}
+	return nodeOwner{size: s.coldBytes, base: s.base, prior: s.prior}
 }
 
 // apply installs the owner index location o in s.
 func (o nodeOwner) apply(s *dirState) {
-	s.cold, s.coldBytes, s.base, s.packed, s.prior = o.size > 0, o.size, o.base, o.packed, o.prior
+	s.cold, s.coldBytes, s.base, s.prior = o.size > 0, o.size, o.base, o.prior
 }
 
 // nodeSlot locates a key's record and owner index.
 type nodeSlot struct {
 	key    uint64
-	own    bool // the record is a file of its own
 	offset int64
 	length int64
 	owner  nodeOwner
-	at     int64 // where the slot was read, in the table or runtime file
+	// The owner index is a file of its own, which only an index from before
+	// owner indexes were all packed has.
+	ownerFile bool
+	at        int64 // where the slot was read, in the table or runtime file
 }
 
 // encode lays out s, its owner written in epoch.
 func (s nodeSlot) encode(b []byte, epoch uint64) {
 	binary.LittleEndian.PutUint64(b[0:], s.key)
-	record := uint64(s.offset)
-	if s.own {
-		record |= ownFile
-	}
-	binary.LittleEndian.PutUint64(b[8:], record)
+	binary.LittleEndian.PutUint64(b[8:], uint64(s.offset))
 	binary.LittleEndian.PutUint64(b[16:], uint64(s.length))
 	s.owner.encode(b[24:], epoch)
 }
@@ -117,10 +118,7 @@ func (s nodeSlot) encode(b []byte, epoch uint64) {
 // encode lays out o's two slot words, written in epoch.
 func (o nodeOwner) encode(b []byte, epoch uint64) {
 	binary.LittleEndian.PutUint64(b[0:], uint64(o.size)|epoch<<sizeBits)
-	base := uint64(o.base)
-	if o.packed {
-		base |= packedOwner
-	}
+	base := uint64(o.base) | packedOwner
 	if o.prior {
 		base |= priorOwner
 	}
@@ -131,29 +129,28 @@ func (o nodeOwner) encode(b []byte, epoch uint64) {
 // adopted at the build or written in an epoch other than epoch: by an
 // earlier open.
 func decodeSlot(b []byte, epoch uint64) nodeSlot {
-	record := binary.LittleEndian.Uint64(b[8:])
 	size, base := binary.LittleEndian.Uint64(b[24:]), binary.LittleEndian.Uint64(b[32:])
 	return nodeSlot{
 		key:    binary.LittleEndian.Uint64(b),
-		own:    record&ownFile != 0,
-		offset: int64(record & offsetMask),
+		offset: int64(binary.LittleEndian.Uint64(b[8:]) & offsetMask),
 		length: int64(binary.LittleEndian.Uint64(b[16:]) & offsetMask),
 		owner: nodeOwner{
-			size:   int64(size & sizeMask),
-			base:   int64(base & offsetMask),
-			packed: base&packedOwner != 0,
-			prior:  size&sizeMask != 0 && (base&priorOwner != 0 || size>>sizeBits != epoch),
+			size:  int64(size & sizeMask),
+			base:  int64(base & offsetMask),
+			prior: size&sizeMask != 0 && (base&priorOwner != 0 || size>>sizeBits != epoch),
 		},
+		ownerFile: size&sizeMask != 0 && base&packedOwner == 0,
 	}
 }
 
 // nodeIndex is an open logged node index. Its fields do not change after
 // open, so I/O uses it without the node mutex. Slots of resident keys are
-// written only by their node's eviction or close, and read only while the
-// key is cold, so no slot is read while it is written.
+// written only by their node's spills, eviction or close, and read only
+// while the key is cold, so no slot is read while it is written.
 type nodeIndex struct {
 	dir     string
 	table   *os.File
+	view    *mapped.File // the table, whose size never changes after the build; slots are read here
 	records *os.File
 	runtime *os.File
 	count   int64  // slots in table
@@ -173,7 +170,7 @@ func (x *nodeIndex) locate(key uint64) (*os.File, int64, bool, error) {
 	lo, hi := int64(0), x.count
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		if _, err := x.table.ReadAt(b[:], tableHeader+mid*slotSize); err != nil {
+		if _, err := x.view.ReadAt(b[:], tableHeader+mid*slotSize); err != nil {
 			return nil, 0, false, err
 		}
 		switch k := binary.LittleEndian.Uint64(b[:]); {
@@ -195,7 +192,11 @@ func (x *nodeIndex) slot(key uint64) (nodeSlot, bool, error) {
 		return nodeSlot{}, false, err
 	}
 	var b [slotSize]byte
-	if _, err := f.ReadAt(b[:], off); err != nil {
+	var r io.ReaderAt = f
+	if f == x.table {
+		r = x.view
+	}
+	if _, err := r.ReadAt(b[:], off); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nodeSlot{}, false, nil // a runtime slot past the end
 		}
@@ -203,7 +204,7 @@ func (x *nodeIndex) slot(key uint64) (nodeSlot, bool, error) {
 	}
 	s := decodeSlot(b[:], x.epoch)
 	s.at = off
-	return s, s.key == key && (s.own || s.length > 0), nil
+	return s, s.key == key && s.length > 0, nil
 }
 
 // slotFile returns the file and offset of key's slot: in the runtime file,
@@ -223,38 +224,27 @@ func (x *nodeIndex) slotFile(key uint64, at int64) (*os.File, int64, error) {
 	return f, at, err
 }
 
-// read returns key's record and slot. A missing record file means its key
-// was retired and its garbage removed.
+// read returns key's record and slot.
 func (x *nodeIndex) read(key uint64) (rec loggedRecord, s nodeSlot, found bool, err error) {
 	s, found, err = x.slot(key)
 	if !found || err != nil {
 		return rec, s, false, err
 	}
-	var b []byte
-	if s.own {
-		b, err = os.ReadFile(coldIndexPath(x.dir, key))
-		if errors.Is(err, os.ErrNotExist) {
-			return rec, s, false, nil
-		}
-	} else {
-		b = make([]byte, s.length)
-		_, err = x.records.ReadAt(b, s.offset)
-	}
-	if err != nil {
+	b := make([]byte, s.length)
+	if _, err = x.records.ReadAt(b, s.offset); err != nil {
 		return rec, s, false, err
 	}
 	rec, err = decodeRecord(b, key)
 	return rec, s, err == nil, err
 }
 
-// publish writes key's record, when rec is not nil, and its slot.
-func (x *nodeIndex) publish(key uint64, rec []byte, owner nodeOwner) error {
-	f, off, ok, err := x.locate(key)
+// publish writes key's slot, at at in the table when known, locating owner
+// and, when rec is not nil, the record rec, first written at offset in
+// records.
+func (x *nodeIndex) publish(key uint64, at int64, rec []byte, offset int64, owner nodeOwner) error {
+	f, off, err := x.slotFile(key, at)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return errNodeIndex
 	}
 	var b [slotSize]byte
 	if rec == nil {
@@ -268,37 +258,17 @@ func (x *nodeIndex) publish(key uint64, rec []byte, owner nodeOwner) error {
 		_, err = f.WriteAt(b[24:], off+24)
 		return err
 	}
-	target := coldIndexPath(x.dir, key)
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+	if _, err := x.records.WriteAt(rec, offset); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(target), ".record-*")
-	if err != nil {
-		return err
-	}
-	if _, err = tmp.Write(rec); err == nil {
-		err = tmp.Close()
-	} else {
-		tmp.Close()
-	}
-	if err == nil {
-		err = os.Rename(tmp.Name(), target)
-	}
-	if err != nil {
-		os.Remove(tmp.Name())
-		return err
-	}
-	nodeSlot{key: key, own: true, length: int64(len(rec)), owner: owner}.encode(b[:], x.epoch)
-	_, err = f.WriteAt(b[8:], off+8)
-	if err == nil && f == x.runtime {
-		_, err = f.WriteAt(b[:8], off)
-	}
+	nodeSlot{key: key, offset: offset, length: int64(len(rec)), owner: owner}.encode(b[:], x.epoch)
+	_, err = f.WriteAt(b[:], off)
 	return err
 }
 
 // close releases the index files; the next open reads their owner fields.
 func (x *nodeIndex) close() error {
-	return errors.Join(x.table.Close(), x.records.Close(), x.runtime.Close())
+	return errors.Join(x.view.Close(), x.table.Close(), x.records.Close(), x.runtime.Close())
 }
 
 // loggedRecord is a logged node as its record describes it.
@@ -406,13 +376,20 @@ func decodeRecord(b []byte, key uint64) (loggedRecord, error) {
 }
 
 // priorIndex is what a clean close left for the next open: the index whose
-// slots hold every key's owner index location, and the pack of segments.
-type priorIndex struct{ nodes, pack string }
+// slots hold every key's owner index location, the instance directory and
+// the pack of segments in it, if any.
+type priorIndex struct {
+	nodes, instance, pack string
+	// legacy marks a store of an earlier layout, which only a rebuild reads.
+	legacy bool
+	owners []keyOwner // a version 1 manifest's owner indexes, without nodes
+}
 
 // keyOwner is a key's owner index location in a closed index.
 type keyOwner struct {
 	key   uint64
 	owner nodeOwner
+	file  bool // a legacy index's owner index file of its own
 }
 
 // readPriorOwners reads the owner fields of every slot of a closed index,
@@ -452,7 +429,7 @@ func readPriorOwners(dir string) ([]keyOwner, error) {
 			if n := len(out); n > 0 && out[n-1].key >= s.key || header && s.key >= base {
 				return errNodeIndex
 			}
-			out = append(out, keyOwner{s.key, s.owner})
+			out = append(out, keyOwner{s.key, s.owner, s.ownerFile})
 		}
 		return nil
 	}
@@ -465,29 +442,71 @@ func readPriorOwners(dir string) ([]keyOwner, error) {
 	return out, nil
 }
 
+// legacyOwnerFile is where a legacy index kept key's owner index file of
+// its own below its instance root.
+func legacyOwnerFile(root string, key uint64) string {
+	return filepath.Join(root, fmt.Sprintf("%02x", key&255), strconv.FormatUint(key, 10))
+}
+
+// priorOwners reads the owner indexes a closed index locates, for a rebuild
+// to carry over.
+type priorOwners struct {
+	instance string
+	pack     *ownerPack
+}
+
+// rows returns the owners and retired hashes the closed index holds for key
+// at o, newest winning and sorted by hash, and the one segment they came
+// from when it can be copied as it is.
+func (p *priorOwners) rows(key uint64, o keyOwner) (rows []ownerRow, seg []byte, err error) {
+	if o.file {
+		data, err := os.ReadFile(legacyOwnerFile(p.instance, key))
+		if err != nil {
+			return nil, nil, err
+		}
+		if int64(len(data)) < o.owner.size {
+			return nil, nil, errOwnerIndex
+		}
+		data = data[:o.owner.size]
+		rows, err := segmentOwners(data)
+		return rows, data, err
+	}
+	if p.pack == nil {
+		return nil, nil, os.ErrNotExist
+	}
+	rows, chain, err := chainRows(p.pack, o.owner)
+	if err == nil && chain.segments == 1 {
+		seg, err = p.pack.segment(o.owner)
+	}
+	return rows, seg, err
+}
+
 // buildIndex writes the index of the logged nodes r replayed and makes only
 // the root resident. Owner indexes a clean close left for this log are
-// adopted: their files stay, and their pack segments move to a new pack
-// together with the hashes the log retired since, so one pack remains.
+// carried to a new instance, each as one segment of its pack, with the
+// hashes the log retired since; the prior instance and index are discarded
+// whole.
 func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 	discard := t.coldParent + ".discard"
 	var owners []keyOwner
-	var oldPack *os.File
+	old := &priorOwners{}
 	if prior != nil {
 		var err error
-		if owners, err = readPriorOwners(prior.nodes); err != nil {
-			// Unreadable slots lose the adopted owners, as a crash would.
-			owners = nil
-			os.Rename(t.coldRoot, filepath.Join(discard, "store-"+rand.Text()))
-			t.coldRoot = ""
-		} else if prior.pack != "" {
-			oldPack, _ = os.Open(prior.pack) // unreadable segments are forgotten
+		owners = prior.owners
+		if prior.nodes != "" {
+			if owners, err = readPriorOwners(prior.nodes); err != nil {
+				owners = nil // unreadable slots lose the adopted owners, as a crash would
+			}
 		}
+		if owners != nil && prior.pack != "" {
+			old.pack, _ = openPack(prior.pack) // unreadable segments are forgotten
+		}
+		old.instance = prior.instance
 	}
 	closeOld := func() {
-		if oldPack != nil {
-			oldPack.Close()
-			oldPack = nil
+		if old.pack != nil {
+			old.pack.close()
+			old.pack = nil
 		}
 	}
 	defer closeOld()
@@ -539,72 +558,49 @@ func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 		return fail(err)
 	}
 
-	var pack *os.File
+	t.coldRoot = ""
 	var pw *bufio.Writer
-	var packSize int64
-	var segment []byte
-	appendSegment := func(data []byte) (int64, error) {
-		if pack == nil {
-			if t.coldRoot == "" {
-				root, err := os.MkdirTemp(t.coldParent, "instance-")
-				if err != nil {
-					return 0, err
-				}
-				t.coldRoot = root
+	appendSegment := func(data []byte) (nodeOwner, error) {
+		if t.pack == nil {
+			if _, err := t.createPack(); err != nil {
+				return nodeOwner{}, err
 			}
-			var err error
-			if pack, err = os.CreateTemp(t.coldRoot, "pack-"); err != nil {
-				return 0, err
-			}
-			pw = bufio.NewWriterSize(pack, 1<<20)
+			pw = bufio.NewWriterSize(t.pack.file, 1<<20)
 		}
-		base := packSize
+		o := nodeOwner{size: int64(len(data)), base: t.pack.end, prior: true}
 		_, err := pw.Write(data)
-		packSize += int64(len(data))
-		return base, err
+		t.pack.end += o.size
+		t.pack.size = t.pack.end
+		return o, err
 	}
-	// carry returns where a key's owner index lives in this instance.
-	carry := func(key uint64, o nodeOwner, retired []uint32) (nodeOwner, error) {
-		if o.packed && oldPack == nil {
-			o = nodeOwner{}
+	// carry returns where a key's owner index lives in the new instance.
+	carry := func(key uint64, o keyOwner, retired []uint32) (nodeOwner, error) {
+		var rows []ownerRow
+		var seg []byte
+		if o.owner.size > 0 {
+			var err error
+			if rows, seg, err = old.rows(key, o); err != nil {
+				rows, seg = nil, nil // an unreadable adopted index holds no owners
+			}
 		}
-		if len(retired) == 0 {
-			switch {
-			case o.size == 0:
-				return nodeOwner{}, nil
-			case !o.packed:
-				return nodeOwner{size: o.size, prior: true}, nil
-			}
-			segment = slices.Grow(segment[:0], int(o.size))[:o.size]
-			if _, err := oldPack.ReadAt(segment, o.base); err != nil {
-				return nodeOwner{}, nil
-			}
-			base, err := appendSegment(segment)
-			return nodeOwner{size: o.size, base: base, packed: true, prior: true}, err
-		}
-		names, gone := map[uint32]string{}, map[uint32]struct{}{}
-		if o.size > 0 {
-			ix := coldIndex{coldIndexPath(t.coldRoot, key), 0, o.size}
-			if o.packed {
-				ix = coldIndex{prior.pack, o.base, o.size}
-			}
-			if n, r, err := readColdNames(ix); err == nil {
-				names = n
-				for _, h := range r {
-					gone[h] = struct{}{}
-				}
-			}
-			if !o.packed {
-				t.deadFiles = append(t.deadFiles, ix.file)
-			}
+		if len(retired) == 0 && seg != nil {
+			return appendSegment(seg)
 		}
 		for _, h := range retired {
-			gone[h] = struct{}{}
-			delete(names, h)
+			i, found := slices.BinarySearchFunc(rows, h, func(r ownerRow, h uint32) int { return cmp.Compare(r.hash, h) })
+			if found {
+				rows[i].name = nil
+			} else {
+				rows = slices.Insert(rows, i, ownerRow{hash: h})
+			}
 		}
-		data := encodeColdNames(names, gone)
-		base, err := appendSegment(data)
-		return nodeOwner{size: int64(len(data)), base: base, packed: true}, err
+		if len(rows) == 0 {
+			return nodeOwner{}, nil
+		}
+		carried, err := appendSegment(encodeSegment(rows, nodeOwner{}))
+		// One holding what the log retired since is no longer only adopted.
+		carried.prior = len(retired) == 0
+		return carried, err
 	}
 
 	var offset int64
@@ -612,18 +608,17 @@ func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 	next := 0
 	for _, i := range live {
 		n := &r.nodes[i]
-		var o nodeOwner
+		var o keyOwner
 		for ; next < len(owners) && owners[next].key <= n.key; next++ {
 			if owners[next].key == n.key {
-				o = owners[next].owner
-			} else if !owners[next].owner.packed {
-				t.deadFiles = append(t.deadFiles, coldIndexPath(t.coldRoot, owners[next].key))
+				o = owners[next]
 			}
 		}
-		if o, err = carry(n.key, o, r.retired[i]); err != nil {
+		owner, err := carry(n.key, o, r.retired[i])
+		if err != nil {
 			return fail(err)
 		}
-		t.coldBytes += o.size
+		t.coldBytes += owner.size
 		rec = rec[:0]
 		if i != 0 {
 			l := loggedRecord{id: n.id, parent: r.nodes[n.parent].key, name: n.name, away: away[i]}
@@ -633,7 +628,7 @@ func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 			rec = appendRecord(rec, n.key, &l)
 		}
 		var b [slotSize]byte
-		nodeSlot{key: n.key, offset: offset, length: int64(len(rec)), owner: o}.encode(b[:], x.epoch)
+		nodeSlot{key: n.key, offset: offset, length: int64(len(rec)), owner: owner}.encode(b[:], x.epoch)
 		if _, err := tw.Write(b[:]); err != nil {
 			return fail(err)
 		}
@@ -644,26 +639,22 @@ func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 		if i == 0 {
 			// The root has the lowest key. Its record waits for close.
 			s := t.root.state()
-			o.apply(s)
-			s.loaded, s.slot, s.stale = o, tableHeader, true
-		}
-	}
-	for ; next < len(owners); next++ {
-		if !owners[next].owner.packed {
-			t.deadFiles = append(t.deadFiles, coldIndexPath(t.coldRoot, owners[next].key))
+			owner.apply(s)
+			s.loaded, s.slot, s.stale = owner, tableHeader, true
 		}
 	}
 	if err := errors.Join(tw.Flush(), rw.Flush()); err != nil {
 		return fail(err)
 	}
-	if pack != nil {
-		if err := errors.Join(pw.Flush(), pack.Close()); err != nil {
+	if pw != nil {
+		if err := pw.Flush(); err != nil {
 			return fail(err)
 		}
-		t.coldPack = pack.Name()
+	}
+	if x.view, err = mapped.Open(x.table.Name()); err != nil {
+		return fail(err)
 	}
 	t.index = x
-	t.nodesBytes = tableHeader + x.count*slotSize + offset
 	t.built, t.recordsEnd = offset, offset
 	var bytes int64
 	for c := r.nodes[0].child; c >= 0; c = r.nodes[c].next {
@@ -675,9 +666,11 @@ func (t *nodeTable) buildIndex(r *replayTable, prior *priorIndex) error {
 	t.addLogged(t.root, bytes)
 	if prior != nil {
 		closeOld()
-		os.Rename(prior.nodes, filepath.Join(discard, "store-"+rand.Text()))
-		if prior.pack != "" {
-			os.Rename(prior.pack, filepath.Join(discard, "store-"+rand.Text()))
+		if prior.nodes != "" {
+			os.Rename(prior.nodes, filepath.Join(discard, "store-"+rand.Text()))
+		}
+		if prior.instance != "" {
+			os.Rename(prior.instance, filepath.Join(discard, "store-"+rand.Text()))
 		}
 	}
 	return nil
@@ -698,11 +691,18 @@ func (t *nodeTable) adoptIndex(h *ownersHeader, prior *priorIndex) error {
 		return f
 	}
 	x.table, x.records, x.runtime = open("table"), open("records"), open("runtime")
+	var pack *ownerPack
 	fail := func(err error) error {
 		for _, f := range []*os.File{x.table, x.records, x.runtime} {
 			if f != nil {
 				f.Close()
 			}
+		}
+		if x.view != nil {
+			x.view.Close()
+		}
+		if pack != nil {
+			pack.close()
 		}
 		return err
 	}
@@ -726,21 +726,25 @@ func (t *nodeTable) adoptIndex(h *ownersHeader, prior *priorIndex) error {
 		records.Size() != int64(h.records) || h.built > h.records || x.base < 2 || h.next < x.base || h.next >= derivedBit {
 		return fail(errNodeIndex)
 	}
+	if x.view, err = mapped.Open(x.table.Name()); err != nil {
+		return fail(err)
+	}
+	if prior.pack != "" {
+		if pack, err = openPack(prior.pack); err != nil {
+			return fail(err)
+		}
+	}
 	rec, slot, found, err := x.read(1)
-	if err == nil && (!found || slot.own) {
+	if err == nil && !found {
 		err = errNodeIndex
 	}
 	if err != nil {
 		return fail(err)
 	}
-	t.index, t.next = x, h.next
+	t.index, t.next, t.pack, t.coldRoot = x, h.next, pack, prior.instance
 	t.compacted, t.built, t.recordsEnd = int64(h.compacted), int64(h.built), int64(h.records)
-	t.coldBytes, t.nodesBytes, t.runtimeBytes = int64(h.coldBytes), int64(h.nodesBytes), int64(h.runtimeBytes)
-	t.coldPack = prior.pack
+	t.coldBytes, t.runtimeBytes = int64(h.coldBytes), int64(h.runtimeBytes)
 	t.deadKeys = h.dead
-	for _, name := range h.garbage {
-		t.deadFiles = append(t.deadFiles, filepath.Join(t.coldParent, name))
-	}
 	s := t.root.state()
 	slot.owner.apply(s)
 	s.loaded, s.slot = slot.owner, slot.at
@@ -903,9 +907,6 @@ func (t *nodeTable) materialize(p *node, key uint64, rec *loggedRecord, slot nod
 	s := n.state()
 	slot.owner.apply(s)
 	s.loaded, s.slot = slot.owner, slot.at
-	if slot.own {
-		s.recordSize = slot.length
-	}
 	bytes := loggedSize(rec.name)
 	for _, k := range rec.kids {
 		bytes += t.addStub(n, k.name, stub{k.key, k.id})
@@ -932,7 +933,7 @@ func (t *nodeTable) trimmed(d *node) bool {
 func (t *nodeTable) evictable(d *node) bool {
 	s := d.dir
 	return t.index != nil && !t.coldSaved && d.key != 0 && d != t.root && d.holds == 0 && len(d.kids) == 0 &&
-		s.reading == 0 && s.indexing == nil && s.cached == s.logged
+		s.reading == 0 && !s.writing && s.cached == s.logged
 }
 
 // reclaimable reports whether trimming d can free anything now.
@@ -982,34 +983,25 @@ func (t *nodeTable) evictNode(d *node) bool {
 		if s.stale {
 			rec = t.appendRecordOf(nil, d)
 		}
-		x, version, location := t.index, s.version, locate(d)
-		op := &coldOperation{done: make(chan struct{})}
-		s.indexing = op
+		x, version, location, at := t.index, s.version, locate(d), s.slot
+		// The record goes to the end of records, claimed under the mutex.
+		offset := t.recordsEnd
+		t.recordsEnd += int64(len(rec))
+		s.writing = true
 		s.reading++
 		t.indexWrites++
 		t.mu.Unlock()
-		err := x.publish(d.key, rec, owner)
+		err := x.publish(d.key, at, rec, offset, owner)
 		t.mu.Lock()
 		t.indexWrites--
 		s.reading--
-		close(op.done)
-		s.indexing = nil
+		s.writing = false
 		if err != nil {
 			t.spillFailed(err)
 			return false
 		}
 		s.loaded = owner
-		if rec != nil {
-			t.nodesBytes += int64(len(rec)) - s.recordSize
-			s.recordSize = int64(len(rec))
-			t.recordFiles[d.key] = struct{}{}
-		}
-		if d.key >= x.base {
-			if end := int64(d.key-x.base+1) * slotSize; end > t.runtimeBytes {
-				t.nodesBytes += end - t.runtimeBytes
-				t.runtimeBytes = end
-			}
-		}
+		t.slotWritten(d.key)
 		if t.byID[d.id] != d || s.version != version || !location.holds(d) || !t.evictable(d) || s.coldDirty || s.recent == t.cacheLRU.Front() {
 			return false
 		}
@@ -1028,16 +1020,19 @@ func (t *nodeTable) evictNode(d *node) bool {
 	return true
 }
 
+// slotWritten accounts the runtime slot of key, just written.
+func (t *nodeTable) slotWritten(key uint64) {
+	if x := t.index; key >= x.base {
+		t.runtimeBytes = max(t.runtimeBytes, int64(key-x.base+1)*slotSize)
+	}
+}
+
 // saveIndex makes the index locate every resident logged node as it is, at
 // close, so that the next open can adopt it. The record of each stale node,
-// the root's included, is appended to records rather than written to a file
-// of its own, and each slot whose record or owner location changed is
-// rewritten in place, adjacent slots in one write. A record file of its own
-// that an appended record supersedes stays, unread, where it is: the key's
-// next eviction overwrites it, its retirement removes it, and a rebuild drops
-// it. Removing it here would cost close a directory update per file. The
-// caller holds mu throughout, with no index write running, and flushes the
-// index (syncIndex) before the manifest.
+// the root's included, is appended to records, and each slot whose record or
+// owner location changed is rewritten in place, adjacent slots in one write.
+// The caller holds mu throughout, with no index write running, and flushes
+// the index (syncIndex) before the manifest.
 func (t *nodeTable) saveIndex() error {
 	x := t.index
 	var keys []uint64
@@ -1103,20 +1098,9 @@ func (t *nodeTable) saveIndex() error {
 	for i, key := range keys {
 		s := t.byKey[key].dir
 		s.loaded = ownerOf(s)
-		if sizes[i] < 0 {
-			continue
-		}
-		s.stale = false
-		if s.recordSize > 0 {
-			t.nodesBytes -= s.recordSize // no longer part of the index
-			s.recordSize = 0
-		}
-		t.nodesBytes += sizes[i]
-		if key >= x.base {
-			if slots := int64(key-x.base+1) * slotSize; slots > t.runtimeBytes {
-				t.nodesBytes += slots - t.runtimeBytes
-				t.runtimeBytes = slots
-			}
+		if sizes[i] >= 0 {
+			s.stale = false
+			t.slotWritten(key)
 		}
 	}
 	t.recordsEnd = end
@@ -1124,56 +1108,25 @@ func (t *nodeTable) saveIndex() error {
 }
 
 // syncIndex makes durable everything the manifest makes authoritative, at
-// close: the index files, the pack, the record and owner index files of
-// their own this open wrote, and the directories naming them. Those an
-// earlier open wrote were flushed by its close; those removed since were
-// garbage. The caller holds mu, with no index write running.
+// close: the index files, the pack trimmed to what was appended, and the
+// directories naming them. The caller holds mu, with no index write running.
 func (t *nodeTable) syncIndex() error {
 	x := t.index
 	type flush struct {
-		path string
-		f    *os.File // already open
-		err  error
+		f   func() error
+		err error
 	}
-	files := []*flush{{f: x.table}, {f: x.records}, {f: x.runtime}}
-	if t.coldPack != "" {
-		files = append(files, &flush{path: t.coldPack})
+	files := []*flush{{f: func() error { return durable.Sync(x.table) }}, {f: func() error { return durable.Sync(x.records) }},
+		{f: func() error { return durable.Sync(x.runtime) }}, {f: func() error { return durable.Dir(x.dir) }}, {f: func() error { return durable.Dir(t.coldParent) }}}
+	if t.pack != nil {
+		files = append(files, &flush{f: t.pack.finish}, &flush{f: func() error { return durable.Dir(t.coldRoot) }})
 	}
-	dirs := map[string]bool{x.dir: true, t.coldParent: true}
-	add := func(root string, keys map[uint64]struct{}) {
-		for key := range keys {
-			file := coldIndexPath(root, key)
-			files = append(files, &flush{path: file})
-			dirs[filepath.Dir(file)] = true
-		}
-	}
-	add(x.dir, t.recordFiles)
-	if t.coldRoot != "" {
-		dirs[t.coldRoot] = true
-		add(t.coldRoot, t.ownerFiles)
-	}
-	inParallel(files, func(fl *flush) {
-		f := fl.f
-		if f == nil {
-			if f, fl.err = os.OpenFile(fl.path, os.O_RDWR, 0); fl.err != nil {
-				return
-			}
-			defer f.Close()
-		}
-		fl.err = durable.Sync(f)
-	})
-	var flushes []*flush
-	for dir := range dirs {
-		flushes = append(flushes, &flush{path: dir})
-	}
-	inParallel(flushes, func(fl *flush) { fl.err = durable.Dir(fl.path) })
-	for _, fl := range append(files, flushes...) {
-		if fl.err != nil && !errors.Is(fl.err, os.ErrNotExist) {
+	inParallel(files, func(fl *flush) { fl.err = fl.f() })
+	for _, fl := range files {
+		if fl.err != nil {
 			return fl.err
 		}
 	}
-	clear(t.recordFiles)
-	clear(t.ownerFiles)
 	return nil
 }
 
@@ -1206,8 +1159,8 @@ func (t *nodeTable) retireID(id uint64) {
 		t.addLogged(d, -heldBytes)
 		t.markStale(d)
 	}
-	if !s.isRetired(h) {
-		s.retire(h)
+	if s.retire(h) {
+		t.charge(d, retiredBytes)
 		s.coldDirty = true
 	}
 }
@@ -1220,14 +1173,20 @@ type enumeration struct {
 }
 
 // coldIDs lists the ids issued in the cold logged subtrees keyed roots: the
-// logged nodes and the derived owners their indexes hold. The reads release
-// the mutex; false means a fault or a node paged in meanwhile.
+// logged nodes and the derived owners their indexes hold. The record reads
+// release the mutex; false means a fault or a node paged in meanwhile.
 func (t *nodeTable) coldIDs(roots []uint64) ([]uint64, bool) {
 	e := &enumeration{keys: make(map[uint64]struct{})}
 	t.enumerations = append(t.enumerations, e)
 	defer func() {
 		t.enumerations = slices.DeleteFunc(t.enumerations, func(o *enumeration) bool { return o == e })
 	}()
+	// coldDir is a cold directory with an owner index.
+	type coldDir struct {
+		key   uint64
+		owner nodeOwner
+		held  map[uint32]struct{} // its derived ids logged nodes hold
+	}
 	var out []uint64
 	for frontier := roots; len(frontier) > 0; {
 		for _, key := range frontier {
@@ -1236,9 +1195,10 @@ func (t *nodeTable) coldIDs(roots []uint64) ([]uint64, bool) {
 				return nil, false
 			}
 		}
-		x, root, pack := t.index, t.coldRoot, t.coldPack
+		x := t.index
 		t.mu.Unlock()
 		var next, ids []uint64
+		var dirs []coldDir
 		var err error
 		for _, key := range frontier {
 			rec, slot, found, readErr := x.read(key)
@@ -1258,30 +1218,29 @@ func (t *nodeTable) coldIDs(roots []uint64) ([]uint64, bool) {
 			for _, a := range rec.away {
 				held[a.hash] = struct{}{}
 			}
-			if o := slot.owner; o.size > 0 {
-				ix := coldIndex{coldIndexPath(root, key), 0, o.size}
-				if o.packed {
-					ix = coldIndex{pack, o.base, o.size}
-				}
-				names, _, readErr := readColdNames(ix)
-				if readErr != nil {
-					if o.prior {
-						continue // an adopted index that cannot be read holds no owners
-					}
-					err = readErr
-					break
-				}
-				for h := range names {
-					if _, ok := held[h]; !ok {
-						ids = append(ids, derivedID(key, h))
-					}
-				}
+			if slot.owner.size > 0 {
+				dirs = append(dirs, coldDir{key, slot.owner, held})
 			}
 		}
 		t.mu.Lock()
 		if err != nil {
 			t.cacheFailure(err)
 			return nil, false
+		}
+		for _, d := range dirs {
+			rows, _, err := chainRows(t.pack, d.owner)
+			if err != nil {
+				if d.owner.prior {
+					continue // an adopted index that cannot be read holds no owners
+				}
+				t.cacheFailure(err)
+				return nil, false
+			}
+			for _, r := range rows {
+				if _, ok := d.held[r.hash]; r.name != nil && !ok {
+					ids = append(ids, derivedID(d.key, r.hash))
+				}
+			}
 		}
 		out = append(out, ids...)
 		frontier = next
@@ -1292,29 +1251,18 @@ func (t *nodeTable) coldIDs(roots []uint64) ([]uint64, bool) {
 // deadBatch bounds the retired cold keys one trim reclaims.
 const deadBatch = 64
 
-// cleanDead removes the index files of a batch of retired cold keys and
-// queues their children. Errors leave garbage for the next open.
+// cleanDead discounts the owner indexes of a batch of retired cold keys from
+// the live index bytes, which decide when an open rebuilds the pack, and
+// queues their children. Errors leave them counted.
 func (t *nodeTable) cleanDead() {
 	for range deadBatch {
-		if t.coldSaved || len(t.deadKeys) == 0 && len(t.deadFiles) == 0 {
+		if t.coldSaved || len(t.deadKeys) == 0 {
 			return
 		}
-		x, root := t.index, t.coldRoot
+		x := t.index
 		// The batch's I/O is in flight: close must not write a manifest that
 		// omits what it popped.
 		t.indexWrites++
-		if len(t.deadKeys) == 0 {
-			file := t.deadFiles[len(t.deadFiles)-1]
-			t.deadFiles = t.deadFiles[:len(t.deadFiles)-1]
-			t.mu.Unlock()
-			if t.indexIO != nil {
-				t.indexIO()
-			}
-			os.Remove(file)
-			t.mu.Lock()
-			t.indexWrites--
-			continue
-		}
 		key := t.deadKeys[len(t.deadKeys)-1]
 		t.deadKeys = t.deadKeys[:len(t.deadKeys)-1]
 		t.mu.Unlock()
@@ -1322,23 +1270,14 @@ func (t *nodeTable) cleanDead() {
 			t.indexIO()
 		}
 		rec, slot, found, err := x.read(key)
-		removed := func(file string) bool {
-			err := os.Remove(file)
-			return err == nil || errors.Is(err, os.ErrNotExist)
-		}
-		// A record file the slot no longer locates may remain too.
-		recordGone := found && err == nil && removed(coldIndexPath(x.dir, key)) && slot.own
-		ownerGone := found && err == nil && slot.owner.size > 0 && (slot.owner.packed || removed(coldIndexPath(root, key)))
 		t.mu.Lock()
 		t.indexWrites--
 		if !found || err != nil {
 			continue
 		}
-		if recordGone {
-			t.nodesBytes -= slot.length
-		}
-		if ownerGone {
-			t.coldBytes -= slot.owner.size
+		if slot.owner.size > 0 {
+			chain, _ := walkChain(t.pack, slot.owner, func([]byte) bool { return true })
+			t.coldBytes -= chain.bytes
 		}
 		for _, k := range rec.kids {
 			t.deadKeys = append(t.deadKeys, k.key)
