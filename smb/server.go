@@ -16,6 +16,9 @@ type Server struct {
 	FS    Backend
 	Share string
 	Users map[string]string
+	// WriteCache opts into WRITE leases on backend-approved isolated files.
+	// Direct backend users must hold Quiesce across every read or mutation.
+	WriteCache bool
 	// MountRoots are the paths that name the share's root to its clients,
 	// slash-separated (O:/, //127.0.0.1/ovnfs/); see [ntinfo.MountRelative].
 	MountRoots []string

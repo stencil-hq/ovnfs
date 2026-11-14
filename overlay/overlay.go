@@ -131,6 +131,27 @@ func (f *FS) Rebase(bottom Bottom) {
 // Upper returns the host directory receiving writes, or empty for read-only views.
 func (f *FS) Upper() string { return f.upper }
 
+// UpperFile reports a regular file owned by this writable upper, including
+// memory files. Lease policies use it to exclude immutable and live lower data;
+// disk metadata is refreshed so hard-link aliases cannot gain separate caches.
+func (f *FS) UpperFile(name string) (os.FileInfo, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	p := Clean(name)
+	if f.index == nil || reserved(p) {
+		return nil, false
+	}
+	entry, ok := f.index.entries[p]
+	if !ok || entry.Kind != KindFile {
+		return nil, false
+	}
+	if m := f.files[p]; m != nil {
+		return m.info(path.Base(p)), true
+	}
+	info, err := lstatIndexed(f.up(p), entry.Info)
+	return info, err == nil && info.Mode().IsRegular()
+}
+
 // Stack returns an independent slice of immutable layers, top first.
 func (f *FS) Stack() []*Layer { return slices.Clone(f.layers) }
 
@@ -1435,11 +1456,13 @@ func (f *FS) upperInfo(p string, e Entry) (os.FileInfo, error) {
 // when it closes (see [FS.upperInfo]).
 type file struct {
 	*os.File
-	name     string
-	inode    inodeKey
-	tracked  bool
-	writable bool
-	fs       *FS
+	name        string
+	inode       inodeKey
+	tracked     bool
+	writable    bool
+	fs          *FS
+	ownerClosed bool
+	closeErr    error
 }
 
 // open wraps a host file without losing its overlay-relative name; an owner
@@ -1465,13 +1488,15 @@ func (f *FS) adopt(h *file) *file {
 
 // CloseFiles closes every open descriptor of an upper file, because Windows
 // refuses to rename a directory while any file below it is open. The caller
-// must exclude file calls and never use those handles again: the export
-// reopens files in the checkout's next generation.
+// must exclude I/O on those handles: the export reopens them in the checkout's
+// next generation. Their eventual Close consumes the original close result,
+// so retiring a cached protocol writer does not report a second-close error.
 func (f *FS) CloseFiles() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for h := range f.hosts {
-		h.File.Close()
+		h.closeErr = h.File.Close()
+		h.ownerClosed = true
 		if h.writable {
 			h.syncInfo()
 		}
@@ -1490,7 +1515,11 @@ func (f *file) Close() error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 	if _, open := f.fs.hosts[f]; !open {
-		return f.File.Close() // closed by CloseFiles
+		if f.ownerClosed {
+			f.ownerClosed = false
+			return f.closeErr
+		}
+		return f.File.Close()
 	}
 	delete(f.fs.hosts, f)
 	err := f.File.Close()

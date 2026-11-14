@@ -21,6 +21,11 @@ import (
 
 // RemoteChanges snapshots an attached checkout and returns its changed source leaves with verified content.
 func (r *Registry) RemoteChanges(ctx context.Context, name string, from store.OID) (peer.Pulled, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return peer.Pulled{}, err
+	}
+	defer resume()
 	h, err := r.lookupCheckout(name)
 	if err != nil {
 		return peer.Pulled{}, err
@@ -68,6 +73,11 @@ func (r *Registry) RemoteChanges(ctx context.Context, name string, from store.OI
 // whose markers the user resolved merges later changes against the version it
 // was marked with (see checkoutMeta.MergeBases).
 func (r *Registry) MergePull(ctx context.Context, args api.PullArgs, from store.OID, pulled peer.Pulled) (api.PullReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.PullReply{}, err
+	}
+	defer resume()
 	if err := checkContext(ctx); err != nil {
 		return api.PullReply{}, err
 	}

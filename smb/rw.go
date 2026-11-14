@@ -2,6 +2,7 @@ package smb
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 
@@ -17,6 +18,9 @@ func init() {
 
 // handleRead implements bounded file and named-pipe reads without changing the file cursor.
 func handleRead(r *request) ([]byte, uint32) {
+	if r.c.srv.st.opens.cacheError() != nil {
+		return nil, statusUnsuccessful
+	}
 	b := r.body
 	if len(b) < 48 || binary.LittleEndian.Uint16(b) != 49 {
 		return nil, statusInvalidParameter
@@ -78,7 +82,7 @@ func handleRead(r *request) ([]byte, uint32) {
 }
 
 // handleWrite writes at the explicit offset, copying lower files up at CREATE time.
-func handleWrite(r *request) ([]byte, uint32) {
+func handleWrite(r *request) (response []byte, status uint32) {
 	b := r.body
 	if len(b) < 48 || binary.LittleEndian.Uint16(b) != 49 {
 		return nil, statusInvalidParameter
@@ -98,6 +102,17 @@ func handleWrite(r *request) ([]byte, uint32) {
 	}
 	if o.isDir {
 		return nil, statusFileIsADirectory
+	}
+	if o.pipe == nil {
+		g := &r.c.srv.st.opens
+		grant := g.beginCacheIO(o)
+		defer func() {
+			var err error
+			if status != statusSuccess {
+				err = fmt.Errorf("backend WRITE failed with status %#x", status)
+			}
+			g.endCacheIO(grant, err)
+		}()
 	}
 	data := r.raw[do:int(uint64(do)+uint64(n))]
 	count := len(data)
@@ -162,7 +177,7 @@ func handleWrite(r *request) ([]byte, uint32) {
 }
 
 // handleFlush commits writes where the backing file supports durable synchronization.
-func handleFlush(r *request) ([]byte, uint32) {
+func handleFlush(r *request) (response []byte, status uint32) {
 	b := r.body
 	if len(b) < 24 || binary.LittleEndian.Uint16(b) != 24 {
 		return nil, statusInvalidParameter
@@ -171,7 +186,20 @@ func handleFlush(r *request) ([]byte, uint32) {
 	if st != statusSuccess {
 		return nil, st
 	}
+	g := &r.c.srv.st.opens
+	grant := g.beginCacheIO(o)
+	defer func() {
+		var err error
+		if status != statusSuccess {
+			err = fmt.Errorf("backend FLUSH failed with status %#x", status)
+		}
+		g.endCacheIO(grant, err)
+	}()
 	o.mu.Lock()
+	if o.file == nil && o.pipe == nil {
+		o.mu.Unlock()
+		return nil, statusFileClosed
+	}
 	if syncer, ok := o.file.(interface{ Sync() error }); ok {
 		err := syncer.Sync()
 		o.mu.Unlock()

@@ -97,6 +97,11 @@ func offerOrigins(ctx context.Context, d *source.Domains) []git.Origin {
 // Offer snapshots a checkout and describes it for attaching on another machine;
 // the returned Blobs serves the snapshot's content to that machine.
 func (r *Registry) Offer(ctx context.Context, name, remoteName string) (peer.Offer, peer.Blobs, api.Snapshot, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return peer.Offer{}, nil, api.Snapshot{}, err
+	}
+	defer resume()
 	if r.node == "" {
 		return peer.Offer{}, nil, api.Snapshot{}, failure("unavailable", "this daemon has no node identity to offer checkouts under")
 	}
@@ -180,6 +185,11 @@ func (b baseBlobs) Open(id store.OID, p string) (io.ReadCloser, int64, error) {
 // same snapshot returns the existing checkout; a new snapshot of the same source
 // updates a cache/local-only checkout in place, and otherwise opens next to it.
 func (r *Registry) AttachRemote(ctx context.Context, o peer.Offer) (api.Checkout, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.Checkout{}, err
+	}
+	defer resume()
 	files := make(map[string]store.File, len(o.Files))
 	info := make(map[string]source.Info, len(o.Files))
 	for _, e := range o.Files {

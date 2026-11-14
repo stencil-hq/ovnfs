@@ -30,6 +30,16 @@ func handleSetInfo(r *request) ([]byte, uint32) {
 	if q[2] == 1 && (q[3] == 10 || q[3] == 13 || q[3] == 64) {
 		return namespaceSetInfo(r, o, q[3], data)
 	}
+	changesMetadata := q[2] == 3 || q[2] == 1 && (q[3] == 4 || q[3] == 19 || q[3] == 20 || q[3] == 39)
+	if r.c.srv.WriteCache && changesMetadata && !r.cacheProtected {
+		return r.withWriteBarrier(o, false, true, func() ([]byte, uint32) { return handleSetInfo(r) })
+	}
+	var cacheErr error
+	if r.c.srv.WriteCache && changesMetadata {
+		g := &r.c.srv.st.opens
+		grant := g.beginCacheIO(o)
+		defer func() { g.endCacheIO(grant, cacheErr) }()
+	}
 	o.mu.Lock()
 	type change struct {
 		p              string
@@ -153,14 +163,17 @@ func handleSetInfo(r *request) ([]byte, uint32) {
 		// Reopen through the overlay so a lower-only handle cannot mutate the lower tree.
 		f, e := fs.OpenFile(o.path, os.O_WRONLY, 0)
 		if e != nil {
+			cacheErr = e
 			return nil, ntinfo.Status(e)
 		}
 		e = f.Truncate(int64(size))
 		ce := f.Close()
 		if e != nil {
+			cacheErr = e
 			return nil, ntinfo.Status(e)
 		}
 		if ce != nil {
+			cacheErr = ce
 			return nil, ntinfo.Status(ce)
 		}
 		filter = 0x18
@@ -176,6 +189,18 @@ func handleSetInfo(r *request) ([]byte, uint32) {
 // namespaceSetInfo releases both the open and CREATE transaction locks during
 // cache breaks: clients may need to reopen, flush, or close the affected handles.
 func namespaceSetInfo(r *request, o *open, class byte, data []byte) ([]byte, uint32) {
+	// Retain the grant gate across asynchronous retries as well as the final
+	// namespace transaction; same-key reopens must not reintroduce dirty data.
+	g := &r.c.srv.st.opens
+	var release func()
+	if r.c.srv.WriteCache {
+		release = g.holdWriteGrants()
+		defer func() {
+			if release != nil {
+				release()
+			}
+		}()
+	}
 	var target string
 	var deleting bool
 	if class == 10 {
@@ -216,7 +241,6 @@ func namespaceSetInfo(r *request, o *open, class byte, data []byte) ([]byte, uin
 	if len(breaks) == 0 {
 		return body, st
 	}
-	g := &r.c.srv.st.opens
 	if r.compound != nil {
 		for len(breaks) != 0 {
 			if !g.waitBreaks(breaks, nil) {
@@ -227,7 +251,12 @@ func namespaceSetInfo(r *request, o *open, class byte, data []byte) ([]byte, uin
 		return body, st
 	}
 	async := r.async()
+	finish := release
+	release = nil
 	go func() {
+		if finish != nil {
+			defer finish()
+		}
 		for len(breaks) != 0 {
 			if !g.waitBreaks(breaks, async.cancelled) {
 				r.complete(async, nil, statusCancelled)
@@ -244,6 +273,9 @@ func namespaceSetInfo(r *request, o *open, class byte, data []byte) ([]byte, uin
 // after every break and commits while competing namespace operations are excluded.
 func namespaceAttempt(r *request, o *open, class byte, data []byte, target string, deleting bool, cancelled <-chan struct{}) ([]byte, uint32, []*oplockGrant) {
 	g := &r.c.srv.st.opens
+	if g.cacheError() != nil {
+		return nil, statusUnsuccessful, nil
+	}
 	// A file's rename or delete reaches only its own name and the target's; a
 	// directory's reaches every name below it.
 	var unlock func()
@@ -275,6 +307,11 @@ func namespaceAttempt(r *request, o *open, class byte, data []byte, target strin
 	}
 	g.mu.Lock()
 	live := g.entries[o]
+	var key [16]byte
+	lease := false
+	if grant := g.grants[o]; grant != nil && grant.lease {
+		key, lease = grant.key, true
+	}
 	g.mu.Unlock()
 	if !live {
 		return nil, statusFileClosed, nil
@@ -307,7 +344,7 @@ func namespaceAttempt(r *request, o *open, class byte, data []byte, target strin
 		if e != nil && !os.IsNotExist(e) {
 			return nil, ntinfo.Status(e), nil
 		}
-		breaks := g.breakDescendants(p)
+		breaks := g.breakNamespaceSource(r.c, p, key, lease, info.IsDir())
 		if e == nil {
 			breaks = append(breaks, g.breakDescendants(target)...)
 		}
@@ -316,6 +353,9 @@ func namespaceAttempt(r *request, o *open, class byte, data []byte, target strin
 		}
 		if e == nil && len(g.at(target)) != 0 {
 			return nil, statusAccessDenied, nil
+		}
+		if g.cacheError() != nil {
+			return nil, statusUnsuccessful, nil
 		}
 		if err := fs.Rename(p, target); err != nil {
 			return nil, ntinfo.Status(err), nil
@@ -333,7 +373,7 @@ func namespaceAttempt(r *request, o *open, class byte, data []byte, target strin
 		if p == "" || r.c.fileAttributes(info)&1 != 0 {
 			return nil, statusCannotDelete, nil
 		}
-		if breaks := g.breakDescendants(p); len(breaks) != 0 {
+		if breaks := g.breakNamespaceSource(r.c, p, key, lease, info.IsDir()); len(breaks) != 0 {
 			return nil, statusPending, breaks
 		}
 		if info.IsDir() {
@@ -345,6 +385,9 @@ func namespaceAttempt(r *request, o *open, class byte, data []byte, target strin
 				return nil, statusDirectoryNotEmpty, nil
 			}
 		}
+	}
+	if g.cacheError() != nil {
+		return nil, statusUnsuccessful, nil
 	}
 	o.mu.Lock()
 	o.deleteOnClose = deleting

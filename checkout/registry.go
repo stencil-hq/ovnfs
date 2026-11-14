@@ -431,6 +431,9 @@ func snapshotLess(a, b string) bool {
 }
 
 // Close stops new mutations, drains hashing and releases persistent base resources.
+// The owner must Quiesce before cutting the file transport and keep its release
+// until Close returns. Close cannot recall clients after that transport is gone;
+// it only drains daemon-side writes and reports their persistence errors.
 func (r *Registry) Close() error {
 	r.closeOnce.Do(func() {
 		// First, while no registry lock is held: Close waits for an event batch
@@ -464,26 +467,18 @@ func (r *Registry) Close() error {
 		r.mu.Lock()
 		// A planned stop keeps memory files: they reach the uppers before exit.
 		for _, h := range checkouts {
-			if err := h.fs.Flush(); r.closeErr == nil {
-				r.closeErr = err
-			}
+			r.closeErr = errors.Join(r.closeErr, h.fs.Flush())
 		}
-		if err := r.persistLocked(); r.closeErr == nil {
-			r.closeErr = err
-		}
+		r.closeErr = errors.Join(r.closeErr, r.persistLocked())
 		for _, b := range r.bases {
-			if err := b.view.Close(); r.closeErr == nil {
-				r.closeErr = err
-			}
+			r.closeErr = errors.Join(r.closeErr, b.view.Close())
 		}
 		for _, h := range checkouts {
 			h.retired.Store(true)
 			h.freeze.Unlock()
 		}
 		r.mu.Unlock()
-		if err := r.stateLock.Close(); r.closeErr == nil {
-			r.closeErr = err
-		}
+		r.closeErr = errors.Join(r.closeErr, r.stateLock.Close())
 	})
 	return coded(r.closeErr)
 }
@@ -551,6 +546,11 @@ func (r *Registry) moveRootLocked() {
 // Ls lists the live checkouts args picks with their retained snapshots, or every
 // retained snapshot without a selection, in name and id order.
 func (r *Registry) Ls(ctx context.Context, args api.LsArgs) (api.LsReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.LsReply{}, err
+	}
+	defer resume()
 	checkouts, err := r.pick(ctx, args.Select)
 	if err != nil {
 		return api.LsReply{}, err

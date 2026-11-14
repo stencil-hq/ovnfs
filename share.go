@@ -62,7 +62,7 @@ func (s *shares) Share(_ context.Context, args api.ShareArgs) (api.ShareReply, e
 	}
 	s.on[args.Checkout] = share{l: l, writable: args.Writable}
 	go func() {
-		err := remotefs.Serve(l, remotefs.Share{FS: s.e.Nodes(), Checkout: args.Checkout, Writable: args.Writable}, remotefs.Options{Logf: log.Printf})
+		err := remotefs.Serve(l, remotefs.Share{FS: s.e.Nodes(), Checkout: args.Checkout, Writable: args.Writable}, remotefs.Options{Logf: log.Printf, Quiesce: s.reg.Quiesce})
 		if err != nil {
 			log.Printf("share %s: %v", args.Checkout, err)
 		}

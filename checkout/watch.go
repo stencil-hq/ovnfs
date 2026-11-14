@@ -1,9 +1,13 @@
 package checkout
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 
+	"github.com/stencil-hq/ovnfs/internal/unixstat"
+	"github.com/stencil-hq/ovnfs/overlay"
+	"github.com/stencil-hq/ovnfs/source"
 	"github.com/stencil-hq/ovnfs/watch"
 )
 
@@ -22,6 +26,41 @@ func (r *Registry) Tracked(name, p string) bool {
 		return true
 	}
 	return r.watcher != nil && r.watcher.Covers(h.base.view.Meta().Dir)
+}
+
+// WriteCacheable reports whether p is isolated data owned by the checkout.
+// Only singly linked regular files in its writable upper qualify, whether held
+// in memory or on disk. Classification does not affect ownership: an upper
+// shadows even a live cache/local lower or a hidden path. Lower files, frozen
+// layers and git/jj metadata never qualify. The client gate protects uppers
+// through direct operations, including flush, snapshot and reattachment.
+// This is a read-only lease-policy check, not an operation barrier. In particular
+// it must not Quiesce or take the freeze lock: the file server may already hold a
+// Session while deciding a lease, and pending drains must still make progress.
+func (r *Registry) WriteCacheable(name, p string) bool {
+	if p == "" || p != overlay.Clean(p) || strings.ContainsRune(p, '\\') || source.IsGitPath(p) || source.IsJJPath(p) {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	h := r.checkouts[name]
+	if r.closed || h == nil || h.retired.Load() {
+		return false
+	}
+	for at := path.Dir(p); at != "."; at = path.Dir(at) {
+		info, err := h.fs.Lstat(at)
+		if err != nil || !info.IsDir() {
+			return false
+		}
+	}
+	info, ok := h.fs.UpperFile(p)
+	if !ok {
+		return false
+	}
+	if stat, ok := unixstat.Of(info); !ok || stat.Nlink != 1 {
+		return false
+	}
+	return true
 }
 
 // invalidate reports daemon-side changes to checkout paths, and anywhere in

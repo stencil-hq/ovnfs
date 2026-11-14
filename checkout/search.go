@@ -123,6 +123,11 @@ func (g remoteSearch) Scan(ctx context.Context, q grep.Query, blobs []grep.Blob)
 
 // Grep searches a folder or a checkout's merged contents without its file protocol.
 func (r *Registry) Grep(ctx context.Context, args api.GrepArgs) (api.GrepReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.GrepReply{}, err
+	}
+	defer resume()
 	if err := checkContext(ctx); err != nil {
 		return api.GrepReply{}, err
 	}
@@ -183,6 +188,11 @@ func (r *Registry) Grep(ctx context.Context, args api.GrepArgs) (api.GrepReply, 
 
 // Glob lists matching paths in a folder or directly in a checkout's merged tree.
 func (r *Registry) Glob(ctx context.Context, args api.GlobArgs) (api.GlobReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.GlobReply{}, err
+	}
+	defer resume()
 	if err := checkContext(ctx); err != nil {
 		return api.GlobReply{}, err
 	}

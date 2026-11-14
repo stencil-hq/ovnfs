@@ -16,6 +16,11 @@ import (
 // Prune removes the checkouts args picks, each as Rm does, except one touched
 // since it was picked.
 func (r *Registry) Prune(ctx context.Context, args api.PruneArgs) (api.PruneReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.PruneReply{}, err
+	}
+	defer resume()
 	if args.Select == (api.Select{}) {
 		return api.PruneReply{}, failure("invalid", "prune needs a criterion (dir, idle_s or no_diff); it never removes every checkout")
 	}

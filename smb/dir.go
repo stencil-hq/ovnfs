@@ -81,6 +81,13 @@ func handleQueryDirectory(r *request) ([]byte, uint32) {
 	if o.access&1 == 0 {
 		return nil, statusAccessDenied
 	}
+	// Other clients' cached child metadata must drain before enumeration.
+	// The requesting client reconciles its own dirty EOF/metadata locally;
+	// recalling those leases here would defeat write caching on every readdir.
+	// FILE_NAMES_INFORMATION consumes names only, not cached file contents.
+	if r.c.srv.WriteCache && class != 12 && !r.cacheProtected {
+		return r.withWriteBarrier(o, true, true, func() ([]byte, uint32) { return handleQueryDirectory(r) })
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	first := o.dir == nil || flags&0x10 != 0
@@ -91,7 +98,7 @@ func handleQueryDirectory(r *request) ([]byte, uint32) {
 		if pattern == "" {
 			pattern = "*"
 		}
-		entries, st := snapshotDirectory(r.c.srv.FS, o.path, pattern)
+		entries, st := snapshotDirectory(r.c.srv.FS, o.path, pattern, r.c.posix || r.c.appleCaseSensitive.Load())
 		if st != statusSuccess {
 			return nil, st
 		}
@@ -175,8 +182,9 @@ func handleQueryDirectory(r *request) ([]byte, uint32) {
 	return directoryResponse(data), statusSuccess
 }
 
-// snapshotDirectory uses direct lookup for exact names and lists only for wildcard or case-fold fallback.
-func snapshotDirectory(fs Backend, dir, pattern string) ([]dirEntry, uint32) {
+// snapshotDirectory uses direct lookup for exact names. Clients that negotiated
+// case-sensitive naming must not turn an absent name into a full directory scan.
+func snapshotDirectory(fs Backend, dir, pattern string, caseSensitive bool) ([]dirEntry, uint32) {
 	if !strings.ContainsAny(pattern, "*?<>\"") {
 		p := dir
 		switch pattern {
@@ -197,6 +205,9 @@ func snapshotDirectory(fs Backend, dir, pattern string) ([]dirEntry, uint32) {
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, ntinfo.Status(err)
+		}
+		if caseSensitive {
+			return nil, statusSuccess
 		}
 	}
 	infos, err := fs.ReadDir(dir)

@@ -41,6 +41,11 @@ func (r *Registry) folder(dir string, extra []string) (string, manifest.Manifest
 // Explain reports which class a path gets and which rule decided it, for a folder
 // (with its manifest as it is now) or a checkout (with the rules it was created with).
 func (r *Registry) Explain(ctx context.Context, args api.ExplainArgs) (api.ExplainReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.ExplainReply{}, err
+	}
+	defer resume()
 	if (args.Dir == "") == (args.Checkout == "") {
 		return api.ExplainReply{}, failure("invalid", "explain needs exactly one of a folder or a checkout")
 	}
@@ -97,6 +102,11 @@ func cleanRel(p string) string { return strings.Trim(path.Clean("/"+p), "/") }
 
 // Plan computes what launching a folder or a checkout elsewhere would transfer, rebuild and leave behind.
 func (r *Registry) Plan(ctx context.Context, args api.PlanArgs) (api.PlanReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.PlanReply{}, err
+	}
+	defer resume()
 	if (args.Dir == "") == (args.Checkout == "") {
 		return api.PlanReply{}, failure("invalid", "plan needs exactly one of a folder or a checkout")
 	}

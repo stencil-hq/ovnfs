@@ -108,6 +108,20 @@ func handleIoctl(r *request) ([]byte, uint32) {
 			return nil, s
 		}
 		id = o.id
+		if r.c.srv.WriteCache && !r.cacheProtected && o.pipe == nil {
+			switch code {
+			case ioctlCopyChunk, ioctlCopyChunkWrite:
+				// COPYCHUNK reads source bytes on the server, not in the
+				// requesting client's cache, so even its own lease must drain.
+				return r.withWriteBarrier(nil, true, false, func() ([]byte, uint32) { return handleIoctl(r) })
+			case ioctlSetReparse:
+				return r.withWriteBarrier(o, false, false, func() ([]byte, uint32) { return handleIoctl(r) })
+			case ioctlZeroData, ioctlAllocatedRanges:
+				return r.withWriteBarrier(o, false, true, func() ([]byte, uint32) { return handleIoctl(r) })
+			}
+			// Object/resume IDs, reparse queries, and unsupported capability
+			// probes neither consume cached data nor mutate its backing file.
+		}
 		switch code {
 		case ioctlGetReparse:
 			if maxOut < 8 {
@@ -523,6 +537,12 @@ func ioctlZero(r *request, o *open, in []byte) uint32 {
 	if o.access&2 == 0 {
 		return statusAccessDenied
 	}
+	var cacheErr error
+	if r.c.srv.WriteCache {
+		g := &r.c.srv.st.opens
+		grant := g.beginCacheIO(o)
+		defer func() { g.endCacheIO(grant, cacheErr) }()
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.file == nil {
@@ -544,9 +564,11 @@ func ioctlZero(r *request, o *open, in []byte) uint32 {
 		nw, err := ioctlWriteAt(o.file, zero[:n], int64(start))
 		start += uint64(nw)
 		if err != nil {
+			cacheErr = err
 			return ntinfo.Status(err)
 		}
 		if nw != int(n) {
+			cacheErr = io.ErrShortWrite
 			return statusDiskFull
 		}
 	}

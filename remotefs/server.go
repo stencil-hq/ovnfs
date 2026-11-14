@@ -6,6 +6,7 @@ package remotefs
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -51,6 +52,9 @@ type Options struct {
 	UIDs []IDRange
 	// GIDs maps guest gids to host gids like UIDs.
 	GIDs []IDRange
+	// Quiesce flushes and excludes external write caches for each request.
+	// Its release runs after backend access; errors reject the request.
+	Quiesce func(context.Context) (func(), error)
 	// Logf receives rejected peers and broken connections; nil discards them.
 	Logf func(format string, args ...any)
 }
@@ -219,6 +223,15 @@ func (c *conn) handle(body, data []byte) reply {
 	}
 	if f := req.missing(); f != "" {
 		return c.fail(errorf(CodeBadRequest, fmt.Sprintf("%s request lacks %s", req.Op, f)))
+	}
+	if c.opts.Quiesce != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		release, err := c.opts.Quiesce(ctx)
+		if err != nil {
+			return c.fail(wireError(err))
+		}
+		defer release()
 	}
 	out, err := c.run(&req, data)
 	if err != nil {

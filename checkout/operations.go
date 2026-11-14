@@ -47,6 +47,11 @@ type gitModule struct {
 // New opens a checkout from any folder (captured and classified now), from a
 // snapshot, or on an existing capture as it was taken.
 func (r *Registry) New(ctx context.Context, args api.NewArgs) (api.NewReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.NewReply{}, err
+	}
+	defer resume()
 	sources := 0
 	for _, set := range []bool{args.Dir != "", args.Snapshot != "", args.Base != ""} {
 		if set {
@@ -924,6 +929,11 @@ func (r *Registry) created(h api.Checkout) {
 
 // Snap freezes a checkout's changes into a snapshot and optionally waits for its tree id.
 func (r *Registry) Snap(ctx context.Context, args api.SnapArgs) (api.SnapReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.SnapReply{}, err
+	}
+	defer resume()
 	if err := checkContext(ctx); err != nil {
 		return api.SnapReply{}, err
 	}
@@ -977,6 +987,11 @@ func (r *Registry) waitHashed(ctx context.Context, s *snapRecord) (api.SnapReply
 // copy and jj workspace made before it, and the freeze and the child are published by
 // one durable state write.
 func (r *Registry) Fork(ctx context.Context, args api.ForkArgs) (api.ForkReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.ForkReply{}, err
+	}
+	defer resume()
 	if err := checkContext(ctx); err != nil {
 		return api.ForkReply{}, err
 	}
@@ -1335,6 +1350,11 @@ func (r *Registry) Rm(ctx context.Context, args api.RmArgs) error {
 // remove is Rm, except that with picked set it keeps a checkout whose Touched is
 // no longer picked, one changed since prune picked it, and reports false.
 func (r *Registry) remove(ctx context.Context, name string, picked time.Time, stickySnapshots bool) (bool, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer resume()
 	if err := checkContext(ctx); err != nil {
 		return false, err
 	}
@@ -1377,7 +1397,7 @@ func (r *Registry) remove(ctx context.Context, name string, picked time.Time, st
 	// Retired and gone from the registry, so no file call reaches h: release the
 	// freeze before the file server's retire, which waits on clients.
 	h.freeze.Unlock()
-	err := r.commitState(seq)
+	err = r.commitState(seq)
 	if err != nil {
 		// The state on disk still names the checkout: record its removal for the
 		// next commit, or for recovery at reopen should none succeed.
@@ -1446,6 +1466,11 @@ func (r *Registry) dropCheckoutSnapshots(name string) error {
 
 // Drop releases a snapshot and its retained stack.
 func (r *Registry) Drop(ctx context.Context, args api.DropArgs) error {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return err
+	}
+	defer resume()
 	if err := checkContext(ctx); err != nil {
 		return err
 	}

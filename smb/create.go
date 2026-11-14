@@ -7,6 +7,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/stencil-hq/ovnfs/ntinfo"
@@ -37,13 +38,16 @@ type openRegistry struct {
 	// parallel builds queue behind each other. Transactions that reach a
 	// directory's subtree (its rename or deletion, delete-on-close and
 	// link-following creates) hold ns exclusively.
-	ns      sync.RWMutex
-	names   [64]sync.Mutex
-	mu      sync.Mutex
-	entries map[*open]bool
-	byPath  map[string]map[*open]struct{} // entries by path; open paths change only under mu
-	pending map[string]bool
-	grants  map[*open]*oplockGrant
+	ns         sync.RWMutex
+	names      [64]sync.Mutex
+	mu         sync.Mutex
+	entries    map[*open]bool
+	byPath     map[string]map[*open]struct{} // entries by path; open paths change only under mu
+	pending    map[string]bool
+	grants     map[*open]*oplockGrant
+	writeGates atomic.Int64
+	writeEpoch atomic.Uint64 // invalidates eligibility sampled before a protected mutation
+	writeFault error         // sticky: a lost dirty owner cannot be recovered by a later ACK
 }
 
 // nameSeed spreads names over openRegistry.names.
@@ -504,6 +508,9 @@ func createAttempt(r *request, a createArgs, cancelled <-chan struct{}) ([]byte,
 		return nil, statusCancelled, nil
 	default:
 	}
+	if g.cacheError() != nil {
+		return nil, statusUnsuccessful, nil
+	}
 	epoch := r.c.srv.st.epoch.Load()
 	name, info, lastLink, st := resolveCreatePath(r.c.srv.FS, a.name, a.options&createOpenReparse != 0)
 	if st == statusSuccess && name != a.name && !exclusive {
@@ -545,11 +552,13 @@ func createAttempt(r *request, a createArgs, cancelled <-chan struct{}) ([]byte,
 		}
 	}
 	var breaks []*oplockGrant
-	if !compatible || a.options&createDeleteOnClose != 0 {
+	if !compatible {
 		// HANDLE caching can retain a locally closed handle with restrictive sharing.
 		// Revoke it before deciding whether a live sharing violation remains.
 		breaks = g.breakDescendants(a.name)
-	} else if a.access&(accessReadData|accessWriteData|accessAppendData|accessExecute|accessDelete) != 0 || a.disposition != 1 {
+	} else if a.options&createDeleteOnClose != 0 || r.c.srv.WriteCache && (a.disposition == 0 || a.disposition == 4 || a.disposition == 5) {
+		breaks = g.breakNamespaceSource(r.c, a.name, a.leaseKey, a.oplock == 255 && a.leaseVersion != 0, info != nil && info.IsDir())
+	} else if r.c.srv.WriteCache || a.access&(accessReadData|accessWriteData|accessAppendData|accessExecute|accessDelete) != 0 || a.disposition != 1 {
 		breaks = g.breakConflicting(r.c, a.name, a.leaseKey, a.oplock == 255)
 	}
 	if len(breaks) != 0 {
@@ -557,6 +566,9 @@ func createAttempt(r *request, a createArgs, cancelled <-chan struct{}) ([]byte,
 	}
 	if !compatible {
 		return nil, statusSharingViolation, nil
+	}
+	if g.cacheError() != nil {
+		return nil, statusUnsuccessful, nil
 	}
 	body, st := finishCreate(r, a, info, epoch)
 	return body, st, nil
@@ -966,6 +978,7 @@ func appleCreateResponse(c *conn, in []byte) []byte {
 	}
 	if bitmap&2 != 0 {
 		out = binary.LittleEndian.AppendUint64(out, 2)
+		c.appleCaseSensitive.Store(true)
 	}
 	if bitmap&4 != 0 {
 		out = binary.LittleEndian.AppendUint32(out, 0)
@@ -1072,7 +1085,6 @@ func closeOpen(c *conn, o *open) uint32 {
 	g.mu.Unlock()
 	c.srv.st.locks.releaseAll(o)
 	c.srv.st.notify.cancelOpen(o)
-	g.dropCaching(o)
 	o.mu.Lock()
 	p, dir, f := o.path, o.isDir, o.file
 	o.file = nil
@@ -1080,12 +1092,14 @@ func closeOpen(c *conn, o *open) uint32 {
 	st := uint32(statusSuccess)
 	if f != nil {
 		if err := f.Close(); err != nil {
+			g.loseCaching(o, err)
 			st = ntinfo.Status(err)
 		}
 		if o.access&(accessWriteData|accessAppendData) != 0 {
 			c.srv.st.changed() // a host can still move the mtime at close
 		}
 	}
+	g.dropCaching(o)
 	g.mu.Lock()
 	last := len(g.byPath[p]) == 0
 	if last && g.pending[p] {

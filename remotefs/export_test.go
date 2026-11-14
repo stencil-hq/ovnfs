@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stencil-hq/ovnfs/api"
@@ -64,7 +66,7 @@ func exportFixture(t *testing.T) (*export.Export, string, string) {
 }
 
 // serveExport serves one checkout of e on a fresh socket and returns a connected client.
-func serveExport(t *testing.T, share remotefs.Share) *remotefs.Client {
+func serveExport(t *testing.T, share remotefs.Share, opts remotefs.Options) *remotefs.Client {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("remotefs share sockets are unsupported on Windows")
@@ -80,7 +82,7 @@ func serveExport(t *testing.T, share remotefs.Share) *remotefs.Client {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- remotefs.Serve(l, share, remotefs.Options{}) }()
+	go func() { done <- remotefs.Serve(l, share, opts) }()
 	c, err := remotefs.Dial(sock, "home")
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +102,7 @@ func serveExport(t *testing.T, share remotefs.Share) *remotefs.Client {
 func TestExportCheckoutOverRemoteFS(t *testing.T) {
 	e, name, src := exportFixture(t)
 	nodes := e.Nodes()
-	c := serveExport(t, remotefs.Share{FS: nodes, Checkout: name, Writable: true})
+	c := serveExport(t, remotefs.Share{FS: nodes, Checkout: name, Writable: true}, remotefs.Options{})
 
 	if st, err := c.Stat("pkg/lib.go"); err != nil || st.Kind != remotefs.KindFile || st.Size != 12 {
 		t.Fatalf("stat seeded file = %+v, %v", st, err)
@@ -170,10 +172,47 @@ func TestExportCheckoutOverRemoteFS(t *testing.T) {
 	}
 }
 
+// TestExportCacheBarrier exposes pending external writes and rejects mutation
+// when their owner cannot flush, rather than reading stale or overwriting data.
+func TestExportCacheBarrier(t *testing.T) {
+	e, name, _ := exportFixture(t)
+	nodes := e.Nodes()
+	var failed atomic.Bool
+	var flush sync.Once
+	var flushErr error
+	quiesce := func(context.Context) (func(), error) {
+		if failed.Load() {
+			return nil, errors.New("write cache owner disconnected")
+		}
+		flush.Do(func() {
+			f, err := nodes.OpenFile(name+"/pkg/lib.go", os.O_WRONLY|os.O_TRUNC, 0)
+			if err != nil {
+				flushErr = err
+				return
+			}
+			_, flushErr = f.Write([]byte("pending client write"))
+			flushErr = errors.Join(flushErr, f.Close())
+		})
+		return func() {}, flushErr
+	}
+	c := serveExport(t, remotefs.Share{FS: nodes, Checkout: name, Writable: true}, remotefs.Options{Quiesce: quiesce})
+	if got, err := c.Read("pkg/lib.go", 0, 64); err != nil || string(got) != "pending client write" {
+		t.Fatalf("read before external flush: %q, %v", got, err)
+	}
+	failed.Store(true)
+	if _, err := c.Write("pkg/lib.go", 0, []byte("overwritten")); err == nil {
+		t.Fatal("write succeeded despite failed cache barrier")
+	}
+	failed.Store(false)
+	if got, err := c.Read("pkg/lib.go", 0, 64); err != nil || string(got) != "pending client write" {
+		t.Fatalf("failed barrier changed data: %q, %v", got, err)
+	}
+}
+
 // TestExportCheckoutRootIsProtected checks the checkout root itself cannot be removed or renamed.
 func TestExportCheckoutRootIsProtected(t *testing.T) {
 	e, name, _ := exportFixture(t)
-	c := serveExport(t, remotefs.Share{FS: e.Nodes(), Checkout: name, Writable: true})
+	c := serveExport(t, remotefs.Share{FS: e.Nodes(), Checkout: name, Writable: true}, remotefs.Options{})
 	if err := c.Rmdir(""); err == nil {
 		t.Fatal("rmdir of the checkout root succeeded")
 	}

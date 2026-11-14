@@ -88,6 +88,11 @@ func (r *Registry) fromTree(ctx context.Context, h *checkoutRecord, id string) (
 
 // Diff lists source paths that differ between a snapshot (default: the base) and the checkout now.
 func (r *Registry) Diff(ctx context.Context, args api.DiffArgs) (api.DiffReply, error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.DiffReply{}, err
+	}
+	defer resume()
 	h, err := r.lookupCheckout(args.Checkout)
 	if err != nil {
 		return api.DiffReply{}, err
@@ -468,6 +473,11 @@ func head(b []byte) []byte { return b[:min(len(b), 8000)] }
 // (see checkoutMeta.MergeBases). Applies into one folder take turns, each merging
 // against what the last one wrote. With Branch it instead copies the checkout's commits.
 func (r *Registry) Apply(ctx context.Context, args api.ApplyArgs) (reply api.ApplyReply, err error) {
+	resume, err := r.Quiesce(ctx)
+	if err != nil {
+		return api.ApplyReply{}, err
+	}
+	defer resume()
 	h, err := r.lookupCheckout(args.Checkout)
 	if err != nil {
 		return api.ApplyReply{}, err

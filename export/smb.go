@@ -48,10 +48,26 @@ func (s *protocolFS) Cacheable(p string) bool {
 func (s *protocolFS) Statfs() (smb.Statfs, error) { return volumeStatfs(s.volume) }
 
 // smbFS is the export as the SMB server sees it.
-type smbFS struct{ protocolFS }
+type smbFS struct {
+	protocolFS
+	writeCacheable func(checkout, p string) bool
+}
 
 // SMB exposes stable file identities; SMB itself recalls conflicting client caches.
-func (e *Export) SMB() smb.Backend { return &smbFS{e.protocolFS()} }
+func (e *Export) SMB() smb.Backend {
+	s := &smbFS{protocolFS: e.protocolFS()}
+	if e.rt != nil {
+		s.writeCacheable = e.rt.reg.WriteCacheable
+	}
+	return s
+}
+
+// WriteCacheable admits isolated upper files whose accesses are covered by
+// the daemon's pre-operation barriers, never live lower paths or hard-link aliases.
+func (s *smbFS) WriteCacheable(p string) bool {
+	co, rel, ok := strings.Cut(overlay.Clean(p), "/")
+	return ok && s.writeCacheable != nil && s.writeCacheable(co, rel)
+}
 
 // OpenFile opens without nodeFS's recall: the SMB server breaks conflicting
 // caches itself before a CREATE opens for writing, and the recall would come

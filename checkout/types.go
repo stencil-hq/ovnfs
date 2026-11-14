@@ -130,6 +130,12 @@ type Config struct {
 	// the export recalls clients' caches. It is called without registry locks
 	// held.
 	Invalidate func(checkout string, paths, trees []string)
+	// Quiesce recalls client write caches and waits for their writes to drain.
+	// Its release keeps new write-cache grants disabled through the operation.
+	// Concurrent and nested calls must coexist, not serialize: Apply calls Snap.
+	// It is called before registry/freeze locks; draining writes must still Enter.
+	// Nil means the export never delegates writes to clients.
+	Quiesce func(context.Context) (func(), error)
 	// GitRemotes gives a source repository a git remote ovnfs/<name> for each
 	// live checkout of it (see Registry.syncRemotes); off, ovnfs removes them.
 	GitRemotes bool

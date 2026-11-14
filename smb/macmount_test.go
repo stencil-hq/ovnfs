@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stencil-hq/ovnfs/internal/dirbottom"
@@ -81,6 +82,85 @@ func TestMacAppleDirectoryModes(t *testing.T) {
 			} else if mode != 0100755 {
 				t.Fatalf("Apple Unix mode: %#o, want 0100755", mode)
 			}
+		})
+	}
+}
+
+type countedDirectoryBackend struct {
+	Backend
+	lists atomic.Int64
+}
+
+func (b *countedDirectoryBackend) ReadDir(p string) ([]os.FileInfo, error) {
+	b.lists.Add(1)
+	return b.Backend.ReadDir(p)
+}
+
+// TestMacExactDirectoryProbe keeps absent-name probes independent of directory
+// size after the client negotiates the advertised case-sensitive volume.
+func TestMacExactDirectoryProbe(t *testing.T) {
+	for _, apple := range []bool{false, true} {
+		name := "legacy"
+		if apple {
+			name = "apple"
+		}
+		t.Run(name, func(t *testing.T) {
+			var backend *countedDirectoryBackend
+			fixture := startSMBWith(t, func(s *Server) {
+				backend = &countedDirectoryBackend{Backend: s.FS}
+				s.FS = backend
+			}, func(lower, upper string) {
+				putDiskFile(t, lower, "entry", "contents")
+			})
+			c := newWireClient(t, fixture.address)
+			c.negotiate([]uint16{0x0300})
+			c.expectStatus(c.login("guest", "", true), wireSuccess)
+			c.expectStatus(c.treeConnect("test"), wireSuccess)
+			b := wireCreateBody("", 1, createDirectory)
+			if apple {
+				in := make([]byte, 24)
+				binary.LittleEndian.PutUint32(in, 1)
+				// Negotiate volume capabilities alone: directory metadata
+				// extensions are independent of case-sensitive lookup.
+				binary.LittleEndian.PutUint64(in[8:], 2)
+				context := appendCreateContexts([]createContext{{"AAPL", in}})
+				binary.LittleEndian.PutUint32(b[48:], uint32(64+len(b)))
+				binary.LittleEndian.PutUint32(b[52:], uint32(len(context)))
+				b = append(b, context...)
+			}
+			reply := c.exchange(cmdCreate, b)
+			c.expectStatus(reply, wireSuccess)
+			var id wireID
+			copy(id[:], reply.body[64:80])
+			query := func(pattern string) wireReply {
+				b := make([]byte, 32)
+				binary.LittleEndian.PutUint16(b, 33)
+				b[2], b[3] = 12, 0x10
+				copy(b[8:], id[:])
+				binary.LittleEndian.PutUint16(b[24:], 96)
+				binary.LittleEndian.PutUint16(b[26:], uint16(utf16Len(pattern)))
+				binary.LittleEndian.PutUint32(b[28:], 4096)
+				return c.exchange(cmdQueryDirectory, utf16Append(b, pattern))
+			}
+			c.expectStatus(query("absent"), statusNoSuchFile)
+			wantLists := int64(1)
+			if apple {
+				wantLists = 0
+			}
+			if got := backend.lists.Load(); got != wantLists {
+				t.Fatalf("absent exact probe listed directory %d times, want %d", got, wantLists)
+			}
+			_, reply = c.queryDirectory(id, false, 4096)
+			c.expectStatus(reply, statusNoMoreFiles)
+			c.expectStatus(query("entry"), wireSuccess)
+			if got := backend.lists.Load(); got != wantLists {
+				t.Fatalf("existing exact probe listed directory: %d", got)
+			}
+			c.expectStatus(query("*"), wireSuccess)
+			if got := backend.lists.Load(); got != wantLists+1 {
+				t.Fatalf("wildcard listings = %d, want %d", got, wantLists+1)
+			}
+			c.expectStatus(c.close(id), wireSuccess)
 		})
 	}
 }

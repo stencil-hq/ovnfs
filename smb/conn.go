@@ -30,12 +30,14 @@ type conn struct {
 	preauth                     [64]byte
 	posix                       bool
 	appleReadDir                atomic.Bool
+	appleCaseSensitive          atomic.Bool
 	maxRead, maxWrite, maxTrans uint32
 	mu                          sync.Mutex
 	sessions                    map[uint64]*session
 	operations                  map[uint64]*asyncRecord
 	closed                      bool
 	writeMu                     sync.Mutex
+	ioTail                      <-chan struct{} // earlier WRITE/FLUSH frames, assigned by serve
 	creditMu                    sync.Mutex
 	creditInitialized           bool
 	credits                     uint32
@@ -123,17 +125,20 @@ func (o *open) stat(s *Server) (os.FileInfo, error) {
 
 // request carries one decoded command and its resolved session/share state.
 type request struct {
-	c            *conn
-	hdr          header
-	raw          []byte
-	body         []byte
-	sess         *session
-	tree         *tree
-	onSent       func(msg []byte)
-	compound     *compoundState
-	pendingReply *wireResponse
-	asyncStarted bool
-	chainFailed  bool
+	c              *conn
+	hdr            header
+	raw            []byte
+	body           []byte
+	sess           *session
+	tree           *tree
+	onSent         func(msg []byte)
+	compound       *compoundState
+	pendingReply   *wireResponse
+	asyncStarted   bool
+	chainFailed    bool
+	ioBefore       <-chan struct{}
+	ioDone         chan struct{}
+	cacheProtected bool
 }
 
 // handler returns a command-specific response or an NTSTATUS failure.
@@ -331,6 +336,9 @@ func (t *tree) close() {
 
 // closeImplicit performs the Files owner's close hook and releases its file.
 func closeImplicit(o *open) {
+	if o.tree != nil && o.tree.sess != nil && o.tree.sess.conn != nil {
+		o.tree.sess.conn.srv.st.opens.loseCaching(o, errors.New("write lease handle closed without SMB CLOSE"))
+	}
 	o.mu.Lock()
 	fn := o.closeFn
 	o.closeFn = nil
@@ -421,6 +429,30 @@ func (c *conn) serve() {
 			if err != nil {
 				return
 			}
+			if c.srv.WriteCache && len(requests) == 1 {
+				// Preserve standalone I/O arrival order through dispatch goroutines.
+				// Compounds execute in order themselves; a WRITE following a
+				// blocked CREATE must not prevent that CREATE's break ACK.
+				for _, r := range requests {
+					drain := r.hdr.Command == cmdWrite || r.hdr.Command == cmdFlush
+					if r.hdr.Command == cmdSetInfo && len(r.body) >= 4 && r.body[2] == 1 {
+						switch r.body[3] {
+						case 4, 19, 20, 39:
+							drain = true // mtime, allocation and EOF can finish a client flush
+						}
+					}
+					if r.hdr.Command == cmdIoctl && len(r.body) >= 8 && binary.LittleEndian.Uint32(r.body[4:]) == ioctlZeroData {
+						drain = true
+					}
+					if drain {
+						r.ioBefore = c.ioTail
+						r.ioDone = make(chan struct{})
+						c.ioTail = r.ioDone
+					} else if r.hdr.Command == cmdOplockBreak || r.hdr.Command == cmdClose {
+						r.ioBefore = c.ioTail
+					}
+				}
+			}
 			go c.runRequests(requests)
 		default:
 			return
@@ -498,6 +530,12 @@ func (c *conn) runRequests(requests []*request) {
 
 // dispatch resolves security and share state before entering a command handler.
 func (c *conn) dispatch(r *request) *wireResponse {
+	if r.ioBefore != nil {
+		<-r.ioBefore
+	}
+	if r.ioDone != nil {
+		defer close(r.ioDone)
+	}
 	if r.hdr.Command != cmdNegotiate && r.hdr.SessionID != 0 {
 		r.sess = c.session(r.hdr.SessionID)
 	}
@@ -557,6 +595,14 @@ func (c *conn) dispatch(r *request) *wireResponse {
 	}
 	if int(r.hdr.Command) >= len(handlers) || handlers[r.hdr.Command] == nil {
 		return c.response(r, nil, statusNotSupported, 0, false)
+	}
+	if c.srv.st.opens.cacheError() != nil {
+		switch r.hdr.Command {
+		case cmdWrite, cmdFlush, cmdClose, cmdOplockBreak, cmdTreeDisconnect, cmdLogoff:
+			// Keep drain and teardown available, but never clear the fault.
+		default:
+			return c.response(r, nil, statusUnsuccessful, 0, false)
+		}
 	}
 	mutating := r.hdr.Command == cmdWrite || r.hdr.Command == cmdSetInfo || r.hdr.Command == cmdIoctl
 	if mutating {
@@ -749,7 +795,16 @@ func (c *conn) writeFrameLocked(msg []byte) error {
 	var prefix [4]byte
 	binary.BigEndian.PutUint32(prefix[:], uint32(len(msg)))
 	buffers := net.Buffers{prefix[:], msg}
-	_, err := buffers.WriteTo(c.nc)
+	var err error
+	// Listener wrappers can retain the underlying socket's writev path;
+	// net.Buffers otherwise writes the prefix and payload separately.
+	if writer, ok := c.nc.(interface {
+		WriteBuffers(net.Buffers) (int64, error)
+	}); ok {
+		_, err = writer.WriteBuffers(buffers)
+	} else {
+		_, err = buffers.WriteTo(c.nc)
+	}
 	if err != nil {
 		_ = c.nc.Close()
 	}
@@ -759,7 +814,9 @@ func (c *conn) writeFrameLocked(msg []byte) error {
 // sendBreak sends the unsigned server-initiated oplock or lease break notification.
 func (c *conn) sendBreak(body []byte) {
 	h := header{Command: cmdOplockBreak, Flags: flagResponse, MessageID: ^uint64(0)}
-	_ = c.writeFrame(append(h.appendTo(nil), body...))
+	if err := c.writeFrame(append(h.appendTo(nil), body...)); err != nil {
+		c.shutdown()
+	}
 }
 
 // async sends the initial unsigned pending response and registers cancellation.

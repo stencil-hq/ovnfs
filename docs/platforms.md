@@ -67,9 +67,38 @@ for about two seconds.
 
 SMB2.1+ file leases allow read and handle caching, recalled on conflicting
 opens, rename/deletion, and daemon or watched-folder changes. Unwatched live
-paths are not leased. Write caching, including exclusive/batch oplocks, is not
-granted: daemon-side snapshots and diffs have no client-flush barrier.
-Directory leasing is not supported.
+paths are not leased. On macOS, `serve --proto smb` also grants write leases
+for regular files already owned by a checkout's writable upper, including
+memory files and build outputs. Live lower files, hard-link aliases and
+private git/jj metadata never receive write leases. Other platforms retain
+read/handle caching only; exclusive/batch oplocks and directory leasing are
+not granted.
+
+The macOS client coalesces small writes in its kernel cache. Before a snapshot,
+fork, diff, search, remote-fs request or other direct checkout access, the daemon
+blocks new write leases, recalls existing ones, and waits for their dirty writes
+and acknowledgements before taking checkout locks. Restart drains these caches
+before cutting client connections. These barriers have a 5 s acquisition limit;
+a failed or lost dirty owner fails closed instead of publishing incomplete
+snapshots. A protected operation keeps new write leases excluded until it ends.
+Ordinary operations by a lease's owner preserve its cache where SMB coherence
+allows it.
+
+Application fsync still reaches the backing file, subject to the existing
+[memory-file fsync policy](configuration.md#where-the-daemon-lives). Repeated
+writes to a small working set may exceed native-file benchmark rates because
+only the final dirty pages cross the protocol; this is buffered throughput,
+not physical-device bandwidth. This does not imply faster builds: measure cold
+and incremental compilation separately before switching a development workload.
+NFS remains the macOS default. SMB still lacks
+[hard links and durable handles](limitations.md). The native macOS SMB client
+rejects hard links, so Rust copies artifacts that NFS can link. Without native
+named streams, macOS also uses AppleDouble files for xattrs such as provenance;
+these are real metadata reads, writes and locks, not dispensable failed probes.
+Disabling client caches or dropping those writes is not a correctness-preserving
+build optimization. The server avoids unnecessary case-fold directory scans for
+negotiated case-sensitive clients and preserves vectored response writes through
+its connection wrapper.
 
 The server resolves a CREATE of an existing name with one lookup (a lookup
 succeeds only through directories, so symlinked components are walked only
