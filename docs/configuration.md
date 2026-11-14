@@ -34,7 +34,21 @@ over NFS. It does not sync parent directories or make snapshots durable.
 `serve --atime` (`OVNFS_ATIME=1`) lets the mount update access times; by
 default it is mounted `noatime`, since the macOS NFS client otherwise sends a
 SETATTR for every exec of a checkout binary. A restart applies the setting to
-the mount the previous daemon left in place without unmounting it.
+the existing mount; macOS NFS uses [mount reconciliation](platforms.md#nfs).
+
+`serve --nfs-io-size SIZE` (`OVNFS_NFS_IO_SIZE`, user key `nfs_io_size`)
+sets NFS read/write transfers, default `128K`: powers of two from `4K` to `1M`
+are accepted; `0` uses the default. It applies to Unix-socket and TCP NFS mounts,
+not SMB. A restart replaces a macOS NFS mount whose negotiated options differ.
+
+`ovnfs tune` measures isolated mount configurations and asks before applying a
+balanced result. Add `--project DIR` for a real Cargo workspace; see
+[the tuning methodology](development.md#balanced-configuration-tuning).
+
+On macOS, `proto: smb` in the user file selects SMB's client write caching on
+the next `restart`; NFS remains the default. See the [frontend tradeoffs](platforms.md#smb),
+including SMB's lack of hard links and durable open handles. Changing protocols
+forces a new mount rather than retaining one that speaks the old protocol.
 
 By default a repository gets a git remote per checkout of it;
 `serve --no-git-remotes` (`OVNFS_GIT_REMOTES=0`) turns that off, see
@@ -179,6 +193,7 @@ env:
 | `node_cache` | size | user file only: estimated cache budget for derived ids and directory listings (default 16M) |
 | `blob_cache` | size | user file only: memory budget for content-addressed blobs (default 16M) |
 | `atime` | boolean | user file only: allow access time updates |
+| `nfs_io_size` | size | user file only: NFS transfer size, power of two from 4K to 1M (default 128K; 0 uses default) |
 | `git_remotes` | boolean | user file only: give a repository a git remote `ovnfs/NAME` per checkout (default true) |
 
 `rules` is a block scalar (`rules: |`) with one `<class> <predicate>` per line.
@@ -234,7 +249,7 @@ ovnfs config edit --global
 
 The keys are `rules`, `cache.ROOT.rebuild`, `cache.ROOT.key`, `env.image`,
 `env.setup` and the daemon settings `state`, `mount`, `proto`, `memory`,
-`fsync`, `blob_cache`, `node_cache`, `atime` and `git_remotes`. A cache root may hold dots
+`fsync`, `blob_cache`, `node_cache`, `atime`, `nfs_io_size` and `git_remotes`. A cache root may hold dots
 (`cache.web/.next.key`) and matches its entry however it is spelled
 (`cache.web/dist.rebuild` finds `./web/dist`). `rules`, `env.setup` and
 `cache.ROOT.key` take several values, one rule line or item each, and

@@ -56,6 +56,7 @@ type Daemon struct {
 	NodeCache  string
 	BlobCache  string
 	Atime      string
+	NFSIOSize  string
 	GitRemotes string
 }
 
@@ -73,6 +74,7 @@ var daemonKeys = map[string]string{
 	"state": "", "mount": "", "proto": "",
 	"memory": "!!int", "fsync": "!!bool", "node_cache": "!!int", "blob_cache": "!!int", "atime": "!!bool",
 	"git_remotes": "!!bool",
+	"nfs_io_size": "!!int",
 }
 
 // UserOnly reports whether key is a daemon setting, which only ~/.o2/ovnfs.yml
@@ -213,6 +215,7 @@ type fileSchema struct {
 	NodeCache  string           `yaml:"node_cache"`
 	BlobCache  string           `yaml:"blob_cache"`
 	Atime      string           `yaml:"atime"`
+	NFSIOSize  string           `yaml:"nfs_io_size"`
 	GitRemotes string           `yaml:"git_remotes"`
 }
 
@@ -233,7 +236,7 @@ func parseLayer(data []byte, display string, user bool) (layer, error) {
 	if root.Kind != yaml.MappingNode {
 		return layer{}, fmt.Errorf("%s:%d: expected a mapping with rules, cache and env", display, root.Line)
 	}
-	if err := checkKeys(root, display, "", "rules", "cache", "env", "state", "mount", "proto", "memory", "fsync", "node_cache", "blob_cache", "atime", "git_remotes"); err != nil {
+	if err := checkKeys(root, display, "", "rules", "cache", "env", "state", "mount", "proto", "memory", "fsync", "node_cache", "blob_cache", "atime", "git_remotes", "nfs_io_size"); err != nil {
 		return layer{}, err
 	}
 	for i := 0; i+1 < len(root.Content); i += 2 {
@@ -246,7 +249,7 @@ func parseLayer(data []byte, display string, user bool) (layer, error) {
 			if p := v.Value; v.Kind == yaml.ScalarNode && p != "" && !strings.HasPrefix(p, "~/") && !filepath.IsAbs(p) && !(k == "mount" && driveLetter(p)) {
 				return layer{}, fmt.Errorf("%s:%d: %s must be an absolute path or start with ~/", display, v.Line, k)
 			}
-		case "proto", "memory", "fsync", "node_cache", "blob_cache", "atime", "git_remotes":
+		case "proto", "memory", "fsync", "node_cache", "blob_cache", "atime", "git_remotes", "nfs_io_size":
 			if !user {
 				return layer{}, fmt.Errorf("%s:%d: %q is read only from %s", display, root.Content[i].Line, k, userFile)
 			}
@@ -278,7 +281,7 @@ func parseLayer(data []byte, display string, user bool) (layer, error) {
 	}
 	l := layer{env: f.Env, daemon: Daemon{
 		State: f.State, Mount: f.Mount, Proto: f.Proto, Memory: f.Memory,
-		Fsync: f.Fsync, NodeCache: f.NodeCache, BlobCache: f.BlobCache, Atime: f.Atime, GitRemotes: f.GitRemotes,
+		Fsync: f.Fsync, NodeCache: f.NodeCache, BlobCache: f.BlobCache, Atime: f.Atime, GitRemotes: f.GitRemotes, NFSIOSize: f.NFSIOSize,
 	}}
 	for k, c := range f.Cache {
 		key, ok := cacheRoot(k)

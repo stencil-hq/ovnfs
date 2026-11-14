@@ -124,7 +124,7 @@ func TestSMBDriveMapping(t *testing.T) {
 	processes := processCounter(t)
 	before := processes()
 	served := make(chan error, 1)
-	port, _, err := listenAndMount(reg, e, "smb", "127.0.0.1:0", state, drive, false /* atime */, served, func(s *smb.Server) { s.Logf = logs.logf })
+	port, _, err := listenAndMount(reg, e, "smb", "127.0.0.1:0", state, drive, mountSettings{}, served, func(s *smb.Server) { s.Logf = logs.logf })
 	if err != nil {
 		t.Fatalf("%v\nlog:\n%s", err, logs)
 	}

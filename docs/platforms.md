@@ -18,7 +18,8 @@ directory, which only its user can open, and `mount_nfs` dials that socket
 (`port=` a path, netid `ticotsord`: undocumented, but in Apple's
 `mount_nfs.c`). When that mount fails, or `serve --listen` names a TCP address,
 it serves `127.0.0.1` on a free port and mounts with `noresvport`. The macOS
-mount uses `locallocks,nobrowse,intr,rwsize=1048576`, `noatime` unless
+mount uses `locallocks,nobrowse,intr,rwsize=131072` by default
+([`nfs_io_size`](configuration.md#where-the-daemon-lives) changes the size), `noatime` unless
 [`serve --atime`](configuration.md#where-the-daemon-lives), and normal
 attribute caching (the client's default timeouts are 5 to 60 s).
 After creating or removing a checkout the daemon `statfs`es its own mount,
@@ -26,6 +27,34 @@ making the client revalidate the export root so new checkouts show up
 immediately. The export root is read-only; cross-checkout rename returns EXDEV
 so `mv` copies. It also holds an empty, unlisted `.metadata_never_index`, the
 file macOS checks for on every new volume to keep Spotlight from indexing it.
+
+The 128 KiB I/O buffers balance bulk transfers with small random writes:
+macOS maps a whole buffer for a write and flushes it before a discontiguous
+write. Larger buffers make 4 KiB writes disproportionately expensive.
+When a regular file shrinks through another frontend or a folder change,
+NFSv3 retires its existing handle instead of reporting the smaller size on
+that handle. The client receives `ESTALE`; a fresh lookup gets a new handle
+with the current attributes. A resize requested by that client keeps its
+handle.
+
+On macOS, startup and `restart` keep a retained NFS mount when its options
+match, but retire every non-root handle so cached files are recovered through
+fresh lookups. A mismatch is logged and forces an unmount and fresh mount,
+even when busy. Retiring handles may interrupt operations on files that
+remain open across the restart; replacing a mount may additionally lose
+unflushed client writes.
+
+Inspection, unmount and mount commands each have a 5 s deadline. Cancellation
+kills the command's process group without waiting indefinitely for a stuck
+kernel call to finish. Inspection failures leave the mount untouched; a failed
+or timed-out replacement fails startup instead of silently keeping old options
+or attempting another transport.
+
+NFSv3 retains up to 4096 writable descriptors across write bursts, expiring
+them after 10 s idle instead of reopening a host file for every small write.
+Cached writers are keyed by file id and path, so renames reopen at the current
+path; the export's generation-aware handles preserve snapshot isolation.
+This does not change NFS's [fsync limitations](configuration.md#where-the-daemon-lives).
 
 The server also accepts NFSv4.0 clients on the same socket or port. These may receive
 read delegations, recalled on changes through another protocol, `pull`,

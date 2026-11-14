@@ -6,6 +6,41 @@ import (
 	"testing"
 )
 
+// TestResetNFSHandles keeps the root identity while rotating every descendant.
+func TestResetNFSHandles(t *testing.T) {
+	e := &Export{fs: newMetadataTestFS(t)}
+	b := e.NFS()
+	if err := b.MkdirAll("co/dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := b.Create("co/dir/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root := b.FileID("")
+	old := []uint64{b.FileID("co"), b.FileID("co/dir"), b.FileID("co/dir/file")}
+	if err := e.ResetNFSHandles(); err != nil {
+		t.Fatal(err)
+	}
+	if id := b.FileID(""); id != root {
+		t.Fatalf("root id changed from %d to %d", root, id)
+	}
+	for _, id := range old {
+		if _, ok := b.Path(id); ok {
+			t.Errorf("old id %d still resolves", id)
+		}
+	}
+	fresh := []uint64{b.FileID("co"), b.FileID("co/dir"), b.FileID("co/dir/file")}
+	for i, id := range fresh {
+		if id == old[i] {
+			t.Errorf("path %d reused id %d", i, id)
+		}
+	}
+}
+
 // TestNFSIDsTrackRenameAndRetirement checks that the ids NFS handles carry
 // follow renames and go stale on removal and checkout retirement.
 func TestNFSIDsTrackRenameAndRetirement(t *testing.T) {

@@ -13,7 +13,7 @@ func TestServeOptions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	for _, name := range []string{"OVNFS_NODE_CACHE", "OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC"} {
+	for _, name := range []string{"OVNFS_NODE_CACHE", "OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC", "OVNFS_NFS_IO_SIZE"} {
 		t.Setenv(name, "")
 	}
 	parse := func(args ...string) (serveCmd, error) {
@@ -72,8 +72,9 @@ func TestServeOptions(t *testing.T) {
 	t.Setenv("OVNFS_BLOB_CACHE", "64MiB")
 	t.Setenv("OVNFS_FSYNC", "1")
 	t.Setenv("OVNFS_ATIME", "1")
-	cmd, err = parse("--memory", "0", "--blob-cache", "0", "--proto", "smb", "--fsync=false", "--atime=false", "--listen", "localhost:1234")
-	if err != nil || cmd.Memory != 0 || cmd.BlobCache != 0 || cmd.Proto != "smb" || cmd.Fsync || cmd.Atime || cmd.Listen != "localhost:1234" {
+	t.Setenv("OVNFS_NFS_IO_SIZE", "256K")
+	cmd, err = parse("--memory", "0", "--blob-cache", "0", "--proto", "smb", "--fsync=false", "--atime=false", "--nfs-io-size", "64K", "--listen", "localhost:1234")
+	if err != nil || cmd.Memory != 0 || cmd.BlobCache != 0 || cmd.Proto != "smb" || cmd.Fsync || cmd.Atime || cmd.NFSIOSize != 64<<10 || cmd.Listen != "localhost:1234" {
 		t.Fatalf("flags: %+v, %v", cmd, err)
 	}
 	t.Setenv("OVNFS_FSYNC", "false")

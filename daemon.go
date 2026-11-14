@@ -344,9 +344,10 @@ func (cmd *stopCmd) Run(c *cli) error {
 }
 
 // restartCmd replaces the running daemon with a fresh one spawned from this
-// invocation's binary, which is how a rebuilt or upgraded ovnfs takes over. An
-// NFS or SMB mount stays, so processes inside it carry on once the new daemon
-// serves. It starts the daemon when none runs, and leaves the old one
+// invocation's binary, which is how a rebuilt or upgraded ovnfs takes over. A
+// compatible NFS or SMB mount stays; retained NFS mounts refresh non-root
+// handles once the new daemon serves. Mismatched macOS NFS options force a
+// fresh mount. It starts the daemon when none runs, and leaves the old one
 // untouched if it refuses to stop. The start lock is held throughout, so
 // clients that auto-start while the old daemon exits wait for the new one
 // instead of racing it for the state directory.

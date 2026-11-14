@@ -200,7 +200,7 @@ func TestUserDaemon(t *testing.T) {
 }
 
 func TestDaemonSettingsUserOnlyAndTypes(t *testing.T) {
-	for _, key := range []string{"proto", "memory", "fsync", "blob_cache", "node_cache", "atime"} {
+	for _, key := range []string{"proto", "memory", "fsync", "blob_cache", "node_cache", "atime", "nfs_io_size"} {
 		t.Run(key, func(t *testing.T) {
 			root := t.TempDir()
 			writeManifest(t, root, key+": value\n")
@@ -213,7 +213,7 @@ func TestDaemonSettingsUserOnlyAndTypes(t *testing.T) {
 	}
 	for _, body := range []string{
 		"proto: false\n", "memory: false\n", "blob_cache: []\n",
-		"fsync: 0\n", "atime: {}\n",
+		"fsync: 0\n", "atime: {}\n", "nfs_io_size: true\n", "nfs_io_size: []\n",
 	} {
 		t.Run(body, func(t *testing.T) {
 			home := t.TempDir()
@@ -227,8 +227,8 @@ func TestDaemonSettingsUserOnlyAndTypes(t *testing.T) {
 		})
 	}
 	home := t.TempDir()
-	writeManifest(t, home, "proto: fuse\nmemory: 1G\nfsync: true\nblob_cache: 512M\natime: true\n")
-	want := Daemon{Proto: "fuse", Memory: "1G", Fsync: "true", BlobCache: "512M", Atime: "true"}
+	writeManifest(t, home, "proto: fuse\nmemory: 1G\nfsync: true\nblob_cache: 512M\natime: true\nnfs_io_size: 65536\n")
+	want := Daemon{Proto: "fuse", Memory: "1G", Fsync: "true", BlobCache: "512M", Atime: "true", NFSIOSize: "65536"}
 	if got, err := UserDaemon(home); err != nil || got != want {
 		t.Fatalf("UserDaemon = %+v, %v; want %+v", got, err, want)
 	}

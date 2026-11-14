@@ -25,7 +25,7 @@ type configCmd struct {
 }
 
 // keyHelp names the keys a config verb accepts.
-const keyHelp = "rules, cache.ROOT.rebuild, cache.ROOT.key, env.image, env.setup, or a daemon setting: state, mount, proto, memory, fsync, node_cache, blob_cache, atime, git_remotes"
+const keyHelp = "rules, cache.ROOT.rebuild, cache.ROOT.key, env.image, env.setup, or a daemon setting: state, mount, proto, memory, fsync, node_cache, blob_cache, atime, nfs_io_size, git_remotes"
 
 // configScope picks the files a config verb works on. Reads default to both,
 // writes to the folder's file, or the user's for a daemon setting.

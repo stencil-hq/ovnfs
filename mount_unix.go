@@ -3,14 +3,13 @@
 package main
 
 import (
-	"bytes"
-	"errors"
+	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
+	"runtime"
 )
 
 // smbClientPort is 0: mount_smbfs and mount.cifs dial any port.
@@ -23,26 +22,47 @@ func mountRoots(string) []string { return nil }
 func smbAccount(string) (user, password string, err error) { return "", "", nil }
 
 // mountServer mounts the localhost NFS or SMB server at addr on mount with the
-// system client, updating access times only if atime is set.
-func mountServer(proto string, addr net.Addr, mount, user, password string, atime bool) error {
-	cmd := mountCmd(proto, addr, mount, atimeOption(atime), "ovnfs", user, password)
-	if out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", err, out)
+// system client with the requested settings.
+func mountServer(proto string, addr net.Addr, mount, user, password string, settings mountSettings) error {
+	if err := settings.validate(); err != nil {
+		return err
 	}
-	return nil
+	cmd := mountCmd(proto, addr, mount, settings, "ovnfs", user, password)
+	_, err := mountOutput(context.Background(), cmd)
+	return err
 }
 
-// matchAtime brings the mount at dir, left by a previous daemon, to the
-// access-time setting in place, so processes using the mount keep running.
-func matchAtime(dir string, atime bool) error {
-	if current, ok := mountAtime(dir); !ok || current == atime {
+// matchMount preserves compatible mounts. macOS cannot update NFS buffer
+// sizes in place, so mismatched parameters require a bounded forced unmount.
+func matchMount(proto string, addr net.Addr, dir string, settings mountSettings) error {
+	if err := settings.validate(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "darwin" && proto == "nfs" {
+		out, err := mountOutput(context.Background(), []string{"/usr/bin/nfsstat", "-f", "JSON", "-m", dir})
+		if err != nil {
+			return err
+		}
+		cmd := mountCmd(proto, addr, dir, settings, "ovnfs", "", "")
+		reason, err := nfsMountMismatch(out, mountPath(dir), cmd)
+		if err != nil {
+			return err
+		}
+		if reason == "" {
+			return nil
+		}
+		log.Printf("replacing NFS mount at %s: %s; forcing unmount (open handles and unflushed writes may be lost)", dir, reason)
+		if err := unmount(dir, true); err != nil {
+			return fmt.Errorf("replacing NFS mount: %w", err)
+		}
+		return mountServer(proto, addr, dir, "", "", settings)
+	}
+	if current, ok := mountAtime(dir); !ok || current == settings.Atime {
 		return nil
 	}
-	cmd := remountCmd(dir, atimeOption(atime))
-	if out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
-	}
-	return nil
+	cmd := remountCmd(dir, atimeOption(settings.Atime))
+	_, err := mountOutput(context.Background(), cmd)
+	return err
 }
 
 // makeMountPoint creates the directory the mount covers.
@@ -53,13 +73,15 @@ func unmount(dir string, force bool) error {
 	if !mounted(dir) {
 		return nil
 	}
-	args := []string{dir}
+	args := []string{"umount", dir}
 	if force {
-		args = []string{"-f", dir}
+		args = []string{"umount", "-f", dir}
 	}
-	out, err := exec.Command("umount", args...).CombinedOutput()
-	if err != nil {
-		return errors.New(strings.TrimSpace(string(out)))
+	if _, err := mountOutput(context.Background(), args); err != nil {
+		return err
+	}
+	if mounted(dir) {
+		return fmt.Errorf("%s is still mounted after umount", dir)
 	}
 	return nil
 }

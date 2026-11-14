@@ -3,6 +3,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -112,6 +113,7 @@ func serveDefaults(conf manifest.Daemon) kong.Option {
 		"node_cache_default":  cmp.Or(os.Getenv("OVNFS_NODE_CACHE"), conf.NodeCache, defaultNodeCache.String()),
 		"blob_cache_default":  cmp.Or(os.Getenv("OVNFS_BLOB_CACHE"), conf.BlobCache, defaultBlobCache.String()),
 		"atime_default":       cmp.Or(os.Getenv("OVNFS_ATIME"), conf.Atime, "false"),
+		"nfs_io_size_default": cmp.Or(os.Getenv("OVNFS_NFS_IO_SIZE"), conf.NFSIOSize, byteSize(defaultNFSIOSize).String()),
 		"git_remotes_default": cmp.Or(os.Getenv("OVNFS_GIT_REMOTES"), conf.GitRemotes, "true"),
 	}
 }
@@ -125,6 +127,7 @@ type serveCmd struct {
 	NodeCache  byteSize `help:"Estimated cache bytes for derived node ids and listings; keeps at least the current directory." default:"${node_cache_default}"`
 	BlobCache  byteSize `help:"Memory budget for small content-addressed blobs; 0 disables." default:"${blob_cache_default}"`
 	Atime      bool     `help:"Allow access time updates on the mount." default:"${atime_default}"`
+	NFSIOSize  byteSize `name:"nfs-io-size" help:"NFS read/write transfer size (power of two, 4K to 1M)." default:"${nfs_io_size_default}"`
 	GitRemotes bool     `help:"Give each source repository a git remote ovnfs/NAME per checkout of it." default:"${git_remotes_default}" negatable:""`
 }
 
@@ -173,10 +176,17 @@ func (h *eventHub) events(ctx context.Context) <-chan admin.Event {
 }
 
 // Run opens the persistent export, attaches its native client, and handles shutdown.
-func (cmd *serveCmd) Run(c *cli) error {
+func (cmd *serveCmd) Run(c *cli) (err error) {
 	proto := cmd.Proto
 	if proto == "" {
 		proto = defaultProto()
+	}
+	if cmd.NFSIOSize > 1<<20 {
+		return fmt.Errorf("NFS I/O size must not exceed 1 MiB")
+	}
+	settings := mountSettings{Atime: cmd.Atime, NFSIOSize: int(cmd.NFSIOSize)}
+	if err := settings.validate(); err != nil {
+		return err
 	}
 	go releaseIdle()
 	var mem *overlay.Memory
@@ -214,7 +224,7 @@ func (cmd *serveCmd) Run(c *cli) error {
 	var exported atomic.Pointer[export.Export]
 	// The system client's connections, from listenAndMount on; nil for in-process mounts.
 	var files atomic.Pointer[fileListener]
-	var smbServer *smb.Server
+	var smbServer atomic.Pointer[smb.Server]
 	var checkoutShares *shares
 	userHome, _ := os.UserHomeDir()
 	lk := newLinks(hub.emit)
@@ -224,6 +234,12 @@ func (cmd *serveCmd) Run(c *cli) error {
 	}
 	reg, err := checkout.Open(checkout.Config{State: state, Mount: mount, UserHome: userHome, Node: node, Emit: hub.emit, Fetch: lk.fetch, Search: lk.search,
 		Memory: mem, BlobCache: int64(cmd.BlobCache), GitRemotes: cmd.GitRemotes, Logf: log.Printf,
+		Quiesce: func(ctx context.Context) (func(), error) {
+			if s := smbServer.Load(); s != nil {
+				return s.Quiesce(ctx)
+			}
+			return func() {}, nil
+		},
 		Retire: func(name string) {
 			lk.detach(name)
 			if checkoutShares != nil {
@@ -239,11 +255,11 @@ func (cmd *serveCmd) Run(c *cli) error {
 			}
 		},
 		Changed: func(name string, added bool) {
-			if smbServer != nil {
+			if s := smbServer.Load(); s != nil {
 				if added {
-					smbServer.Changed(name, smb.NotifyAdded)
+					s.Changed(name, smb.NotifyAdded)
 				} else {
-					smbServer.Retire(name)
+					s.Retire(name)
 				}
 			}
 			if l := files.Load(); l != nil && proto == "nfs" {
@@ -253,7 +269,13 @@ func (cmd *serveCmd) Run(c *cli) error {
 	if err != nil {
 		return fmt.Errorf("checkouts: %w", err)
 	}
-	defer reg.Close()
+	var releaseCaches func()
+	defer func() {
+		if releaseCaches != nil {
+			releaseCaches()
+		}
+	}()
+	defer func() { err = errors.Join(err, reg.Close()) }()
 	lk.reg = reg
 	defer lk.close()
 	e, err = export.New(export.NewRouter(reg), filepath.Join(state, "nodes.log"), state, log.Printf)
@@ -282,7 +304,7 @@ func (cmd *serveCmd) Run(c *cli) error {
 		}
 	} else {
 		var l *fileListener
-		if port, l, err = listenAndMount(reg, e, proto, cmd.Listen, state, mount, cmd.Atime, served, func(s *smb.Server) { smbServer = s }); err != nil {
+		if port, l, err = listenAndMount(reg, e, proto, cmd.Listen, state, mount, settings, served, smbServer.Store); err != nil {
 			return err
 		}
 		files.Store(l)
@@ -304,7 +326,7 @@ func (cmd *serveCmd) Run(c *cli) error {
 	handler := &opsHandler{nodeCache: e.NodeCache, nodeIndexBytes: e.NodeIndexBytes, nodeCacheError: e.NodeCacheError, reg: reg, shares: checkoutShares, links: lk, welcome: welcome, started: time.Now(), stop: func(ctx context.Context, a api.StopArgs) error {
 		done := make(chan error, 1)
 		select {
-		case stops <- stopRequest{keepMount: a.KeepMount, done: done}:
+		case stops <- stopRequest{keepMount: a.KeepMount, ctx: ctx, done: done}:
 			return <-done
 		case <-ctx.Done():
 			return ctx.Err()
@@ -324,16 +346,37 @@ func (cmd *serveCmd) Run(c *cli) error {
 		case req = <-stops:
 		case <-sigs:
 		}
+		var flushRelease func()
+		if !force || req.keepMount {
+			ctx := req.ctx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			flushRelease, err = reg.Quiesce(ctx)
+			if err != nil {
+				err = fmt.Errorf("flushing client write caches: %w", err)
+				log.Print(err)
+				if req.done != nil {
+					req.done <- err
+				}
+				force = true
+				continue
+			}
+		}
 		if l := files.Load(); req.keepMount && l != nil {
 			// Cut before the export closes, which would answer the kernel
 			// client "not found": it retries the cut connections instead, until
 			// the next daemon serves this port.
+			releaseCaches = flushRelease
 			l.cut()
 			log.Printf("left %s mounted for the next daemon", mount)
 			req.done <- nil
 			return nil
 		}
 		if err = release(force); err != nil {
+			if flushRelease != nil {
+				flushRelease()
+			}
 			err = fmt.Errorf("unmount: %w", err)
 			if !force {
 				err = fmt.Errorf("%w; stop again to force", err)
@@ -345,6 +388,7 @@ func (cmd *serveCmd) Run(c *cli) error {
 			req.done <- err
 		}
 		if err == nil {
+			releaseCaches = flushRelease
 			return nil
 		}
 	}
@@ -354,6 +398,7 @@ func (cmd *serveCmd) Run(c *cli) error {
 // daemon exits, the unmount error while it keeps running.
 type stopRequest struct {
 	keepMount bool
+	ctx       context.Context
 	done      chan<- error
 }
 
@@ -419,6 +464,11 @@ type fileConn struct {
 	l *fileListener
 }
 
+// WriteBuffers preserves scatter/gather writes through the listener wrapper.
+func (c *fileConn) WriteBuffers(buffers net.Buffers) (int64, error) {
+	return buffers.WriteTo(c.Conn)
+}
+
 // Close forgets and closes the connection.
 func (c *fileConn) Close() error {
 	c.l.mu.Lock()
@@ -481,16 +531,29 @@ func mountInProcess(proto string, e *export.Export, mount string, atime bool) (i
 // authenticates with the state directory's account where the OS has one
 // (smbAccount), otherwise as guest. It returns the TCP port, 0 on the socket,
 // and the listener whose connections the system client holds.
-func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, state, mount string, atime bool, served chan<- error, smbStarted func(*smb.Server)) (int, *fileListener, error) {
+func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, state, mount string, settings mountSettings, served chan<- error, smbStarted func(*smb.Server)) (int, *fileListener, error) {
 	savedProto, savedPort := reg.Listen()
 	remount := mounted(mount)
 	socket := savedProto == "nfs" && savedPort == 0 // the previous run served the NFS socket
-	if savedProto != proto && (savedPort != 0 || remount && socket) {
-		return 0, nil, fmt.Errorf("listen: state uses %s; restart with -proto %s", savedProto, savedProto)
+	if savedProto != "" && savedProto != proto {
+		if remount {
+			log.Printf("replacing %s mount at %s with %s; forcing unmount", savedProto, mount, proto)
+			if err := unmount(mount, true); err != nil {
+				return 0, nil, fmt.Errorf("changing mount protocol: %w", err)
+			}
+			remount = false
+		}
+		savedPort, socket = 0, false
+	}
+	if proto == "nfs" && runtime.GOOS == "darwin" && remount {
+		log.Printf("resetting handles for retained NFS mount at %s", mount)
+		if err := e.ResetNFSHandles(); err != nil {
+			return 0, nil, fmt.Errorf("resetting retained NFS handles: %w", err)
+		}
 	}
 	if proto == "nfs" && runtime.GOOS == "darwin" && (remount && socket || !remount && address == "") {
-		files, err := mountLocal(reg, e, state, mount, atime, served)
-		if err == nil || remount {
+		files, err := mountLocal(reg, e, state, mount, settings, served)
+		if err == nil || remount || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return 0, files, err
 		}
 		log.Printf("NFS over %s failed, using TCP: %v", nfsSocket(state), err)
@@ -532,7 +595,7 @@ func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, st
 		return 0, nil, fmt.Errorf("persist listen: %w", err)
 	}
 	if proto == "smb" {
-		s := &smb.Server{FS: e.SMB(), Share: "ovnfs", MountRoots: mountRoots(mount)}
+		s := &smb.Server{FS: e.SMB(), Share: "ovnfs", MountRoots: mountRoots(mount), WriteCache: runtime.GOOS == "darwin"}
 		if user != "" {
 			s.Users = map[string]string{user: password}
 		}
@@ -550,7 +613,8 @@ func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, st
 	} else {
 		go func() { served <- fmt.Errorf("nfs serve: %w", serveNFS(files, e)) }()
 	}
-	if err = attach(proto, listener.Addr(), mount, user, password, atime); err != nil {
+	if err = attach(proto, listener.Addr(), mount, user, password, settings); err != nil {
+		files.cut()
 		return 0, nil, err
 	}
 	return port, files, nil
@@ -559,7 +623,7 @@ func listenAndMount(reg *checkout.Registry, e *export.Export, proto, address, st
 // mountLocal serves NFS on the state directory's Unix socket and mounts it at
 // mount; mount_nfs dials such a socket only on macOS. A failed mount stops
 // the server again, leaving the caller free to fall back to TCP.
-func mountLocal(reg *checkout.Registry, e *export.Export, state, mount string, atime bool, served chan<- error) (*fileListener, error) {
+func mountLocal(reg *checkout.Registry, e *export.Export, state, mount string, settings mountSettings, served chan<- error) (*fileListener, error) {
 	l, err := admin.Listen(nfsSocket(state))
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
@@ -571,7 +635,7 @@ func mountLocal(reg *checkout.Registry, e *export.Export, state, mount string, a
 	}
 	stopped := make(chan error, 1)
 	go func() { stopped <- serveNFS(files, e) }()
-	if err = attach("nfs", l.Addr(), mount, "", "", atime); err != nil {
+	if err = attach("nfs", l.Addr(), mount, "", "", settings); err != nil {
 		files.cut()
 		<-stopped
 		return nil, err
@@ -580,19 +644,19 @@ func mountLocal(reg *checkout.Registry, e *export.Export, state, mount string, a
 	return files, nil
 }
 
-// attach mounts the server at addr on mount with the system client, or brings
-// a mount a previous run left there to the access-time setting (see [matchAtime]).
-func attach(proto string, addr net.Addr, mount, user, password string, atime bool) error {
+// attach mounts the server at addr or reconciles a retained mount's options.
+// A failed reconciliation is a startup error, not a silently stale mount.
+func attach(proto string, addr net.Addr, mount, user, password string, settings mountSettings) error {
 	if mounted(mount) {
-		if err := matchAtime(mount, atime); err != nil {
-			log.Printf("%s keeps its access-time setting: %v", mount, err)
+		if err := matchMount(proto, addr, mount, settings); err != nil {
+			return fmt.Errorf("matching mount options: %w", err)
 		}
 		return nil
 	}
 	if err := makeMountPoint(mount); err != nil {
 		return fmt.Errorf("mount directory: %w", err)
 	}
-	if err := mountServer(proto, addr, mount, user, password, atime); err != nil {
+	if err := mountServer(proto, addr, mount, user, password, settings); err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
 	return nil

@@ -171,10 +171,17 @@ indexes are rewritten sorted when the store opens.
 On restart the server binds its persisted port, or the NFS socket a macOS mount
 dials, and serves before touching the mount path, so hard-mounted NFS I/O
 resumes with existing handles and cwd.
-`restart` therefore leaves an NFS or SMB mount in place (`stop` with
+`restart` initially leaves an NFS or SMB mount in place (`stop` with
 `keep_mount`): the old daemon cuts its file connections before it closes the
-export, and the client retries until the new one serves. From the cut on the
-old daemon makes no call into the mount, such as the NFS root refresh after a
+export, and the client retries until the new one serves. The new daemon keeps
+a compatible mount; mismatched macOS NFS parameters force a fresh mount, with
+5 s deadlines per inspection, unmount and mount command. That replacement may
+invalidate open handles and lose unflushed client writes. A configured change
+between NFS and SMB likewise replaces the retained mount. With SMB write caching,
+the old daemon first excludes new write leases and drains existing client caches;
+it holds that gate through its final registry close. A failed drain refuses the
+restart. From the cut on the old daemon makes no call into the mount, such as
+the NFS root refresh after a
 create or removal: with no server it would wait for the new daemon, which
 waits for the old one to exit. A plain `stop`
 unmounts before it replies; while the mount is busy it fails and the daemon

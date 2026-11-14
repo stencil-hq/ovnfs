@@ -141,6 +141,7 @@ func TestDocSaveRefuses(t *testing.T) {
 	for _, set := range []struct{ key, value, err string }{
 		{"rules", "bogus x", `.o2/ovnfs.yml:2: unknown class "bogus"`},
 		{"proto", "smb", `.o2/ovnfs.yml:3: "proto" is read only from ~/.o2/ovnfs.yml`},
+		{"nfs_io_size", "64KiB", `.o2/ovnfs.yml:3: "nfs_io_size" is read only from ~/.o2/ovnfs.yml`},
 	} {
 		d := readDoc(t, FolderDoc(root, home))
 		if err := d.Set(set.key, set.value); err != nil {
@@ -155,7 +156,7 @@ func TestDocSaveRefuses(t *testing.T) {
 	}
 
 	d := readDoc(t, UserDoc(home))
-	for _, err := range []error{d.Set("memory", "1e3"), d.Set("fsync", "true"), d.Set("proto", "false")} {
+	for _, err := range []error{d.Set("memory", "1e3"), d.Set("fsync", "true"), d.Set("proto", "false"), d.Set("nfs_io_size", "64KiB")} {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -163,7 +164,7 @@ func TestDocSaveRefuses(t *testing.T) {
 	if err := d.Save(); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := UserDaemon(home); err != nil || got != (Daemon{Memory: "1e3", Fsync: "true", Proto: "false"}) {
+	if got, err := UserDaemon(home); err != nil || got != (Daemon{Memory: "1e3", Fsync: "true", Proto: "false", NFSIOSize: "64KiB"}) {
 		t.Fatalf("UserDaemon = %+v, %v", got, err)
 	}
 	if err := d.Set("env.image", "a", "b"); err == nil {

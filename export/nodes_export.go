@@ -33,5 +33,18 @@ func (e *Export) Retire(name string) {
 	e.fs.nodes.remove(name)
 }
 
+// ResetNFSHandles retires every non-root handle while preserving the
+// namespace, allowing a retained mount to recover through fresh lookups.
+func (e *Export) ResetNFSHandles() error {
+	entries, err := e.fs.Filesystem.ReadDir("")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		e.fs.nodes.remove(entry.Name())
+	}
+	return e.fs.IdentityError()
+}
+
 // Close flushes outstanding identity records and closes the log.
 func (e *Export) Close() error { return e.fs.nodes.close() }
