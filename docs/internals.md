@@ -316,7 +316,7 @@ runs. Tracking includes ancestor directories under the repository that answers
 their facts: a nested repository's root keeps its outer repository's tracking,
 while paths below it use the nested repository's facts.
 
-Writable uppers and raw frozen layers retain one metadata record per path.
+Loaded writable uppers and raw frozen layers retain one metadata record per path.
 The directory-child index stores canonical paths, not another copy of each
 entry. Unix listings use the shared native basename/stat slabs, and metadata
 refreshed after writes copies the stat without retaining its absolute host path.
@@ -325,6 +325,21 @@ Windows retains its handle-derived identity cache. Hard-link pairs keep both
 names inline and allocate an alias map only for larger groups. These indexes
 still scale with the number of upper paths; the file/blob cache budgets do not
 cap them, and removing files does not immediately return Go's heap to the OS.
+
+A writable upper starts cold. Registering a checkout and statting its root
+retain only root attributes. The first non-root lookup, directory listing or
+mutation walks the upper once under its lock. Walk errors reach that operation
+instead of rejecting unrelated checkouts at daemon startup. Status reports
+`upper index` as loaded out of retained checkouts (`cold_checkouts` in JSON).
+
+The registry checks every ten seconds and drops an upper index after a minute
+without index-dependent access. Open native descriptors, memory-file handles
+(including unlinked ones), unflushed files and staged I/O pin it. Cooling only
+detaches reconstructible metadata maps: it leaves files, checkout generations
+and inode identities unchanged, and keeps sparse rename hints for the next
+walk. A later access rebuilds the maps. Freezing a cold upper walks its renamed
+directory before publishing the layer. Frozen-layer metadata remains resident;
+these layers are shared and are not part of upper-index expiry.
 
 Small store blobs (at most 1 MiB) are served from a second budget
 (`--blob-cache`, default 16 MiB) instead of their object files. `ovnfs status` shows both. A

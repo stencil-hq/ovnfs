@@ -427,6 +427,7 @@ func (cmd *statusCmd) Run(c *cli) error {
 		{"state", st.State},
 		{"socket", st.Socket},
 		{"checkouts", commas(int64(st.Checkouts))},
+		{"upper index", commas(int64(st.Checkouts-st.ColdCheckouts)) + " loaded of " + commas(int64(st.Checkouts))},
 		{"snapshots", commas(int64(st.Snapshots))},
 		{"bases", commas(int64(st.Bases))},
 		{"layers", commas(int64(st.Layers))},

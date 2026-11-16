@@ -13,19 +13,10 @@ const originsName = metaPrefix + "origins"
 
 // saveOrigins records hints before Freeze transfers ownership of the upper.
 func (l *Layer) saveOrigins(dir string) (bool, error) {
-	var origins map[string]string
-	for p, e := range l.entries {
-		if e.Origin != "" {
-			if origins == nil {
-				origins = make(map[string]string)
-			}
-			origins[p] = e.Origin
-		}
-	}
-	if len(origins) == 0 {
+	if len(l.origins) == 0 {
 		return false, nil
 	}
-	data, err := json.Marshal(origins)
+	data, err := json.Marshal(l.origins)
 	if err != nil {
 		return false, err
 	}

@@ -236,9 +236,10 @@ func Open(c Config) (*Registry, error) {
 	}
 	phase("leftovers")
 	r.hasher = newHasher(r.storeLayers)
-	r.workers.Add(2)
+	r.workers.Add(3)
 	go r.collectGarbage()
 	go r.processNotices()
+	go r.coolCheckouts()
 	go r.emptyTrash()
 	// Without folder events, live paths are simply never delegated (see Tracked).
 	if r.watcher, err = watch.New(r.folderChanged); err == nil {
@@ -584,6 +585,9 @@ func (r *Registry) Counts(s *api.Status) {
 	for _, h := range r.checkouts {
 		if !h.retired.Load() {
 			s.Checkouts++
+			if !h.fs.Indexed() {
+				s.ColdCheckouts++
+			}
 		}
 	}
 	s.Snapshots, s.Bases, s.Layers = len(r.snapshots), len(r.bases), len(r.layers)

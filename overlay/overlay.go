@@ -5,6 +5,7 @@ package overlay
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,20 +35,25 @@ const (
 // FS is a concurrent-safe writable upper over immutable layers and a bottom.
 // The index and cached inode metadata are kept current under mu.
 type FS struct {
-	mu          sync.RWMutex
-	upper, work string
-	layers      []*Layer
-	bottom      Bottom
-	bottomEpoch uint64
-	index       *Layer
-	tmpSeq      uint64
-	pathIDs     map[string]inodeKey
-	aliases     map[inodeKey]inodeNames
-	mem         *Memory             // nil: every write goes to upper on disk
-	files       map[string]*memFile // upper names whose data is in memory
-	hosts       map[*file]struct{}  // open descriptors of upper files, see [FS.CloseFiles]
-	writers     map[inodeKey]int    // open writable descriptors per upper inode, see [FS.upperInfo]
-	staging     sync.RWMutex        // shared by an unlocked writeback, see [FS.writeBack]
+	mu            sync.RWMutex
+	upper, work   string
+	layers        []*Layer
+	bottom        Bottom
+	bottomEpoch   uint64
+	index         *Layer
+	tmpSeq        uint64
+	pathIDs       map[string]inodeKey
+	aliases       map[inodeKey]inodeNames
+	mem           *Memory             // nil: every write goes to upper on disk
+	files         map[string]*memFile // upper names whose data is in memory
+	hosts         map[*file]struct{}  // open descriptors of upper files, see [FS.CloseFiles]
+	writers       map[inodeKey]int    // open writable descriptors per upper inode, see [FS.upperInfo]
+	staging       sync.RWMutex        // shared by an unlocked writeback, see [FS.writeBack]
+	rootInfo      os.FileInfo         // root attributes remain available without walking a cold upper
+	savedOrigins  map[string]string   // sparse rename hints retained while the index is cold
+	lastAccess    atomic.Int64
+	indexed       atomic.Bool // status queries must not block behind an index load
+	memoryHandles int         // includes handles of unlinked memory files
 }
 
 // Filesystem interface assertions keep the overlay compatible with protocols.
@@ -56,8 +63,8 @@ var (
 )
 
 // New opens upper over layers (top first) and bottom. An empty upper is
-// read-only. With mem, small written files stay in memory under its budget
-// until they spill into upper (see [Memory]); nil keeps every write on disk.
+// read-only. The upper index loads on first file access, not at daemon start.
+// With mem, small written files stay in memory until they spill into upper.
 func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error) {
 	f := &FS{layers: slices.Clone(layers), bottom: bottom, hosts: make(map[*file]struct{}), writers: make(map[inodeKey]int)}
 	for _, l := range layers {
@@ -68,10 +75,6 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	if upper == "" {
 		return f, nil
 	}
-	if cachePathIDs {
-		f.pathIDs = make(map[string]inodeKey)
-	}
-	f.aliases = make(map[inodeKey]inodeNames)
 	if mem != nil {
 		f.mem, f.files = mem, make(map[string]*memFile)
 	}
@@ -88,6 +91,13 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	if err := os.MkdirAll(f.upper, 0o755); err != nil {
 		return nil, err
 	}
+	info, err := hostLstat(f.upper)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, &fs.PathError{Op: "index", Path: f.upper, Err: fs.ErrInvalid}
+	}
 	f.work = filepath.Join(f.upper, workName)
 	if err := os.RemoveAll(f.work); err != nil {
 		return nil, err
@@ -95,29 +105,44 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	if err := os.Mkdir(f.work, 0o700); err != nil {
 		return nil, err
 	}
-	f.index, err = indexLayer(f.upper, true)
+	// Check only root names. Opening an idle checkout must not stat its whole
+	// tree; a root containing only internal metadata is still an empty upper.
+	dir, err := os.Open(f.upper)
 	if err != nil {
 		return nil, err
 	}
-	for p, e := range f.index.entries {
-		if err := f.track(p, e.Info); err != nil {
-			return nil, err
+	defer dir.Close()
+	empty := true
+	for empty {
+		names, readErr := dir.Readdirnames(16)
+		for _, name := range names {
+			if !strings.HasPrefix(name, metaPrefix) {
+				empty = false
+				break
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
 		}
 	}
-	// A fresh upper must not change the visible root's timestamp.
-	if len(f.index.entries) == 1 {
-		idx := f.index
-		f.index = nil
-		_, info, e := f.lookup("")
-		f.index = idx
-		if e == nil {
-			if err := os.Chtimes(f.upper, info.ModTime(), info.ModTime()); err != nil {
-				return nil, err
-			}
-			if err := f.refresh(""); err != nil {
+	if empty {
+		// rootInfo is not set yet, so lookup sees only the inherited stack.
+		if _, inherited, err := f.lookup(""); err == nil {
+			if err := os.Chtimes(f.upper, inherited.ModTime(), inherited.ModTime()); err != nil {
 				return nil, err
 			}
 		}
+	}
+	info, err = hostLstat(f.upper)
+	if err != nil {
+		return nil, err
+	}
+	f.rootInfo, err = withMode(f.upper, info)
+	if err != nil {
+		return nil, err
 	}
 	return f, nil
 }
@@ -164,7 +189,7 @@ func (f *FS) Stack() []*Layer { return slices.Clone(f.layers) }
 func (f *FS) Freeze(dir string) (*Layer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.upper == "" || f.index == nil {
+	if f.upper == "" {
 		return nil, &fs.PathError{Op: "freeze", Path: dir, Err: syscall.EROFS}
 	}
 	if len(f.files) != 0 {
@@ -182,6 +207,15 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 		return nil, &fs.PathError{Op: "freeze", Path: root, Err: syscall.ENOTDIR}
 	}
 	l := f.index
+	if l == nil {
+		// The caller has already renamed the upper and removed its staging
+		// directory. A cold index must be rebuilt at that new location.
+		l, err = indexLayer(root, false)
+		if err != nil {
+			return nil, err
+		}
+		f.restoreOrigins(l)
+	}
 	if wrote, err := l.saveOrigins(root); err != nil {
 		return nil, err
 	} else if wrote {
@@ -194,6 +228,7 @@ func (f *FS) Freeze(dir string) (*Layer, error) {
 	l.set("", e)
 	l.dir = root
 	f.index = nil
+	f.indexed.Store(false)
 	f.pathIDs = nil
 	f.aliases = nil
 	f.upper, f.work = "", ""
@@ -235,6 +270,9 @@ func (f *FS) up(p string) string { return filepath.Join(f.upper, p) }
 func (f *FS) lookup(p string) (source, os.FileInfo, error) {
 	if reserved(p) {
 		return source{}, nil, notExist("lstat", p)
+	}
+	if p == "" && f.index == nil && f.upper != "" && f.rootInfo != nil {
+		return source{upper: true}, f.rootInfo, nil
 	}
 	if f.index != nil {
 		if e, ok := f.index.entries[p]; ok {
@@ -301,15 +339,19 @@ func (f *FS) readlink(s source, p string) (string, error) {
 // served by the bottom: neither the upper nor a frozen layer provides or
 // hides it.
 func (f *FS) InBottom(name string) bool {
-	f.mu.RLock()
+	if err := f.lockRead(Clean(name) != ""); err != nil {
+		return false
+	}
 	defer f.mu.RUnlock()
 	s, _, err := f.lookup(Clean(name))
-	return err == nil && s.layer == nil
+	return err == nil && !s.upper && s.layer == nil
 }
 
 // Lstat describes name without following its final symlink.
 func (f *FS) Lstat(name string) (os.FileInfo, error) {
-	f.mu.RLock()
+	if err := f.lockRead(Clean(name) != ""); err != nil {
+		return nil, err
+	}
 	defer f.mu.RUnlock()
 	_, info, err := f.lookup(Clean(name))
 	return info, err
@@ -317,7 +359,9 @@ func (f *FS) Lstat(name string) (os.FileInfo, error) {
 
 // Stat describes name, resolving relative final symlinks within the overlay.
 func (f *FS) Stat(name string) (os.FileInfo, error) {
-	f.mu.RLock()
+	if err := f.lockRead(Clean(name) != ""); err != nil {
+		return nil, err
+	}
 	defer f.mu.RUnlock()
 	p := Clean(name)
 	for range 40 {
@@ -339,7 +383,9 @@ func (f *FS) Stat(name string) (os.FileInfo, error) {
 
 // Readlink returns a symlink's stored target.
 func (f *FS) Readlink(name string) (string, error) {
-	f.mu.RLock()
+	if err := f.lockRead(true); err != nil {
+		return "", err
+	}
 	defer f.mu.RUnlock()
 	p := Clean(name)
 	s, _, err := f.lookup(p)
@@ -351,7 +397,9 @@ func (f *FS) Readlink(name string) (string, error) {
 
 // ReadDir merges direct entries from all visible levels in name order.
 func (f *FS) ReadDir(name string) ([]os.FileInfo, error) {
-	f.mu.RLock()
+	if err := f.lockRead(true); err != nil {
+		return nil, err
+	}
 	defer f.mu.RUnlock()
 	return f.readDir(Clean(name))
 }
@@ -479,7 +527,9 @@ func (f *FS) Open(name string) (billy.File, error) { return f.OpenFile(name, os.
 // or missing name), which [FS.OpenFile] decides under the exclusive lock.
 func (f *FS) openLower(name string, flag int) (h billy.File, ok bool, err error) {
 	p := Clean(name)
-	f.mu.RLock()
+	if err := f.lockRead(true); err != nil {
+		return nil, true, err
+	}
 	s, info, err := f.lookup(p)
 	bottom := f.bottom
 	f.mu.RUnlock()
@@ -509,14 +559,21 @@ func (f *FS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, erro
 		if h, ok, err := f.openLower(name, flag); ok {
 			return h, err
 		}
-	} else {
-		f.staging.RLock()
-		defer f.staging.RUnlock()
 	}
+	// Cooling must also wait for a read-open that temporarily drops mu while
+	// resolving a lower symlink; no descriptor has been adopted yet.
+	f.staging.RLock()
+	defer f.staging.RUnlock()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 retry:
 	p := Clean(name)
+	if !writing && f.index == nil {
+		if err := f.loadIndex(); err != nil {
+			return nil, err
+		}
+		f.lastAccess.Store(time.Now().UnixNano())
+	}
 	if writing {
 		if err := f.mutable("open", p); err != nil {
 			return nil, err
@@ -1176,6 +1233,10 @@ func (f *FS) mutable(op, p string) error {
 	if f.upper == "" {
 		return &fs.PathError{Op: op, Path: p, Err: syscall.EROFS}
 	}
+	if err := f.loadIndex(); err != nil {
+		return err
+	}
+	f.lastAccess.Store(time.Now().UnixNano())
 	return nil
 }
 

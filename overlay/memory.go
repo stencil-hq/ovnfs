@@ -485,6 +485,7 @@ func (f *FS) installed(m *memFile, fds map[*memHandle]*os.File) error {
 		h.disk = f.adopt(&file{File: fd, name: h.name, writable: writable(h.flag)})
 		f.bind(h.disk, p)
 		h.m = nil
+		f.memoryHandles--
 	}
 	clear(m.handles)
 	m.data = nil
@@ -538,6 +539,7 @@ func stage(tmp string, m *memFile) (map[*memHandle]*os.File, error) {
 // newHandle registers a handle on m so a spill can hand it a host descriptor.
 func (f *FS) newHandle(m *memFile, name string, flag int) *memHandle {
 	h := &memHandle{fs: f, name: name, flag: flag, m: m}
+	f.memoryHandles++
 	m.handles[h] = struct{}{}
 	f.mem.touch(m)
 	return h
@@ -895,5 +897,6 @@ func (h *memHandle) Close() error {
 	}
 	h.closed = true
 	delete(h.m.handles, h)
+	h.fs.memoryHandles--
 	return nil
 }

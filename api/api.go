@@ -59,6 +59,7 @@ type Status struct {
 	State          string  `json:"state"`
 	Socket         string  `json:"socket"` // admin socket clients dial for these operations
 	Checkouts      int     `json:"checkouts"`
+	ColdCheckouts  int     `json:"cold_checkouts,omitempty"` // writable upper indices not currently resident
 	Snapshots      int     `json:"snapshots"`
 	Bases          int     `json:"bases"`
 	Layers         int     `json:"layers"`

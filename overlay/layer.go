@@ -50,6 +50,7 @@ type Layer struct {
 	entries  map[string]Entry
 	children map[string]map[string]string // child name → canonical path; metadata lives only in entries
 	gits     map[string]bool              // paths of entries named .git, see [Layer.GitEntries]
+	origins  map[string]string            // sparse rename hints, independent of the full metadata index
 	storing  sync.Mutex                   // serializes [Layer.Store]
 	mu       sync.RWMutex                 // guards blobs, ids and tree; held shared while raw files are read, see [Layer.Content]
 	blobs    Blobs                        // nil while every entry is raw
@@ -211,6 +212,14 @@ func (l *Layer) set(p string, e Entry) {
 		e.Origin = l.entries[p].Origin
 	}
 	l.entries[p] = e
+	if e.Origin != "" {
+		if l.origins == nil {
+			l.origins = make(map[string]string)
+		}
+		l.origins[p] = e.Origin
+	} else {
+		delete(l.origins, p)
+	}
 	if path.Base(p) == ".git" {
 		if l.gits == nil {
 			l.gits = make(map[string]bool)
@@ -234,6 +243,7 @@ func (l *Layer) drop(p string) {
 	delete(l.children, p)
 	delete(l.entries, p)
 	delete(l.gits, p)
+	delete(l.origins, p)
 	if p != "" {
 		delete(l.children[parent(p)], path.Base(p))
 	}
