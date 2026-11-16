@@ -482,9 +482,9 @@ func (l *Layer) decode() (*Layer, error) {
 	if l.links == 0 {
 		l.links = storedLinks.Add(1) << 32
 	}
-	v := &Layer{dir: l.dir, entries: make(map[string]Entry), children: make(map[string]map[string]Entry), ids: make(map[string]string)}
+	v := &Layer{dir: l.dir}
 	var m manifest
-	loadErr, err := decodeManifest(reader, &m, func(i int, me manifestEntry) error { return v.load(i, me, l.links) })
+	loadErr, err := v.decodeManifest(reader, &m, l.links)
 	if err != nil {
 		return nil, fmt.Errorf("overlay: layer manifest %s: %w", l.dir, err)
 	}
@@ -502,10 +502,11 @@ func (l *Layer) decode() (*Layer, error) {
 }
 
 // decodeManifest reads m's fields in any order, case-insensitively as
-// encoding/json does, and passes each entry to load instead of keeping them.
-// The containers must close. Entries of a version already known to differ are
-// not loaded; loadErr is the first load failure.
-func decodeManifest(r io.Reader, m *manifest, load func(int, manifestEntry) error) (loadErr, err error) {
+// encoding/json does, and indexes each entry into v instead of keeping them.
+// The containers must close; a repeated entries key replaces the earlier
+// array. The caller checks the final version before loadErr, the first load
+// failure of the last array.
+func (v *Layer) decodeManifest(r io.Reader, m *manifest, links uint64) (loadErr, err error) {
 	dec := json.NewDecoder(r)
 	if err := delim(dec, '{'); err != nil {
 		return nil, err
@@ -522,6 +523,8 @@ func decodeManifest(r io.Reader, m *manifest, load func(int, manifestEntry) erro
 		case strings.EqualFold(name, "r"):
 			err = dec.Decode(&m.Tree)
 		case strings.EqualFold(name, "e"):
+			v.entries, v.children, v.gits, v.ids = make(map[string]Entry), make(map[string]map[string]Entry), nil, make(map[string]string)
+			loadErr = nil
 			var t json.Token
 			if t, err = dec.Token(); err != nil || t == nil { // null: no entries
 				break
@@ -531,8 +534,8 @@ func decodeManifest(r io.Reader, m *manifest, load func(int, manifestEntry) erro
 			}
 			for i := 0; err == nil && dec.More(); i++ {
 				var me manifestEntry
-				if err = dec.Decode(&me); err == nil && loadErr == nil && (m.Version == 0 || m.Version == manifestVersion) {
-					loadErr = load(i, me)
+				if err = dec.Decode(&me); err == nil && loadErr == nil {
+					loadErr = v.load(i, me, links)
 				}
 			}
 			if err == nil {
