@@ -615,11 +615,15 @@ func (f *fixture) snapLayer(name string) (api.Snapshot, *overlay.Layer) {
 	}
 	// Stored turns true before Store removes the raw files; the keeper runs
 	// until Store returns, so wait for it too before tests read the directory.
+	// The keeper swaps the record's layer for its restored copy under reg.mu.
 	eventually(f.t, "layer "+rec.id+" stored", func() bool {
+		f.reg.mu.RLock()
+		stored := rec.layer.Stored()
+		f.reg.mu.RUnlock()
 		h := f.reg.hasher
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		return rec.layer.Stored() && !h.keeping
+		return stored && !h.keeping
 	})
 	return reply.Snapshot, rec.layer
 }
