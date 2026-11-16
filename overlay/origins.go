@@ -13,15 +13,7 @@ const originsName = metaPrefix + "origins"
 
 // saveOrigins records hints before Freeze transfers ownership of the upper.
 func (l *Layer) saveOrigins(dir string) (bool, error) {
-	var origins map[string]string
-	for p, e := range l.entries {
-		if e.Origin != "" {
-			if origins == nil {
-				origins = make(map[string]string)
-			}
-			origins[p] = e.Origin
-		}
-	}
+	origins := l.origins()
 	if len(origins) == 0 {
 		return false, nil
 	}
@@ -39,6 +31,20 @@ func (l *Layer) saveOrigins(dir string) (bool, error) {
 	return err == nil, err
 }
 
+// origins collects the entries' rename hints.
+func (l *Layer) origins() map[string]string {
+	var origins map[string]string
+	for p, e := range l.entries {
+		if e.Origin != "" {
+			if origins == nil {
+				origins = make(map[string]string)
+			}
+			origins[p] = e.Origin
+		}
+	}
+	return origins
+}
+
 // loadOrigins restores optional optimization hints, never paths used for host
 // I/O: an unreadable file or a hint that no longer fits its entry is dropped,
 // costing at most a delta base, never the layer.
@@ -54,13 +60,18 @@ func (l *Layer) loadOrigins() error {
 	if json.Unmarshal(data, &origins) != nil {
 		return nil
 	}
+	l.addOrigins(origins)
+	return nil
+}
+
+// addOrigins sets the hints that still fit their entries.
+func (l *Layer) addOrigins(origins map[string]string) {
 	for p, origin := range origins {
 		if e, ok := l.entries[p]; ok && validOrigin(e.Kind, origin) {
 			e.Origin = origin
 			l.set(p, e)
 		}
 	}
-	return nil
 }
 
 // validOrigin reports whether origin can hint the delta base of an entry of kind.

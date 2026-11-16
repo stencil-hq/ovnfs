@@ -307,6 +307,14 @@ dep-info files, temporary files, most rlibs) in memory, while large outputs
 of being buffered whole and copied out later. 64 KiB measured 16% slower on a
 replayed cold cargo build: mid-sized rlibs then spill while being written.
 
+Writable upper indexes load on demand and expire after a minute without
+index-dependent access, checked every ten seconds. Registering a checkout,
+metadata queries and directory listings inspect only the requested paths.
+Opening an upper file or mutating the overlay loads the full index. Open host
+or memory handles, pending writes and staged I/O pin the index; cooling keeps
+rename hints and leaves files and exported identities unchanged. Frozen-layer
+metadata and simultaneously used upper indexes remain outside cache budgets.
+
 A base's per-path state is not in memory at all: lookups, listings and
 tracked-path facts read its `capture.idx` through a read-only mapping, whose
 pages the kernel shares with its file cache and can drop at any time. A path is

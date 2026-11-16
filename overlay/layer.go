@@ -67,12 +67,17 @@ func IndexUpper(dir string) (*Layer, error) { return indexLayer(dir, true) }
 
 // indexLayer also supports a live upper whose staging directory is private.
 func indexLayer(dir string, live bool) (*Layer, error) {
+	return walkLayer(dir, live, true, "")
+}
+
+// walkLayer can visit only a listing's ancestors and direct children.
+func walkLayer(dir string, live, recursive bool, listing string) (*Layer, error) {
 	root, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
 	}
 	l := &Layer{dir: root, entries: make(map[string]Entry), children: make(map[string]map[string]Entry)}
-	err = filepath.Walk(root, func(real string, info os.FileInfo, err error) error {
+	err = filepath.WalkDir(root, func(real string, item fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -81,6 +86,18 @@ func indexLayer(dir string, live bool) (*Layer, error) {
 			return err
 		}
 		p := Clean(rel)
+		// A shallow listing needs its ancestors, their markers and its own children.
+		if !recursive && p != "" && parent(p) != listing && p != listing && !strings.HasPrefix(listing, p+"/") &&
+			!strings.HasPrefix(path.Base(p), whPrefix) {
+			if item.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := item.Info()
+		if err != nil {
+			return err
+		}
 		if p == "" {
 			if !info.IsDir() {
 				return &fs.PathError{Op: "index", Path: root, Err: fs.ErrInvalid}
@@ -116,6 +133,9 @@ func indexLayer(dir string, live bool) (*Layer, error) {
 				return err
 			}
 			l.set(p, entry(info))
+			if info.IsDir() && !recursive && p != listing && !strings.HasPrefix(listing, p+"/") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if info.IsDir() {

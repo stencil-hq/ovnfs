@@ -236,10 +236,11 @@ func Open(c Config) (*Registry, error) {
 	}
 	phase("leftovers")
 	r.hasher = newHasher(r.storeLayers)
-	r.workers.Add(2)
+	r.workers.Add(3)
 	go r.collectGarbage()
 	go r.processNotices()
 	go r.emptyTrash()
+	go r.coolCheckouts()
 	// Without folder events, live paths are simply never delegated (see Tracked).
 	if r.watcher, err = watch.New(r.folderChanged); err == nil {
 		r.watchWake = make(chan struct{}, 1)
@@ -953,6 +954,32 @@ func (r *Registry) wakeNotices() {
 	select {
 	case r.noticeWake <- struct{}{}:
 	default:
+	}
+}
+
+// coolCheckouts drops upper indexes unused for a minute. It never retires a
+// checkout or invalidates handles, and never waits on one under r.mu.
+func (r *Registry) coolCheckouts() {
+	defer r.workers.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.stop:
+			return
+		case <-ticker.C:
+		}
+		var filesystems []*overlay.FS
+		r.mu.RLock()
+		for _, h := range r.checkouts {
+			if !h.retired.Load() {
+				filesystems = append(filesystems, h.fs)
+			}
+		}
+		r.mu.RUnlock()
+		for _, fs := range filesystems {
+			fs.Cool(time.Now().Add(-time.Minute))
+		}
 	}
 }
 
