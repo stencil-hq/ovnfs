@@ -168,7 +168,11 @@ func (f *FS) UpperFile(name string) (os.FileInfo, bool) {
 }
 
 // Stack returns an independent slice of immutable layers, top first.
-func (f *FS) Stack() []*Layer { return slices.Clone(f.layers) }
+func (f *FS) Stack() []*Layer {
+	f.mu.RLock() // [FS.Relayer] swaps entries
+	defer f.mu.RUnlock()
+	return slices.Clone(f.layers)
+}
 
 // Freeze transfers this upper's index to a frozen layer after the caller has
 // flushed it ([FS.Flush]), renamed the upper to dir and removed its work
