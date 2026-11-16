@@ -131,6 +131,18 @@ func (f *FS) Rebase(bottom Bottom) {
 	f.bottomEpoch++
 }
 
+// Relayer replaces frozen layer old with fresh, the same layer restored from its
+// metadata, without disturbing open files or inode identities.
+func (f *FS) Relayer(old, fresh *Layer) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, l := range f.layers {
+		if l == old {
+			f.layers[i] = fresh
+		}
+	}
+}
+
 // Upper returns the host directory receiving writes, or empty for read-only views.
 func (f *FS) Upper() string { return f.upper }
 
@@ -263,13 +275,14 @@ func (f *FS) lookup(p string) (source, os.FileInfo, error) {
 		}
 	}
 	for _, l := range f.layers {
-		if e, ok := l.entries[p]; ok {
+		v := l.view()
+		if e, ok := v.entries[p]; ok {
 			if e.Kind == KindWhiteout {
 				return source{}, nil, notExist("lstat", p)
 			}
 			return source{layer: l}, e.Info, nil
 		}
-		if l.barrier(p) {
+		if v.barrier(p) {
 			return source{}, nil, notExist("lstat", p)
 		}
 	}
@@ -286,7 +299,7 @@ func (f *FS) lookup(p string) (source, os.FileInfo, error) {
 // lowerHas detects a name in any immutable source, even if currently hidden.
 func (f *FS) lowerHas(p string) (bool, error) {
 	for _, l := range f.layers {
-		if e, ok := l.entries[p]; ok && e.Kind != KindWhiteout {
+		if e, ok := l.view().entries[p]; ok && e.Kind != KindWhiteout {
 			return true, nil
 		}
 	}
@@ -399,6 +412,7 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 	seen := make(map[string]bool)
 	out := make([]os.FileInfo, 0)
 	merge := func(l *Layer, upper bool) (bool, error) {
+		l = l.view()
 		e, present := l.entries[p]
 		if present && e.Kind != KindDir {
 			return true, nil
@@ -472,6 +486,7 @@ func (f *FS) bottomOnly(p string) bool {
 
 // untouched reports whether l has no entry, child or barrier for directory p.
 func (l *Layer) untouched(p string) bool {
+	l = l.view()
 	_, present := l.entries[p]
 	return !present && len(l.children[p]) == 0 && !l.barrier(p)
 }

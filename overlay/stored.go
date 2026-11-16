@@ -121,7 +121,7 @@ func (l *Layer) Tree() string {
 func (l *Layer) Blob(p string) (string, bool) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	id, ok := l.ids[p]
+	id, ok := l.view().ids[p]
 	return id, ok
 }
 
@@ -132,7 +132,7 @@ func (l *Layer) Blob(p string) (string, bool) {
 func (l *Layer) Content(p string, fn func(host, blob string) error) error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	if id, ok := l.ids[p]; ok {
+	if id, ok := l.view().ids[p]; ok {
 		return fn("", id)
 	}
 	return fn(filepath.Join(l.dir, filepath.FromSlash(p)), "")
@@ -154,14 +154,15 @@ func (l *Layer) readBlob(id string) ([]byte, error) {
 func (l *Layer) open(p, name string, flag int) (billy.File, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	if id, ok := l.ids[p]; ok {
+	v := l.view()
+	if id, ok := v.ids[p]; ok {
 		c, err := l.blobs.Open(id)
 		if err != nil {
 			return nil, err
 		}
 		return wrapContent(c, name), nil
 	}
-	if l.blobs != nil && l.entries[p].Kind == KindDir {
+	if l.blobs != nil && v.entries[p].Kind == KindDir {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
 	}
 	h, err := open(filepath.Join(l.dir, filepath.FromSlash(p)), name, flag, 0, nil)
@@ -453,32 +454,49 @@ func OpenLayer(dir string, blobs Blobs) (*Layer, error) {
 }
 
 // RestoreLayer loads compressed metadata persisted by the caller; raw entries
-// stay under dir, which need not exist when every entry is stored. It retains data.
+// stay under dir, which need not exist when every entry is stored. It retains
+// data, from which the index is decoded again once [Layer.Cool] drops it.
 func RestoreLayer(dir string, data []byte, blobs Blobs) (*Layer, error) {
 	root, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
 	}
-	reader := flate.NewReader(bytes.NewReader(data))
+	l := &Layer{dir: root, blobs: blobs, metadata: data}
+	v, err := l.decode()
+	if err != nil {
+		return nil, err
+	}
+	l.tree = v.tree
+	l.resident.Store(v)
+	return l, nil
+}
+
+// decode builds the index l's metadata describes. Hard-link groups keep their
+// numbers across decodes, so [sameStored] holds between them.
+func (l *Layer) decode() (*Layer, error) {
+	reader := flate.NewReader(bytes.NewReader(l.metadata))
 	defer reader.Close()
 	var m manifest
 	if err := json.NewDecoder(reader).Decode(&m); err != nil {
-		return nil, fmt.Errorf("overlay: layer manifest %s: %w", root, err)
+		return nil, fmt.Errorf("overlay: layer manifest %s: %w", l.dir, err)
 	}
 	if m.Version != manifestVersion {
-		return nil, fmt.Errorf("overlay: layer manifest in %s has version %d, want %d", root, m.Version, manifestVersion)
+		return nil, fmt.Errorf("overlay: layer manifest in %s has version %d, want %d", l.dir, m.Version, manifestVersion)
 	}
-	l := &Layer{dir: root, entries: make(map[string]Entry), children: make(map[string]map[string]Entry), blobs: blobs, ids: make(map[string]string), tree: m.Tree, metadata: data}
-	links := make(map[int]uint64)
+	if l.links == 0 {
+		n := uint64(len(m.Entries))
+		l.links = storedLinks.Add(n+1) - n
+	}
+	v := &Layer{dir: l.dir, entries: make(map[string]Entry), children: make(map[string]map[string]Entry), ids: make(map[string]string), tree: m.Tree}
 	for i, me := range m.Entries {
-		if err := l.load(i, me, links); err != nil {
-			return nil, fmt.Errorf("overlay: layer manifest in %s: %w", root, err)
+		if err := v.load(i, me, l.links); err != nil {
+			return nil, fmt.Errorf("overlay: layer manifest in %s: %w", l.dir, err)
 		}
 	}
-	if e, ok := l.entries[""]; !ok || e.Kind != KindDir {
-		return nil, fmt.Errorf("overlay: layer manifest in %s has no root directory", root)
+	if e, ok := v.entries[""]; !ok || e.Kind != KindDir {
+		return nil, fmt.Errorf("overlay: layer manifest in %s has no root directory", l.dir)
 	}
-	return l, nil
+	return v, nil
 }
 
 // Metadata returns immutable compressed layer metadata, or nil before Store;
@@ -519,7 +537,7 @@ func (l *Layer) RemoveMetadata() error {
 }
 
 // load indexes manifest entry i after its parent directory.
-func (l *Layer) load(i int, me manifestEntry, links map[int]uint64) error {
+func (l *Layer) load(i int, me manifestEntry, links uint64) error {
 	p := me.Path
 	if p != Clean(p) || reserved(p) {
 		return fmt.Errorf("invalid path %q", p)
@@ -551,10 +569,7 @@ func (l *Layer) load(i int, me manifestEntry, links map[int]uint64) error {
 		if me.Link < 1 || me.Link > i+1 {
 			return fmt.Errorf("%q links to entry %d", p, me.Link)
 		}
-		if links[me.Link] == 0 {
-			links[me.Link] = storedLinks.Add(1)
-		}
-		info.link = links[me.Link]
+		info.link = links + uint64(me.Link)
 	}
 	e := entry(info)
 	if e.Kind != me.Kind {
@@ -581,7 +596,7 @@ func (l *Layer) load(i int, me manifestEntry, links map[int]uint64) error {
 // whether the layer still holds raw entries.
 func (l *Layer) prune() bool {
 	l.mu.RLock()
-	ids := l.ids
+	ids := l.view().ids
 	l.mu.RUnlock()
 	_ = os.Remove(filepath.Join(l.dir, originsName))
 	_ = os.Remove(filepath.Join(l.dir, originsName+".tmp"))

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Bottom is the read-only filesystem beneath an overlay's immutable layers.
@@ -56,6 +57,13 @@ type Layer struct {
 	ids      map[string]string // path → blob id of a stored file's content or symlink's target
 	tree     string            // store tree reaching every stored blob; "" when none
 	metadata []byte            // immutable compressed metadata once stored
+
+	// A layer restored from metadata keeps its index only while used, see [Layer.view].
+	resident atomic.Pointer[Layer] // the index; nil while cold
+	loading  sync.Mutex            // serializes rebuilding resident
+	used     atomic.Bool           // set by view, cleared by [Layer.Cool]
+	idle     int                   // Cool calls since the last use; Cool's caller owns it
+	links    uint64                // base of this layer's hard-link group numbers
 }
 
 // IndexLayer indexes a frozen upper after its staging work directory is removed.
@@ -155,15 +163,15 @@ func walkLayer(dir string, live, recursive bool, listing string) (*Layer, error)
 func (l *Layer) Dir() string { return l.dir }
 
 // Get looks up a canonical overlay path without touching the filesystem.
-func (l *Layer) Get(p string) (Entry, bool) { e, ok := l.entries[Clean(p)]; return e, ok }
+func (l *Layer) Get(p string) (Entry, bool) { e, ok := l.view().entries[Clean(p)]; return e, ok }
 
 // Children returns an independent map of direct entries, including whiteouts.
-func (l *Layer) Children(p string) map[string]Entry { return maps.Clone(l.children[Clean(p)]) }
+func (l *Layer) Children(p string) map[string]Entry { return maps.Clone(l.view().children[Clean(p)]) }
 
 // GitEntries lists the paths of the layer's entries named .git, in no order. The
 // index keeps them as it changes, so the git adapter finds a checkout's gitfiles
 // without walking every entry.
-func (l *Layer) GitEntries() []string { return slices.Collect(maps.Keys(l.gits)) }
+func (l *Layer) GitEntries() []string { return slices.Collect(maps.Keys(l.view().gits)) }
 
 // Extract moves entry p, with everything below it, out of a layer that
 // [FS.Freeze] just returned and nothing reads yet, to the new host path dst.
@@ -183,6 +191,7 @@ func (l *Layer) Extract(p, dst string) error {
 
 // Walk visits entries in deterministic pre-order, including the root directory.
 func (l *Layer) Walk(fn func(p string, e Entry) error) error {
+	l = l.view()
 	var visit func(string) error
 	visit = func(p string) error {
 		if err := fn(p, l.entries[p]); err != nil {
@@ -245,6 +254,7 @@ func (l *Layer) drop(p string) {
 
 // barrier reports whether this layer prevents lookup in all deeper layers.
 func (l *Layer) barrier(p string) bool {
+	l = l.view()
 	for q := parent(p); ; q = parent(q) {
 		if e, ok := l.entries[q]; ok && (e.Kind != KindDir || e.Opaque) {
 			return true
@@ -252,5 +262,41 @@ func (l *Layer) barrier(p string) bool {
 		if q == "" {
 			return false
 		}
+	}
+}
+
+// view returns the layer holding the index: l itself, or the index a restored
+// layer decodes again from its metadata after [Layer.Cool] dropped it. Index
+// readers of a frozen layer use it; the index never changes once decoded.
+func (l *Layer) view() *Layer {
+	if l.entries != nil { // indexed directly; only a restored layer leaves entries nil
+		return l
+	}
+	if !l.used.Load() {
+		l.used.Store(true)
+	}
+	if v := l.resident.Load(); v != nil {
+		return v
+	}
+	l.loading.Lock()
+	defer l.loading.Unlock()
+	if v := l.resident.Load(); v != nil {
+		return v
+	}
+	v, err := l.decode()
+	if err != nil {
+		panic(err) // RestoreLayer decoded the same immutable metadata
+	}
+	l.resident.Store(v)
+	return v
+}
+
+// Cool drops a restored layer's index after checks calls without use in
+// between. One goroutine calls it; readers keep the index they hold.
+func (l *Layer) Cool(checks int) {
+	if l.used.Swap(false) {
+		l.idle = 0
+	} else if l.idle++; l.idle >= checks {
+		l.resident.Store(nil)
 	}
 }
