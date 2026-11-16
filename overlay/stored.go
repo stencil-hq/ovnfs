@@ -471,32 +471,73 @@ func RestoreLayer(dir string, data []byte, blobs Blobs) (*Layer, error) {
 	return l, nil
 }
 
-// decode builds the index l's metadata describes. Hard-link groups keep their
-// numbers across decodes, so [sameStored] holds between them.
+// decode builds the index l's metadata describes, one manifest entry at a time:
+// buffering the whole document and its entry slice cost several times the
+// index itself. Hard-link groups keep their numbers across decodes, so
+// [sameStored] holds between them.
 func (l *Layer) decode() (*Layer, error) {
 	reader := flate.NewReader(bytes.NewReader(l.metadata))
 	defer reader.Close()
+	if l.links == 0 {
+		l.links = storedLinks.Add(1) << 32
+	}
+	v := &Layer{dir: l.dir, entries: make(map[string]Entry), children: make(map[string]map[string]Entry), ids: make(map[string]string)}
 	var m manifest
-	if err := json.NewDecoder(reader).Decode(&m); err != nil {
+	if err := decodeManifest(reader, &m, func(i int, me manifestEntry) error { return v.load(i, me, l.links) }); err != nil {
 		return nil, fmt.Errorf("overlay: layer manifest %s: %w", l.dir, err)
 	}
 	if m.Version != manifestVersion {
 		return nil, fmt.Errorf("overlay: layer manifest in %s has version %d, want %d", l.dir, m.Version, manifestVersion)
 	}
-	if l.links == 0 {
-		n := uint64(len(m.Entries))
-		l.links = storedLinks.Add(n+1) - n
-	}
-	v := &Layer{dir: l.dir, entries: make(map[string]Entry), children: make(map[string]map[string]Entry), ids: make(map[string]string), tree: m.Tree}
-	for i, me := range m.Entries {
-		if err := v.load(i, me, l.links); err != nil {
-			return nil, fmt.Errorf("overlay: layer manifest in %s: %w", l.dir, err)
-		}
-	}
 	if e, ok := v.entries[""]; !ok || e.Kind != KindDir {
 		return nil, fmt.Errorf("overlay: layer manifest in %s has no root directory", l.dir)
 	}
+	v.tree = m.Tree
 	return v, nil
+}
+
+// decodeManifest reads m's fields and passes each entry to load instead of
+// keeping them; it stops before the entries of an unknown version.
+func decodeManifest(r io.Reader, m *manifest, load func(int, manifestEntry) error) error {
+	dec := json.NewDecoder(r)
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return errors.Join(err, errors.New("not an object"))
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "v":
+			err = dec.Decode(&m.Version)
+		case "r":
+			err = dec.Decode(&m.Tree)
+		case "e":
+			if m.Version != manifestVersion {
+				return nil
+			}
+			if _, err = dec.Token(); err != nil {
+				return err
+			}
+			for i := 0; err == nil && dec.More(); i++ {
+				var me manifestEntry
+				if err = dec.Decode(&me); err == nil {
+					err = load(i, me)
+				}
+			}
+			if err == nil {
+				_, err = dec.Token()
+			}
+		default:
+			var skip json.RawMessage
+			err = dec.Decode(&skip)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Metadata returns immutable compressed layer metadata, or nil before Store;
