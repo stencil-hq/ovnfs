@@ -10,6 +10,17 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Windows identity requires a handle query, so keep its existing path cache.
+const cachePathIDs = true
+
+func retainInfo(_ string, info os.FileInfo) os.FileInfo { return info }
+
+func layerEntries(dir string) ([]os.DirEntry, error) { return os.ReadDir(dir) }
+
+func layerInfo(dir, name string, info os.FileInfo) (os.FileInfo, error) {
+	return withMode(filepath.Join(dir, name), info)
+}
+
 // primeInfo makes raw Windows FileInfo independent of the path used by Lstat.
 func primeInfo(info os.FileInfo) error {
 	if info = rawInfo(info); os.SameFile(info, info) {

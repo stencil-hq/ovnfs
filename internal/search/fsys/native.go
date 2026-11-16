@@ -73,6 +73,10 @@ func ReadDir(path string) ([]os.DirEntry, error) {
 	return entries, nil
 }
 
+// AppleDouble reports macOS xattr sidecar names ("._name"). They remain
+// reachable by name for xattr writes, but exports and searches never list them.
+func AppleDouble(name string) bool { return strings.HasPrefix(name, "._") }
+
 // failedEntry is a listed entry whose metadata could not be read: its
 // listing type is known but Info reports why the stat failed.
 type failedEntry struct {

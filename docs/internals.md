@@ -316,6 +316,16 @@ runs. Tracking includes ancestor directories under the repository that answers
 their facts: a nested repository's root keeps its outer repository's tracking,
 while paths below it use the nested repository's facts.
 
+Writable uppers and raw frozen layers retain one metadata record per path.
+The directory-child index stores canonical paths, not another copy of each
+entry. Unix listings use the shared native basename/stat slabs, and metadata
+refreshed after writes copies the stat without retaining its absolute host path.
+Unix inode identities come from that stat instead of a second per-path map;
+Windows retains its handle-derived identity cache. Hard-link pairs keep both
+names inline and allocate an alias map only for larger groups. These indexes
+still scale with the number of upper paths; the file/blob cache budgets do not
+cap them, and removing files does not immediately return Go's heap to the OS.
+
 Small store blobs (at most 1 MiB) are served from a second budget
 (`--blob-cache`, default 16 MiB) instead of their object files. `ovnfs status` shows both. A
 crash or `kill -9` loses the files still in memory; `--memory 0` writes every

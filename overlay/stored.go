@@ -468,7 +468,7 @@ func RestoreLayer(dir string, data []byte, blobs Blobs) (*Layer, error) {
 	if m.Version != manifestVersion {
 		return nil, fmt.Errorf("overlay: layer manifest in %s has version %d, want %d", root, m.Version, manifestVersion)
 	}
-	l := &Layer{dir: root, entries: make(map[string]Entry), children: make(map[string]map[string]Entry), blobs: blobs, ids: make(map[string]string), tree: m.Tree, metadata: data}
+	l := &Layer{dir: root, entries: make(map[string]Entry), children: make(map[string]map[string]string), blobs: blobs, ids: make(map[string]string), tree: m.Tree, metadata: data}
 	links := make(map[int]uint64)
 	for i, me := range m.Entries {
 		if err := l.load(i, me, links); err != nil {

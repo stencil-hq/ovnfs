@@ -7,14 +7,13 @@ import (
 	"path"
 
 	"github.com/go-git/go-billy/v5"
-	"github.com/stencil-hq/ovnfs/overlay"
 )
 
 // FromOverlay lets daemon searches read a pinned checkout without its network mount.
 // The caller must keep the checkout session alive until every search worker exits.
-func FromOverlay(f *overlay.FS) FS { return &overlayFS{f: f} }
+func FromOverlay(f billy.Filesystem) FS { return &overlayFS{f: f} }
 
-type overlayFS struct{ f *overlay.FS }
+type overlayFS struct{ f billy.Filesystem }
 
 func (*overlayFS) Abs(root string) (string, error) { return path.Clean("/" + root), nil }
 func (f *overlayFS) NewSession() Session           { return &overlaySession{f: f.f} }
@@ -26,7 +25,7 @@ func (*overlayFS) Separator() byte                 { return '/' }
 func (*overlayFS) Workers() int { return 8 }
 
 type overlaySession struct {
-	f     *overlay.FS
+	f     billy.Filesystem
 	ls    Listing
 	files []billy.File
 	free  []uintptr
@@ -64,7 +63,7 @@ func (s *overlaySession) List(h Handle, detail Detail, _ uint32) (*Listing, erro
 	s.ls.reset()
 	for _, info := range entries {
 		typ := overlayType(info.Mode())
-		if typ == 0 || overlay.AppleDouble(info.Name()) {
+		if typ == 0 || AppleDouble(info.Name()) {
 			continue
 		}
 		size, mtime := int64(-1), int64(0)

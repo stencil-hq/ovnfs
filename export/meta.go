@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/stencil-hq/ovnfs/internal/search/fsys"
 	"github.com/stencil-hq/ovnfs/overlay"
 )
 
@@ -21,7 +22,7 @@ type nodeFS struct {
 	onRecall atomic.Pointer[func(id uint64)] // see Export.OnRecall
 }
 
-// ReadDir hides [overlay.AppleDouble] sidecars (fs::copy and cp copy their
+// ReadDir hides [fsys.AppleDouble] sidecars (fs::copy and cp copy their
 // xattrs too). They must stay creatable and reachable by name, or xattr
 // writes and therefore copies fail, but listing them would show tools like
 // git and cargo a file per real file. Symlinks are typed as by [nodeFS.Lstat].
@@ -49,7 +50,7 @@ func (n *nodeFS) ReadDir(name string) ([]os.FileInfo, error) {
 	}
 	out := infos[:0]
 	for _, info := range infos {
-		if overlay.AppleDouble(info.Name()) {
+		if fsys.AppleDouble(info.Name()) {
 			continue
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -297,7 +298,7 @@ func (n *nodeFS) dropAppleDouble(dir string) bool {
 		return false
 	}
 	for _, info := range infos {
-		if !overlay.AppleDouble(info.Name()) {
+		if !fsys.AppleDouble(info.Name()) {
 			return false
 		}
 	}

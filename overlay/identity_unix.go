@@ -5,8 +5,25 @@ package overlay
 import (
 	"io/fs"
 	"os"
+	"path"
 	"syscall"
+
+	"github.com/stencil-hq/ovnfs/internal/search/fsys"
 )
+
+// Unix stat records already contain identity; a second per-path map duplicates it.
+const cachePathIDs = false
+
+func layerEntries(dir string) ([]os.DirEntry, error) { return fsys.ReadDir(dir) }
+
+func layerInfo(_, _ string, info os.FileInfo) (os.FileInfo, error) { return info, nil }
+
+func retainInfo(p string, info os.FileInfo) os.FileInfo {
+	if p == "" {
+		return info
+	}
+	return fsys.RetainInfo(path.Base(p), info)
+}
 
 // primeInfo is unnecessary on Unix because Lstat already contains inode identity.
 func primeInfo(os.FileInfo) error { return nil }

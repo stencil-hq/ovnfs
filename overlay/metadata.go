@@ -8,25 +8,48 @@ import (
 // inodeKey identifies one host inode so hardlinked paths share metadata updates.
 type inodeKey struct{ device, inode uint64 }
 
-// inodeNames stores ordinary single-linked files without a per-file map allocation.
+// inodeNames keeps the common one- and two-link cases inline. A map is only
+// needed for the less common groups with three or more names.
 type inodeNames struct {
 	first  string
+	second string
 	others map[string]struct{}
 }
 
-// addIdentity records a name, allocating an alias set only for real hardlinks.
+// addIdentity records a name without allocating a map for a hard-link pair.
 func (f *FS) addIdentity(p string, key inodeKey) {
 	names := f.aliases[key]
 	if names.first == "" {
 		names.first = p
-	} else if names.first != p {
-		if names.others == nil {
-			names.others = make(map[string]struct{})
+	} else if names.first != p && names.second != p {
+		if names.second == "" {
+			names.second = p
+		} else {
+			if names.others == nil {
+				names.others = make(map[string]struct{})
+			}
+			names.others[p] = struct{}{}
 		}
-		names.others[p] = struct{}{}
 	}
 	f.aliases[key] = names
-	f.pathIDs[p] = key
+	if f.pathIDs != nil {
+		f.pathIDs[p] = key
+	}
+}
+
+// indexedIdentity uses the Unix stat already owned by the index. Windows
+// retains its cache because resolving a file id there needs a host handle.
+func (f *FS) indexedIdentity(p string) (inodeKey, bool) {
+	if f.pathIDs != nil {
+		key, ok := f.pathIDs[p]
+		return key, ok
+	}
+	e, ok := f.index.entries[p]
+	if !ok || e.Info == nil || e.Info.IsDir() {
+		return inodeKey{}, false
+	}
+	key, err := identity(f.upper, p, e.Info)
+	return key, err == nil
 }
 
 // track records one upper name's inode without reading or changing its metadata.
@@ -44,9 +67,15 @@ func (f *FS) track(p string, info os.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	if old, ok := f.pathIDs[p]; ok {
+	if old, ok := f.indexedIdentity(p); ok {
 		if old == key {
-			return nil
+			names := f.aliases[key]
+			if names.first == p || names.second == p {
+				return nil
+			}
+			if _, exists := names.others[p]; exists {
+				return nil
+			}
 		}
 		f.untrack(p)
 	}
@@ -56,21 +85,29 @@ func (f *FS) track(p string, info os.FileInfo) error {
 
 // untrack retires one upper name without retaining dead inode groups.
 func (f *FS) untrack(p string) {
-	key, ok := f.pathIDs[p]
+	key, ok := f.indexedIdentity(p)
 	if !ok {
 		return
 	}
 	delete(f.pathIDs, p)
 	names := f.aliases[key]
 	if names.first == p {
-		names.first = ""
+		names.first, names.second = names.second, ""
+	} else if names.second == p {
+		names.second = ""
+	} else {
+		delete(names.others, p)
+	}
+	if names.second == "" {
 		for other := range names.others {
-			names.first = other
+			if names.first == "" {
+				names.first = other
+			} else {
+				names.second = other
+			}
 			delete(names.others, other)
 			break
 		}
-	} else {
-		delete(names.others, p)
 	}
 	if names.first == "" {
 		delete(f.aliases, key)
@@ -84,8 +121,8 @@ func (f *FS) untrack(p string) {
 
 // dropIndex removes a subtree and all its hardlink bookkeeping together.
 func (f *FS) dropIndex(p string) {
-	for n := range f.index.children[p] {
-		f.dropIndex(path.Join(p, n))
+	for _, child := range f.index.children[p] {
+		f.dropIndex(child)
 	}
 	if m := f.files[p]; m != nil {
 		f.detach(m)
@@ -96,13 +133,16 @@ func (f *FS) dropIndex(p string) {
 
 // otherAlias finds a surviving name whose link count changes when p is removed.
 func (f *FS) otherAlias(p string) string {
-	key, ok := f.pathIDs[p]
+	key, ok := f.indexedIdentity(p)
 	if !ok {
 		return ""
 	}
 	names := f.aliases[key]
 	if names.first != p {
 		return names.first
+	}
+	if names.second != "" {
+		return names.second
 	}
 	for other := range names.others {
 		return other
@@ -112,7 +152,7 @@ func (f *FS) otherAlias(p string) string {
 
 // moveIdentity temporarily registers a renamed path before the old name retires.
 func (f *FS) moveIdentity(from, to string) {
-	if key, ok := f.pathIDs[from]; ok {
+	if key, ok := f.indexedIdentity(from); ok {
 		f.addIdentity(to, key)
 	}
 }
@@ -135,17 +175,18 @@ func (f *FS) restat(p string) error {
 
 // setInfo indexes upper name p's metadata, keeping its opacity.
 func (f *FS) setInfo(p string, info os.FileInfo) {
-	e := entry(info)
+	e := entry(retainInfo(p, info))
 	e.Opaque = f.index.entries[p].Opaque
 	f.index.set(p, e)
 }
 
 // cacheInfo stores a fresh snapshot and shares it with other names of the same inode.
 func (f *FS) cacheInfo(p string, info os.FileInfo) error {
-	f.setInfo(p, info)
+	// Track before replacing the old stat so inode replacement retires its old group.
 	if err := f.track(p, info); err != nil {
 		return err
 	}
+	f.setInfo(p, info)
 	f.cacheAliases(p, info)
 	return nil
 }
@@ -154,13 +195,16 @@ func (f *FS) cacheInfo(p string, info os.FileInfo) error {
 // names share one inode, so only the name differs; re-reading each would cost
 // a host lstat per link on every metadata change.
 func (f *FS) cacheAliases(p string, info os.FileInfo) {
-	key, ok := f.pathIDs[p]
+	key, ok := f.indexedIdentity(p)
 	if !ok {
 		return
 	}
 	names := f.aliases[key]
 	if names.first != p {
 		f.setInfo(names.first, aliasInfo{FileInfo: info, name: path.Base(names.first)})
+	}
+	if names.second != "" && names.second != p {
+		f.setInfo(names.second, aliasInfo{FileInfo: info, name: path.Base(names.second)})
 	}
 	for other := range names.others {
 		if other != p {
@@ -190,7 +234,7 @@ func unalias(info os.FileInfo) os.FileInfo {
 // bind associates an open descriptor with its inode, not its current name; a
 // writable one makes the inode's indexed metadata volatile until it closes.
 func (f *FS) bind(h *file, p string) {
-	h.inode, h.tracked = f.pathIDs[p]
+	h.inode, h.tracked = f.indexedIdentity(p)
 	if h.writable && h.tracked {
 		f.writers[h.inode]++
 	}

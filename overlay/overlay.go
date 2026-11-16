@@ -68,7 +68,9 @@ func New(upper string, layers []*Layer, bottom Bottom, mem *Memory) (*FS, error)
 	if upper == "" {
 		return f, nil
 	}
-	f.pathIDs = make(map[string]inodeKey)
+	if cachePathIDs {
+		f.pathIDs = make(map[string]inodeKey)
+	}
 	f.aliases = make(map[inodeKey]inodeNames)
 	if mem != nil {
 		f.mem, f.files = mem, make(map[string]*memFile)
@@ -377,7 +379,8 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 		if present && e.Kind != KindDir {
 			return true, nil
 		}
-		for n, c := range l.children[p] {
+		for n, child := range l.children[p] {
+			c := l.entries[child]
 			if seen[n] {
 				continue
 			}
@@ -386,11 +389,11 @@ func (f *FS) readDir(p string) ([]os.FileInfo, error) {
 				continue
 			}
 			ci := c.Info
-			if m := f.files[path.Join(p, n)]; upper && m != nil {
+			if m := f.files[child]; upper && m != nil {
 				ci = m.info(n)
 			} else if upper {
 				var err error
-				ci, err = f.upperInfo(path.Join(p, n), c)
+				ci, err = f.upperInfo(child, c)
 				if err != nil {
 					return false, err
 				}
@@ -1044,8 +1047,8 @@ func (f *FS) Rename(from, to string) error {
 			delete(f.files, a)
 			f.files[b], m.path = m, b
 		}
-		for n := range f.index.children[a] {
-			move(path.Join(a, n), path.Join(b, n))
+		for n, child := range f.index.children[a] {
+			move(child, path.Join(b, n))
 		}
 	}
 	f.dropIndex(dst)
@@ -1445,7 +1448,7 @@ func (f *FS) upperInfo(p string, e Entry) (os.FileInfo, error) {
 	if e.Kind == KindDir {
 		return e.Info, nil
 	}
-	if key, ok := f.pathIDs[p]; ok && f.writers[key] == 0 {
+	if key, ok := f.indexedIdentity(p); ok && f.writers[key] == 0 {
 		return e.Info, nil
 	}
 	return lstatIndexed(f.up(p), e.Info)
@@ -1576,12 +1579,6 @@ func (f *file) syncInfo() {
 		_ = f.fs.restat(p)
 	}
 }
-
-// AppleDouble reports macOS xattr sidecar names ("._name"). Clients without
-// native xattrs store xattrs in such files, and the macOS kernel tags every
-// new file with com.apple.provenance, so exports keep them reachable by name
-// but never list them, and searches skip them.
-func AppleDouble(name string) bool { return strings.HasPrefix(name, "._") }
 
 // Clean canonicalizes a path to slash-separated root-relative form.
 func Clean(p string) string {

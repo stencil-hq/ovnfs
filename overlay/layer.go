@@ -48,14 +48,14 @@ type Entry struct {
 type Layer struct {
 	dir      string
 	entries  map[string]Entry
-	children map[string]map[string]Entry
-	gits     map[string]bool   // paths of entries named .git, see [Layer.GitEntries]
-	storing  sync.Mutex        // serializes [Layer.Store]
-	mu       sync.RWMutex      // guards blobs, ids and tree; held shared while raw files are read, see [Layer.Content]
-	blobs    Blobs             // nil while every entry is raw
-	ids      map[string]string // path → blob id of a stored file's content or symlink's target
-	tree     string            // store tree reaching every stored blob; "" when none
-	metadata []byte            // immutable compressed metadata once stored
+	children map[string]map[string]string // child name → canonical path; metadata lives only in entries
+	gits     map[string]bool              // paths of entries named .git, see [Layer.GitEntries]
+	storing  sync.Mutex                   // serializes [Layer.Store]
+	mu       sync.RWMutex                 // guards blobs, ids and tree; held shared while raw files are read, see [Layer.Content]
+	blobs    Blobs                        // nil while every entry is raw
+	ids      map[string]string            // path → blob id of a stored file's content or symlink's target
+	tree     string                       // store tree reaching every stored blob; "" when none
+	metadata []byte                       // immutable compressed metadata once stored
 }
 
 // IndexLayer indexes a frozen upper after its staging work directory is removed.
@@ -71,59 +71,68 @@ func indexLayer(dir string, live bool) (*Layer, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Layer{dir: root, entries: make(map[string]Entry), children: make(map[string]map[string]Entry)}
-	err = filepath.Walk(root, func(real string, info os.FileInfo, err error) error {
+	info, err := os.Lstat(root)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, &fs.PathError{Op: "index", Path: root, Err: fs.ErrInvalid}
+	}
+	info, err = withMode(root, info)
+	if err != nil {
+		return nil, err
+	}
+	l := &Layer{dir: root, entries: make(map[string]Entry), children: make(map[string]map[string]string)}
+	l.set("", entry(info))
+	// Native listings own compact basename/stat slabs. filepath.Walk's per-file
+	// Lstat objects instead retain every full upper path for the layer's lifetime.
+	var walk func(string, string) error
+	walk = func(real, parentPath string) error {
+		items, err := layerEntries(real)
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(root, real)
-		if err != nil {
-			return err
-		}
-		p := Clean(rel)
-		if p == "" {
-			if !info.IsDir() {
-				return &fs.PathError{Op: "index", Path: root, Err: fs.ErrInvalid}
-			}
-			if info, err = withMode(real, info); err != nil {
+		for _, item := range items {
+			info, err := item.Info()
+			if err != nil {
 				return err
 			}
-			l.set(p, entry(info))
-			return nil
-		}
-		n := info.Name()
-		switch {
-		case n == workName:
-			if !live || parent(p) != "" {
-				return fmt.Errorf("overlay: staging directory remains in layer: %s", real)
+			n := item.Name()
+			p := path.Join(parentPath, n)
+			switch {
+			case n == workName:
+				if !live || parentPath != "" {
+					return fmt.Errorf("overlay: staging directory remains in layer: %s", filepath.Join(real, n))
+				}
+				if !info.IsDir() {
+					return fmt.Errorf("overlay: staging path is not a directory: %s", filepath.Join(real, n))
+				}
+			case n == opaqueName:
+				e := l.entries[parentPath]
+				e.Opaque = true
+				l.set(parentPath, e)
+			case strings.HasPrefix(n, metaPrefix):
+			case strings.HasPrefix(n, whPrefix):
+				q := path.Join(parentPath, strings.TrimPrefix(n, whPrefix))
+				if _, ok := l.entries[q]; !ok {
+					l.set(q, Entry{Kind: KindWhiteout})
+				}
+			default:
+				info, err = layerInfo(real, n, info)
+				if err != nil {
+					return err
+				}
+				l.set(p, entry(retainInfo(p, info)))
+				if info.IsDir() {
+					if err := walk(filepath.Join(real, n), p); err != nil {
+						return err
+					}
+				}
 			}
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return fmt.Errorf("overlay: staging path is not a directory: %s", real)
-		case n == opaqueName:
-			e := l.entries[parent(p)]
-			e.Opaque = true
-			l.set(parent(p), e)
-		case strings.HasPrefix(n, metaPrefix):
-		case strings.HasPrefix(n, whPrefix):
-			q := path.Join(parent(p), strings.TrimPrefix(n, whPrefix))
-			if _, ok := l.entries[q]; !ok {
-				l.set(q, Entry{Kind: KindWhiteout})
-			}
-		default:
-			if info, err = withMode(real, info); err != nil {
-				return err
-			}
-			l.set(p, entry(info))
-			return nil
-		}
-		if info.IsDir() {
-			return filepath.SkipDir
 		}
 		return nil
-	})
-	if err == nil {
+	}
+	if err = walk(root, ""); err == nil {
 		err = l.loadOrigins()
 	}
 	return l, err
@@ -138,7 +147,14 @@ func (l *Layer) Dir() string { return l.dir }
 func (l *Layer) Get(p string) (Entry, bool) { e, ok := l.entries[Clean(p)]; return e, ok }
 
 // Children returns an independent map of direct entries, including whiteouts.
-func (l *Layer) Children(p string) map[string]Entry { return maps.Clone(l.children[Clean(p)]) }
+func (l *Layer) Children(p string) map[string]Entry {
+	children := l.children[Clean(p)]
+	out := make(map[string]Entry, len(children))
+	for name, child := range children {
+		out[name] = l.entries[child]
+	}
+	return out
+}
 
 // GitEntries lists the paths of the layer's entries named .git, in no order. The
 // index keeps them as it changes, so the git adapter finds a checkout's gitfiles
@@ -169,7 +185,7 @@ func (l *Layer) Walk(fn func(p string, e Entry) error) error {
 			return err
 		}
 		for _, n := range slices.Sorted(maps.Keys(l.children[p])) {
-			if err := visit(path.Join(p, n)); err != nil {
+			if err := visit(l.children[p][n]); err != nil {
 				return err
 			}
 		}
@@ -204,16 +220,16 @@ func (l *Layer) set(p string, e Entry) {
 	if p != "" {
 		d := parent(p)
 		if l.children[d] == nil {
-			l.children[d] = make(map[string]Entry)
+			l.children[d] = make(map[string]string)
 		}
-		l.children[d][path.Base(p)] = e
+		l.children[d][path.Base(p)] = p
 	}
 }
 
 // drop removes a mutable upper subtree from both indexes.
 func (l *Layer) drop(p string) {
-	for n := range l.children[p] {
-		l.drop(path.Join(p, n))
+	for _, child := range l.children[p] {
+		l.drop(child)
 	}
 	delete(l.children, p)
 	delete(l.entries, p)

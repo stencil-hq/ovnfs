@@ -7,14 +7,27 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 // Unix files hold their mode natively; see mode_windows.go for hosts that cannot.
 
-// sameFile is [os.SameFile] for metadata that may carry an alias name.
-func sameFile(a, b os.FileInfo) bool { return os.SameFile(unalias(a), unalias(b)) }
+// sameFile accepts native directory metadata as well as os.Lstat records.
+// Stored layers use their own link groups: historical inode numbers can be reused.
+func sameFile(a, b os.FileInfo) bool {
+	a, b = unalias(a), unalias(b)
+	if _, stored := a.(storedInfo); stored {
+		return false
+	}
+	if _, stored := b.(storedInfo); stored {
+		return false
+	}
+	x, ok := a.Sys().(*syscall.Stat_t)
+	y, ok2 := b.Sys().(*syscall.Stat_t)
+	return ok && ok2 && x != nil && y != nil && x.Dev == y.Dev && x.Ino == y.Ino
+}
 
 // hostLstat is [os.Lstat].
 func hostLstat(name string) (os.FileInfo, error) { return os.Lstat(name) }

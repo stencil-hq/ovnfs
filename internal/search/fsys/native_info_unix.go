@@ -22,6 +22,20 @@ type nativeInfo struct {
 	st   syscall.Stat_t
 }
 
+// RetainInfo detaches host metadata from the absolute path os.Lstat keeps
+// behind Name. The caller already owns name; the native stat is copied so
+// its interior pointer cannot keep the original os.FileInfo alive.
+func RetainInfo(name string, info os.FileInfo) os.FileInfo {
+	if _, ok := info.(*nativeInfo); ok {
+		return info
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return info
+	}
+	return &nativeInfo{name: name, mode: info.Mode(), mod: info.ModTime(), st: *st}
+}
+
 // ChangeTime returns the status change time, in Unix nanoseconds, of the
 // entry at path that info describes (its [os.Lstat] data or a [ReadDir]
 // entry's Info). Content, metadata and renames move it, and unlike the mtime
