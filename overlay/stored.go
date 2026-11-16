@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -483,11 +484,15 @@ func (l *Layer) decode() (*Layer, error) {
 	}
 	v := &Layer{dir: l.dir, entries: make(map[string]Entry), children: make(map[string]map[string]Entry), ids: make(map[string]string)}
 	var m manifest
-	if err := decodeManifest(reader, &m, func(i int, me manifestEntry) error { return v.load(i, me, l.links) }); err != nil {
+	loadErr, err := decodeManifest(reader, &m, func(i int, me manifestEntry) error { return v.load(i, me, l.links) })
+	if err != nil {
 		return nil, fmt.Errorf("overlay: layer manifest %s: %w", l.dir, err)
 	}
 	if m.Version != manifestVersion {
 		return nil, fmt.Errorf("overlay: layer manifest in %s has version %d, want %d", l.dir, m.Version, manifestVersion)
+	}
+	if loadErr != nil {
+		return nil, fmt.Errorf("overlay: layer manifest in %s: %w", l.dir, loadErr)
 	}
 	if e, ok := v.entries[""]; !ok || e.Kind != KindDir {
 		return nil, fmt.Errorf("overlay: layer manifest in %s has no root directory", l.dir)
@@ -496,48 +501,61 @@ func (l *Layer) decode() (*Layer, error) {
 	return v, nil
 }
 
-// decodeManifest reads m's fields and passes each entry to load instead of
-// keeping them; it stops before the entries of an unknown version.
-func decodeManifest(r io.Reader, m *manifest, load func(int, manifestEntry) error) error {
+// decodeManifest reads m's fields in any order, case-insensitively as
+// encoding/json does, and passes each entry to load instead of keeping them.
+// The containers must close. Entries of a version already known to differ are
+// not loaded; loadErr is the first load failure.
+func decodeManifest(r io.Reader, m *manifest, load func(int, manifestEntry) error) (loadErr, err error) {
 	dec := json.NewDecoder(r)
-	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
-		return errors.Join(err, errors.New("not an object"))
+	if err := delim(dec, '{'); err != nil {
+		return nil, err
 	}
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		switch key {
-		case "v":
+		name, _ := key.(string)
+		switch {
+		case strings.EqualFold(name, "v"):
 			err = dec.Decode(&m.Version)
-		case "r":
+		case strings.EqualFold(name, "r"):
 			err = dec.Decode(&m.Tree)
-		case "e":
-			if m.Version != manifestVersion {
-				return nil
+		case strings.EqualFold(name, "e"):
+			var t json.Token
+			if t, err = dec.Token(); err != nil || t == nil { // null: no entries
+				break
 			}
-			if _, err = dec.Token(); err != nil {
-				return err
+			if t != json.Delim('[') {
+				return nil, errors.New("entries are not an array")
 			}
 			for i := 0; err == nil && dec.More(); i++ {
 				var me manifestEntry
-				if err = dec.Decode(&me); err == nil {
-					err = load(i, me)
+				if err = dec.Decode(&me); err == nil && loadErr == nil && (m.Version == 0 || m.Version == manifestVersion) {
+					loadErr = load(i, me)
 				}
 			}
 			if err == nil {
-				_, err = dec.Token()
+				err = delim(dec, ']')
 			}
 		default:
 			var skip json.RawMessage
 			err = dec.Decode(&skip)
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return loadErr, delim(dec, '}')
+}
+
+// delim reads the next token, which must be d.
+func delim(dec *json.Decoder, d json.Delim) error {
+	t, err := dec.Token()
+	if err == nil && t != d {
+		err = fmt.Errorf("want %v, got %v", d, t)
+	}
+	return err
 }
 
 // Metadata returns immutable compressed layer metadata, or nil before Store;
