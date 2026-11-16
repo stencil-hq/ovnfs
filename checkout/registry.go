@@ -963,13 +963,13 @@ func (r *Registry) coolCheckouts() {
 	defer r.workers.Done()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	var filesystems []*overlay.FS
 	for {
 		select {
 		case <-r.stop:
 			return
 		case <-ticker.C:
 		}
-		var filesystems []*overlay.FS
 		r.mu.RLock()
 		for _, h := range r.checkouts {
 			if !h.retired.Load() {
@@ -977,9 +977,12 @@ func (r *Registry) coolCheckouts() {
 			}
 		}
 		r.mu.RUnlock()
+		before := time.Now().Add(-time.Minute)
 		for _, fs := range filesystems {
-			fs.Cool(time.Now().Add(-time.Minute))
+			fs.Cool(before)
 		}
+		clear(filesystems) // keep no retired checkout's FS alive between ticks
+		filesystems = filesystems[:0]
 	}
 }
 
