@@ -16,8 +16,9 @@ import (
 // the user's repository: HEAD, refs, config and the index are copies taken at
 // capture, and "objects" links to an object directory shared by every checkout on
 // same base, which borrows the user's objects through alternates. Commits
-// made in a checkout land there; the user's repository is never written,
-// except for checkout remotes (see SetCheckoutRemotes).
+// made in a checkout land there; ovnfs never writes the user's repository,
+// except for checkout remotes (see SetCheckoutRemotes). A checkout whose "hooks"
+// links to the repository's own (see LinkHooks) writes there through it.
 
 // PrepareObjects creates a base's shared object directory that reads the repository's objects through alternates.
 func (r *Repo) PrepareObjects(dir string) error {
@@ -113,6 +114,36 @@ func (r *Repo) MakeGitdir(gitdir, objects, index string) error {
 		}
 	}
 	return hostfile.Symlink(objects, filepath.Join(gitdir, "objects"))
+}
+
+// LinkHooks links gitdir's hooks to the repository's, so git finds the hooks a
+// linked work tree of the repository would. It leaves gitdir alone when gitdir
+// already has a hooks entry, such as the real directory of a submodule cloned
+// inside a checkout. When the repository's hooks are gone, are not a directory
+// or can never resolve (a symlink loop, a path through a file), it links nothing
+// and removes gitdir's hooks entry if that is exactly the link LinkHooks made to
+// it before; any other entry stays. When the hooks cannot be examined (a
+// permission or I/O error) it changes nothing: a link must not go on a failure
+// that may pass.
+func (r *Repo) LinkHooks(gitdir string) error {
+	hooks := filepath.Join(r.CommonDir, "hooks")
+	link := filepath.Join(gitdir, "hooks")
+	info, err := os.Stat(hooks)
+	if err != nil && !errors.Is(err, os.ErrNotExist) && !hostfile.Unresolvable(err) {
+		return nil
+	}
+	if err != nil || !info.IsDir() {
+		if target, err := os.Readlink(link); err == nil && target == hooks {
+			return os.Remove(link)
+		}
+		return nil
+	}
+	if _, err := os.Lstat(link); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return hostfile.Symlink(hooks, link)
 }
 
 // UnsetModuleWorktrees removes core.worktree from every submodule git directory
