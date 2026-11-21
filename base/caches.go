@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/stencil-hq/ovnfs/internal/clone"
 	"github.com/stencil-hq/ovnfs/internal/hostfile"
+	"github.com/stencil-hq/ovnfs/internal/lowprio"
 	"github.com/stencil-hq/ovnfs/internal/search/fsys"
 	"github.com/stencil-hq/ovnfs/rules"
 )
@@ -277,10 +279,10 @@ func (b *Base) served() []*Caches {
 	return served
 }
 
-// take copies b's local roots into the snapshot: first the roots that are no
-// directory, quickly, so listings can present every root, then the directory
-// roots. A root is taken while every ancestor in the folder is a real
-// directory, so a symlink in the folder cannot pull outside content in.
+// take runs in its own goroutine. It copies b's local roots into the snapshot:
+// first the roots that are no directory, quickly, so listings can present
+// every root, then the directory roots. A root is taken while every ancestor
+// in the folder is a real directory, so a symlink cannot pull in outside content.
 func (c *Caches) take(b *Base) {
 	defer b.config.Stats.Job("snapshot.take", c.id+" of "+b.meta.Dir).End()
 	roots := make(map[string]cacheRoot)
@@ -323,9 +325,21 @@ func (c *Caches) take(b *Base) {
 			return
 		}
 		defer func() { <-takeSlots }()
+		if b.stoppingTakes() {
+			return
+		}
+		if runtime.GOOS == "darwin" {
+			// APFS directory clones and timestamp restoration can issue a
+			// burst of metadata writes. Let macOS favor foreground I/O.
+			// The demoted thread exits with this goroutine, not into Go's pool.
+			runtime.LockOSThread()
+			if err := lowprio.Thread(); err != nil {
+				runtime.UnlockOSThread()
+				b.fault("lower the priority of local directory copies: " + err.Error())
+			}
+		}
 		for _, p := range dirs {
-			// Check again after admission: the slot and stop can be ready
-			// together. An unfinished take must not write rootsFile.
+			// Incomplete takes must not write rootsFile.
 			if b.stoppingTakes() {
 				return
 			}

@@ -318,6 +318,10 @@ identities. On macOS and Linux a snapshot holds its `tree/` open and resolves
 lookups relative to it (`fstatat`, `openat`, `readlinkat`), so the kernel
 does not walk the dozen components of the snapshot's absolute path each time.
 
+On macOS, local directory copies use background I/O priority. APFS keeps the
+access times, so the timestamp pass only restores modification times and
+skips empty directories whose modification time already matches.
+
 **Cache roots are not copied.** A clone of one is cheap to make and dear to
 unmake: `clonefile(2)` takes 10 µs an entry and the unlink that undoes it 45
 µs, per entry of every root, for every snapshot, whatever its checkouts read
