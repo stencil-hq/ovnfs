@@ -11,7 +11,7 @@ func TestServeOptions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	for _, name := range []string{"OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC", "OVNFS_NFS_IO_SIZE"} {
+	for _, name := range []string{"OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC", "OVNFS_NFS_IO_SIZE", "OVNFS_NFS_NOINTR"} {
 		t.Setenv(name, "")
 	}
 	parse := func(args ...string) (serveCmd, error) {
@@ -26,7 +26,7 @@ func TestServeOptions(t *testing.T) {
 	}
 
 	cmd, err := parse()
-	if err != nil || cmd.Proto != defaultProto() || cmd.Memory != 64<<20 || cmd.BlobCache != 16<<20 || cmd.Atime || cmd.Fsync {
+	if err != nil || cmd.Proto != defaultProto() || cmd.Memory != 64<<20 || cmd.BlobCache != 16<<20 || cmd.Atime || cmd.Fsync || cmd.NFSNoIntr {
 		t.Fatalf("defaults: %+v, %v", cmd, err)
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".o2"), 0o755); err != nil {
@@ -39,22 +39,23 @@ func TestServeOptions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writeConfig("proto: smb\nmemory: 3G\nblob_cache: 128M\nfsync: true\natime: true\n")
+	writeConfig("proto: smb\nmemory: 3G\nblob_cache: 128M\nfsync: true\natime: true\nnfs_nointr: true\n")
 	cmd, err = parse()
-	if err != nil || cmd.Proto != "smb" || cmd.Memory != 3<<30 || cmd.BlobCache != 128<<20 || !cmd.Fsync || !cmd.Atime {
+	if err != nil || cmd.Proto != "smb" || cmd.Memory != 3<<30 || cmd.BlobCache != 128<<20 || !cmd.Fsync || !cmd.Atime || !cmd.NFSNoIntr {
 		t.Fatalf("user config: %+v, %v", cmd, err)
 	}
-	writeConfig("proto: nfs\nmemory: 0\nblob_cache: 0\nfsync: false\natime: false\n")
+	writeConfig("proto: nfs\nmemory: 0\nblob_cache: 0\nfsync: false\natime: false\nnfs_nointr: false\n")
 	cmd, err = parse()
-	if err != nil || cmd.Proto != "nfs" || cmd.Memory != 0 || cmd.BlobCache != 0 || cmd.Fsync || cmd.Atime {
+	if err != nil || cmd.Proto != "nfs" || cmd.Memory != 0 || cmd.BlobCache != 0 || cmd.Fsync || cmd.Atime || cmd.NFSNoIntr {
 		t.Fatalf("zero user config: %+v, %v", cmd, err)
 	}
 	t.Setenv("OVNFS_MEMORY", "2G")
 	t.Setenv("OVNFS_BLOB_CACHE", "64MiB")
 	t.Setenv("OVNFS_ATIME", "1")
 	t.Setenv("OVNFS_FSYNC", "1")
+	t.Setenv("OVNFS_NFS_NOINTR", "1")
 	cmd, err = parse()
-	if err != nil || cmd.Proto != "nfs" || cmd.Memory != 2<<30 || cmd.BlobCache != 64<<20 || !cmd.Atime || !cmd.Fsync {
+	if err != nil || cmd.Proto != "nfs" || cmd.Memory != 2<<30 || cmd.BlobCache != 64<<20 || !cmd.Atime || !cmd.Fsync || !cmd.NFSNoIntr {
 		t.Fatalf("environment: %+v, %v", cmd, err)
 	}
 	writeConfig("proto: nfs\nmemory: 3G\nblob_cache: 128M\nfsync: true\natime: true\n")
@@ -71,8 +72,8 @@ func TestServeOptions(t *testing.T) {
 	t.Setenv("OVNFS_FSYNC", "1")
 	t.Setenv("OVNFS_ATIME", "1")
 	t.Setenv("OVNFS_NFS_IO_SIZE", "256K")
-	cmd, err = parse("--memory", "0", "--blob-cache", "0", "--proto", "smb", "--fsync=false", "--atime=false", "--nfs-io-size", "64K", "--listen", "localhost:1234")
-	if err != nil || cmd.Memory != 0 || cmd.BlobCache != 0 || cmd.Proto != "smb" || cmd.Fsync || cmd.Atime || cmd.NFSIOSize != 64<<10 || cmd.Listen != "localhost:1234" {
+	cmd, err = parse("--memory", "0", "--blob-cache", "0", "--proto", "smb", "--fsync=false", "--atime=false", "--nfs-io-size", "64K", "--nfs-nointr=false", "--listen", "localhost:1234")
+	if err != nil || cmd.Memory != 0 || cmd.BlobCache != 0 || cmd.Proto != "smb" || cmd.Fsync || cmd.Atime || cmd.NFSIOSize != 64<<10 || cmd.NFSNoIntr || cmd.Listen != "localhost:1234" {
 		t.Fatalf("flags: %+v, %v", cmd, err)
 	}
 	t.Setenv("OVNFS_FSYNC", "false")

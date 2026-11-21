@@ -133,9 +133,14 @@ A soft NFS mount trades waiting for errors; it is not a repair for a dead
 server. A timed-out request can report `ETIMEDOUT` on macOS or `EIO` with
 Linux `soft`. It does not prove a write had no effect: files may be only
 partly updated. A failed page-in of a mapped file can deliver `SIGBUS`
-instead of a recoverable I/O error. On macOS even the default `intr`
-mount can do this if a signal interrupts a page-in. Keep executables and
-native libraries on a local filesystem if they must survive a mount outage.
+instead of a recoverable I/O error. On macOS, a signal that interrupts a
+page-in on the default `intr` mount can do the same ([#101](https://github.com/stencil-hq/ovnfs/issues/101)).
+With [`nfs_nointr`](configuration.md#where-the-daemon-lives), a signal no
+longer aborts that wait with `EINTR`. I/O can block indefinitely even after
+Ctrl-C if the daemon cannot reply. This does not protect against a lost
+mount or other page-in errors such as the `ENXIO` reported during daemon
+handover. To avoid depending on the mount, keep both executables and native
+libraries on a local filesystem; writes there are not checkout-isolated.
 
 ## FUSE
 

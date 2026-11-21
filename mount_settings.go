@@ -8,6 +8,7 @@ const defaultNFSIOSize = 128 << 10
 type mountSettings struct {
 	Atime     bool
 	NFSIOSize int
+	NFSNoIntr bool
 }
 
 func (s mountSettings) nfsIOSize() int {

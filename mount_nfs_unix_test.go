@@ -14,11 +14,13 @@ func TestNFSMountMismatch(t *testing.T) {
 			"Original mount options": {"NFS parameters": ["rsize=1048576", "wsize=1048576"]},
 			"Current mount parameters": {
 				"General mount flags": {"Flags": ["noatime", "nobrowse", "nodev", "nosuid"]},
-				"NFS parameters": ["vers=3", "ticotsord", "port=/state/nfs.sock", "mountport=/state/nfs.sock", "intr", "locallocks", "rsize=131072", "wsize=131072", "readahead=16"]
+				"NFS parameters": ["vers=3", "ticotsord", "port=/state/nfs.sock", "mountport=/state/nfs.sock", "hard", "intr", "locallocks", "rsize=131072", "wsize=131072", "readahead=16"]
 			}
 		}
 	}`
 	const options = "vers=3,port=/state/nfs.sock,mountport=/state/nfs.sock,locallocks,nobrowse,intr,rwsize=131072,noatime"
+	noIntrReport := strings.Replace(report, `"intr"`, `"nointr"`, 1)
+	noIntrOptions := strings.Replace(options, ",intr,", ",hard,nointr,", 1)
 	for _, tc := range []struct {
 		name, data, options, mismatch string
 		badReport                     bool
@@ -27,6 +29,10 @@ func TestNFSMountMismatch(t *testing.T) {
 		{name: "read size", data: strings.Replace(report, "rsize=131072", "rsize=1048576", 1), options: options, mismatch: "rsize="},
 		{name: "write size", data: strings.Replace(report, "wsize=131072", "wsize=1048576", 1), options: options, mismatch: "wsize="},
 		{name: "missing required flag", data: strings.Replace(report, `"intr",`, "", 1), options: options, mismatch: "intr"},
+		{name: "keeps hard nointr mount", data: noIntrReport, options: noIntrOptions},
+		{name: "enabling nointr replaces interruptible mount", data: report, options: noIntrOptions, mismatch: "missing nointr"},
+		{name: "disabling nointr replaces non-interruptible mount", data: noIntrReport, options: options, mismatch: "missing intr"},
+		{name: "soft nointr does not match hard nointr", data: strings.Replace(noIntrReport, `"hard"`, `"soft"`, 1), options: noIntrOptions, mismatch: "missing hard"},
 		{name: "atime disabled", data: report, options: strings.Replace(options, "noatime", "atime", 1), mismatch: "access times"},
 		{name: "atime enabled by default", data: strings.Replace(report, `"noatime",`, "", 1), options: strings.Replace(options, "noatime", "atime", 1)},
 		{name: "wrong target", data: strings.Replace(report, `"/mounted"`, `"/other"`, 1), options: options, badReport: true},

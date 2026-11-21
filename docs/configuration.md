@@ -53,6 +53,13 @@ sets NFS read/write transfers, default `128K`: powers of two from `4K` to `1M`
 are accepted; `0` uses the default. It applies to Unix-socket and TCP NFS mounts,
 not SMB. A restart replaces a macOS NFS mount whose negotiated options differ.
 
+On macOS, `serve --nfs-nointr` (`OVNFS_NFS_NOINTR=1`, user key
+`nfs_nointr: true`) opts into `hard,nointr` on both Unix-socket and TCP NFS
+mounts. The default stays interruptible. To switch policies, stop checkout
+clients, leave the mount, then `ovnfs stop` and `ovnfs start`. Changing the
+policy with `restart` can force a remount. See [what happens during a
+stall](platforms.md#when-the-nfs-daemon-stops-answering).
+
 `ovnfs tune` measures isolated mount configurations and asks before applying a
 balanced result. Add `--project DIR` for a real Cargo workspace; see
 [the tuning methodology](development.md#balanced-configuration-tuning).
@@ -242,6 +249,7 @@ env:
 | `blob_cache` | size | user file only: memory budget for content-addressed blobs (default 16M) |
 | `atime` | boolean | user file only: allow access time updates |
 | `nfs_io_size` | size | user file only: NFS transfer size, power of two from 4K to 1M (default 128K; 0 uses default) |
+| `nfs_nointr` | boolean | user file only: disable signal interruption on macOS NFS (default false) |
 | `git_remotes` | boolean | user file only: give a repository a git remote `ovnfs/NAME` per checkout (default true) |
 
 `rules` is a block scalar (`rules: |`) with one `<class> <predicate>` per line.
@@ -274,9 +282,9 @@ git_remotes: true
 For each setting, the explicit `serve` flag wins over its environment variable,
 which wins over the user file, which wins over the built-in default. The
 environment variables are `OVNFS_MEMORY`, `OVNFS_FSYNC`, `OVNFS_BLOB_CACHE`,
-`OVNFS_ATIME` and `OVNFS_GIT_REMOTES`; `proto` has no environment variable.
-Serve settings take effect when the daemon starts; restart it after changing
-them.
+`OVNFS_ATIME`, `OVNFS_NFS_IO_SIZE`, `OVNFS_NFS_NOINTR` and `OVNFS_GIT_REMOTES`;
+`proto` has no environment variable.
+Serve settings take effect the next time the daemon starts.
 
 ### `ovnfs config`
 
@@ -296,9 +304,10 @@ ovnfs config edit --global
 
 The keys are `rules`, `cache.ROOT.rebuild`, `cache.ROOT.key`, `env.image`,
 `env.setup` and the daemon settings `state`, `mount`, `proto`, `memory`,
-`fsync`, `blob_cache`, `atime`, `nfs_io_size` and `git_remotes`. A cache root may hold dots
-(`cache.web/.next.key`) and matches its entry however it is spelled
-(`cache.web/dist.rebuild` finds `./web/dist`). `rules`, `env.setup` and
+`fsync`, `blob_cache`, `atime`, `nfs_io_size`, `nfs_nointr` and `git_remotes`.
+A cache root may hold dots (`cache.web/.next.key`) and matches its entry
+however it is spelled (`cache.web/dist.rebuild` finds `./web/dist`).
+`rules`, `env.setup` and
 `cache.ROOT.key` take several values, one rule line or item each, and
 `set --append` adds to them; every other key takes one.
 
