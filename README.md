@@ -104,7 +104,10 @@ handle the common cases; `.o2/ovnfs.yml` and `--rule` override them, and
 `ovnfs explain PATH` says which rule decided.
 
 Writes go to the checkout's own copy-on-write layer, so the folder is never
-written until you `apply`. In a git repository the checkout gets a private git
+written until you `apply`, except for git hooks, which a checkout with the
+hooks link (`git_hooks`) shares with the folder (see
+[checkouts](docs/checkouts.md#git-hooks)). In a git repository the
+checkout gets a private git
 directory: commit freely, then `land` the commits on the folder's branch,
 `apply --branch NAME` to bring them back as another branch, or
 `git fetch ovnfs/NAME` them from its git remote. In a

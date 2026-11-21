@@ -14,8 +14,8 @@ import (
 	"github.com/stencil-hq/ovnfs/overlay"
 )
 
-// enforcedPerms skips tests whose failure needs the OS to refuse unlinking in an
-// unwritable directory, which neither root nor Windows does.
+// enforcedPerms skips tests whose failure needs the OS to refuse unlinking or
+// writing in an unwritable directory, which neither root nor Windows does.
 func enforcedPerms(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {

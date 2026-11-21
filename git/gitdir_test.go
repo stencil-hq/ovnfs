@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -218,5 +219,78 @@ func TestMakeGitdirConfig(t *testing.T) {
 		if strings.Join(got[key], ",") != strings.Join(values, ",") {
 			t.Errorf("%s = %v, want %v", key, got[key], values)
 		}
+	}
+}
+
+// TestLinkHooksKeepsLinkWhenStatFails keeps the link LinkHooks made when the
+// repository's hooks cannot be told apart from gone, such as under an unreadable
+// .git: only hooks that are really gone remove it.
+func TestLinkHooksKeepsLinkWhenStatFails(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("permissions do not deny access here")
+	}
+	repo := testRepo(t)
+	hooks := filepath.Join(repo.CommonDir, "hooks")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitdir := t.TempDir()
+	if err := repo.LinkHooks(gitdir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(repo.CommonDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(repo.CommonDir, 0o755) })
+	if err := repo.LinkHooks(gitdir); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := os.Readlink(filepath.Join(gitdir, "hooks")); err != nil || target != hooks {
+		t.Fatalf("link after a failed stat = %q, %v", target, err)
+	}
+}
+
+// TestLinkHooksRemovesLinkToUnresolvableHooks treats a source hooks entry that can
+// never resolve as gone, and removes the link made to it: a symlink loop, and a
+// symlink to a path through a regular file.
+func TestLinkHooksRemovesLinkToUnresolvableHooks(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		target func(hooks string) string
+	}{
+		{"loop", func(hooks string) string { return hooks }},
+		{"through a file", func(string) string { return filepath.Join(file, "x") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			repo := testRepo(t)
+			hooks := filepath.Join(repo.CommonDir, "hooks")
+			if err := os.RemoveAll(hooks); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(hooks, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			gitdir := t.TempDir()
+			if err := repo.LinkHooks(gitdir); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(hooks); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(c.target(hooks), hooks); err != nil {
+				t.Skipf("no symlinks: %v", err)
+			}
+			if err := repo.LinkHooks(gitdir); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(filepath.Join(gitdir, "hooks")); !os.IsNotExist(err) {
+				t.Fatalf("link to unresolvable hooks stays: %v", err)
+			}
+		})
 	}
 }

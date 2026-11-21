@@ -483,8 +483,10 @@ func (r *Registry) openOnLocked(ctx context.Context, b *baseRecord, template git
 
 // namePrepared names prepared checkout h: it opens now, so it gets the cache
 // snapshot a checkout opening now uses (see useCaches), its git directories
-// mark it as checkout name, and its objects are its base's (see
-// setWarmLocked). config is the root git directory's config as prepared.
+// mark it as checkout name, its objects are its base's (see setWarmLocked), and
+// with Config.GitHooks their hooks links match the source's now (linkHooks),
+// which may have changed since. config is the root git directory's config as
+// prepared.
 func (r *Registry) namePrepared(h *checkoutRecord, name, config string) error {
 	h.meta.Name, h.meta.Created = name, time.Now().UTC()
 	caches, err := r.useCaches(h.base)
@@ -503,6 +505,7 @@ func (r *Registry) namePrepared(h *checkoutRecord, name, config string) error {
 			return err
 		}
 	}
+	r.linkCheckoutHooks(gitdir, h.base.view, name)
 	if len(submodules(h.base.view)) == 0 {
 		return git.MarkNew(gitdir, config, name)
 	}

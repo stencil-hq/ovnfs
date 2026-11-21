@@ -104,7 +104,7 @@ func (r *Registry) New(ctx context.Context, args api.NewArgs) (api.NewReply, err
 				r.unreserve(name)
 			}
 		}()
-		ready, err := r.prepareGit(ctx, tree, filepath.Join(r.snapshotDir(s.meta.ID), "git"), baseID)
+		ready, linkErr, err := r.prepareGit(ctx, tree, filepath.Join(r.snapshotDir(s.meta.ID), "git"), baseID)
 		if err != nil {
 			return api.NewReply{}, coded(err)
 		}
@@ -128,6 +128,10 @@ func (r *Registry) New(ctx context.Context, args api.NewArgs) (api.NewReply, err
 			reply = api.NewReply{Checkout: r.checkoutLocked(h), Warnings: append([]string{}, warnings...)}
 		}
 		r.mu.Unlock()
+		if err == nil {
+			// The checkout exists, whatever happens to the prepared directory.
+			r.postHooksNotice(baseID, name, linkErr)
+		}
 		if discardErr := discardGit(ready); err == nil && discardErr != nil {
 			err = discardErr
 		}
@@ -640,6 +644,13 @@ func (r *Registry) prepareCheckout(name, dir string, b *baseRecord, layers []*ov
 		default:
 			err = os.Rename(gs.ready, gitdir)
 		}
+		if err == nil && name != "" && gs.ready == "" {
+			// Linked here: a checkout built from the template or by makeGitdirs.
+			// Linked elsewhere: a ready directory, by prepareGit when it was
+			// written, and an unnamed (pooled) one, by namePrepared once it is
+			// named, since the source's hooks may change while it waits.
+			r.linkCheckoutHooks(gitdir, b.view, name)
+		}
 		if err == nil && gs.rev != nil {
 			err = gs.rev.SetHEAD(gitdir)
 		}
@@ -712,6 +723,65 @@ func markGitdirs(gitdir, name string, view *base.Base) error {
 		}
 	}
 	return nil
+}
+
+// linkCheckoutHooks is linkHooks for the checkout called name, being created or
+// restored, best effort and only with Config.GitHooks on: it returns at once when
+// off. Every link that fails (a source whose hooks cannot be linked, a junction
+// refused on Windows) is listed in one notice for the checkout, which names it;
+// the git directories whose links failed stay without hooks while the others are
+// linked. A source hooks directory that cannot be examined (permission or I/O
+// error) gets no new link and no notice, and a link it already has stays.
+func (r *Registry) linkCheckoutHooks(gitdir string, view *base.Base, name string) {
+	if !r.config.GitHooks {
+		return
+	}
+	r.postHooksNotice(view.Meta().ID, name, linkHooks(gitdir, view))
+}
+
+// postHooksNotice posts err, a link failure of the checkout called name on base
+// baseID, as one notice; nil posts nothing.
+func (r *Registry) postHooksNotice(baseID, name string, err error) {
+	if err != nil {
+		r.enqueueNotice(baseNotice{base: baseID, fault: "link hooks of checkout " + name + ": " + err.Error()})
+	}
+}
+
+// linkHooks links the hooks of a checkout's private git directory and of its
+// absorbed submodules' that it still has to those of the repositories the base
+// captured (git.Repo.LinkHooks). A repository found at another place than the
+// captured folder (an enclosing one, once the folder's own is gone) and a base
+// without a repository have none to link. It tries the root and every submodule
+// and returns the failures joined, so one that fails does not leave the others
+// unlinked. Callers run it only with Config.GitHooks on.
+func linkHooks(gitdir string, view *base.Base) error {
+	var errs []error
+	top := view.Meta().Dir
+	if repo := view.Domains().Repo(""); repo != nil && sameDir(repo.Top, top) {
+		errs = append(errs, repo.LinkHooks(gitdir))
+	}
+	for _, sub := range submodules(view) {
+		repo := view.Domains().Repo(sub.Path)
+		if repo == nil || !sameDir(repo.Top, filepath.Join(top, filepath.FromSlash(sub.Path))) {
+			continue
+		}
+		dir := filepath.Join(gitdir, filepath.FromSlash(sub.Module))
+		if _, err := os.Lstat(filepath.Join(dir, "HEAD")); errors.Is(err, os.ErrNotExist) {
+			continue // removed in the checkout
+		}
+		errs = append(errs, repo.LinkHooks(dir))
+	}
+	return errors.Join(errs...)
+}
+
+// sameDir reports whether a and b are the same directory, however either spells it.
+func sameDir(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	return err == nil && os.SameFile(ai, bi)
 }
 
 // installGitfiles points a new checkout's submodules at their private git
@@ -1029,7 +1099,7 @@ func (r *Registry) Fork(ctx context.Context, args api.ForkArgs) (api.ForkReply, 
 	if err != nil {
 		return api.ForkReply{}, coded(err)
 	}
-	ready, err := r.prepareGit(ctx, tree, "", baseID)
+	ready, linkErr, err := r.prepareGit(ctx, tree, "", baseID)
 	if err != nil {
 		return api.ForkReply{}, coded(err)
 	}
@@ -1063,6 +1133,7 @@ func (r *Registry) Fork(ctx context.Context, args api.ForkArgs) (api.ForkReply, 
 	r.mu.Unlock()
 	r.emit(Event{Name: "snapshotted", Payload: map[string]any{"snapshot": result}})
 	if createErr == nil {
+		r.postHooksNotice(baseID, child, linkErr)
 		r.created(childCheckout)
 	}
 	r.mu.Lock()

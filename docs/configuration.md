@@ -64,7 +64,10 @@ forces a new mount rather than retaining one that speaks the old protocol.
 
 By default a repository gets a git remote per checkout of it;
 `serve --no-git-remotes` (`OVNFS_GIT_REMOTES=0`) turns that off, see
-[checkouts](checkouts.md#git-remotes).
+[checkouts](checkouts.md#git-remotes). A checkout's private git directory has
+no hooks by default; `serve --git-hooks` (`OVNFS_GIT_HOOKS=1`) links it to the
+folder's hooks, as a linked worktree uses them, see
+[checkouts](checkouts.md#git-hooks).
 
 ## Classes
 
@@ -243,6 +246,7 @@ env:
 | `atime` | boolean | user file only: allow access time updates |
 | `nfs_io_size` | size | user file only: NFS transfer size, power of two from 4K to 1M (default 128K; 0 uses default) |
 | `git_remotes` | boolean | user file only: give a repository a git remote `ovnfs/NAME` per checkout (default true) |
+| `git_hooks` | boolean | user file only: link each checkout's private git directory to the repository's hooks (default false) |
 
 `rules` is a block scalar (`rules: |`) with one `<class> <predicate>` per line.
 Blank lines and lines starting with `#` are skipped; `#` after whitespace
@@ -269,12 +273,14 @@ fsync: true
 blob_cache: 64M
 atime: false
 git_remotes: true
+git_hooks: false
 ```
 
 For each setting, the explicit `serve` flag wins over its environment variable,
 which wins over the user file, which wins over the built-in default. The
 environment variables are `OVNFS_MEMORY`, `OVNFS_FSYNC`, `OVNFS_BLOB_CACHE`,
-`OVNFS_ATIME` and `OVNFS_GIT_REMOTES`; `proto` has no environment variable.
+`OVNFS_ATIME`, `OVNFS_GIT_REMOTES` and `OVNFS_GIT_HOOKS`; `proto` has no
+environment variable.
 Serve settings take effect when the daemon starts; restart it after changing
 them.
 
@@ -296,7 +302,7 @@ ovnfs config edit --global
 
 The keys are `rules`, `cache.ROOT.rebuild`, `cache.ROOT.key`, `env.image`,
 `env.setup` and the daemon settings `state`, `mount`, `proto`, `memory`,
-`fsync`, `blob_cache`, `atime`, `nfs_io_size` and `git_remotes`. A cache root may hold dots
+`fsync`, `blob_cache`, `atime`, `nfs_io_size`, `git_remotes` and `git_hooks`. A cache root may hold dots
 (`cache.web/.next.key`) and matches its entry however it is spelled
 (`cache.web/dist.rebuild` finds `./web/dist`). `rules`, `env.setup` and
 `cache.ROOT.key` take several values, one rule line or item each, and

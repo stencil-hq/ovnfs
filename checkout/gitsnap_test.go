@@ -135,6 +135,39 @@ func TestGitSnapshotTreesAreGCRoots(t *testing.T) {
 	}
 }
 
+// legacySnapshot snapshots checkout as a build that copied whole git directories
+// did: it closes the registry, stores the checkout's git directory as a copy at
+// snapshots/<id>/git (edit changes the copy first), and clears the snapshot's
+// git tree. The caller reopens the registry; the snapshot's id and its directory
+// are returned.
+func (f *fixture) legacySnapshot(checkout string, edit func(copied string)) (id, legacy string) {
+	f.t.Helper()
+	id, _ = f.snapGit(checkout)
+	gitdir := f.gitdir(checkout)
+	if err := f.reg.Close(); err != nil {
+		f.t.Fatal(err)
+	}
+	legacy = filepath.Join(f.state, "snapshots", id)
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		f.t.Fatal(err)
+	}
+	copied := filepath.Join(legacy, "git")
+	if err := git.CopyGitdir(gitdir, copied, "unused"); err != nil {
+		f.t.Fatal(err)
+	}
+	if edit != nil {
+		edit(copied)
+	}
+	d := readDisk(f.t, f.state)
+	for i := range d.Snapshots {
+		d.Snapshots[i].Git = ""
+	}
+	if err := writeState(f.state, d); err != nil {
+		f.t.Fatal(err)
+	}
+	return id, legacy
+}
+
 // TestLegacySnapshotGitCopy opens a snapshot recorded by a build that copied the whole
 // git directory into snapshots/<id>/git, and drops it.
 func TestLegacySnapshotGitCopy(t *testing.T) {
@@ -144,24 +177,7 @@ func TestLegacySnapshotGitCopy(t *testing.T) {
 	f.newCheckout(dir, "app")
 	gitdir := f.gitdir("app")
 	head := gitRun(t, dir, "--git-dir", gitdir, "rev-parse", "HEAD")
-	id, _ := f.snapGit("app")
-	if err := f.reg.Close(); err != nil {
-		t.Fatal(err)
-	}
-	legacy := filepath.Join(f.state, "snapshots", id)
-	if err := os.MkdirAll(legacy, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := git.CopyGitdir(gitdir, filepath.Join(legacy, "git"), "unused"); err != nil {
-		t.Fatal(err)
-	}
-	d := readDisk(t, f.state)
-	for i := range d.Snapshots {
-		d.Snapshots[i].Git = ""
-	}
-	if err := writeState(f.state, d); err != nil {
-		t.Fatal(err)
-	}
+	id, legacy := f.legacySnapshot("app", nil)
 	gitRun(t, dir, "--git-dir", gitdir, "commit", "--allow-empty", "-qm", "later")
 	f.open()
 	if _, err := f.reg.New(ctx, api.NewArgs{Snapshot: id, Name: "view"}); err != nil {

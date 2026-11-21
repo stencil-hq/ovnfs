@@ -401,12 +401,12 @@ func TestGitdirKeepsLockNamedModules(t *testing.T) {
 	write(t, filepath.Join(dir, "index.lock"), "")
 	write(t, filepath.Join(dir, "modules", "dep.lock", "HEAD"), "ref: refs/heads/main\n")
 	write(t, filepath.Join(dir, "modules", "dep.lock", "config.lock"), "")
-	tree, err := saveGitdir(f.reg.store, dir, &gitCache{})
+	tree, err := saveGitdir(f.reg.store, dir, &gitCache{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(t.TempDir(), "git")
-	if err := materializeGitdir(f.reg.store, tree, dst, func(string) string { return t.TempDir() }, nil); err != nil {
+	if err := materializeGitdir(f.reg.store, tree, dst, func(string) string { return t.TempDir() }, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dst, "modules", "dep.lock", "HEAD")); err != nil {

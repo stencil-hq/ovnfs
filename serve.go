@@ -114,6 +114,7 @@ func serveDefaults(conf manifest.Daemon) kong.Option {
 		"atime_default":       cmp.Or(os.Getenv("OVNFS_ATIME"), conf.Atime, "false"),
 		"nfs_io_size_default": cmp.Or(os.Getenv("OVNFS_NFS_IO_SIZE"), conf.NFSIOSize, byteSize(defaultNFSIOSize).String()),
 		"git_remotes_default": cmp.Or(os.Getenv("OVNFS_GIT_REMOTES"), conf.GitRemotes, "true"),
+		"git_hooks_default":   cmp.Or(os.Getenv("OVNFS_GIT_HOOKS"), conf.GitHooks, "false"),
 	}
 }
 
@@ -127,6 +128,7 @@ type serveCmd struct {
 	Atime      bool     `help:"Allow access time updates on the mount." default:"${atime_default}"`
 	NFSIOSize  byteSize `name:"nfs-io-size" help:"NFS read/write transfer size (power of two, 4K to 1M)." default:"${nfs_io_size_default}"`
 	GitRemotes bool     `help:"Give each source repository a git remote ovnfs/NAME per checkout of it." default:"${git_remotes_default}" negatable:""`
+	GitHooks   bool     `help:"Link each checkout's git hooks to its source repository's, so git runs the hooks a linked worktree would." default:"${git_hooks_default}" negatable:""`
 }
 
 // eventHub fans persisted events out to connected admin subscribers.
@@ -241,7 +243,7 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	}
 	defer rec.Close() // after the registry's, whose final work it records
 	reg, err := checkout.Open(checkout.Config{State: state, Mount: mount, UserHome: userHome, Node: node, Emit: hub.emit, Fetch: lk.fetch, Search: lk.search,
-		Memory: mem, BlobCache: int64(cmd.BlobCache), GitRemotes: cmd.GitRemotes, Logf: log.Printf, Stats: rec,
+		Memory: mem, BlobCache: int64(cmd.BlobCache), GitRemotes: cmd.GitRemotes, GitHooks: cmd.GitHooks, Logf: log.Printf, Stats: rec,
 		Quiesce: func(ctx context.Context) (func(), error) {
 			if s := smbServer.Load(); s != nil {
 				return s.Quiesce(ctx)

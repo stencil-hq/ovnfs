@@ -39,7 +39,8 @@ add` and `git submodule update --init` lay it out, gets a private git directory
 of its own, built the same way and placed below the checkout's at
 `modules/<name>`, where git looks for it; the submodule's `.git` in the checkout
 points there. Commits made in the submodule stay in the checkout, forks and
-snapshots carry them, and the folder's `.git/modules` is never written. A fork
+snapshots carry them, and ovnfs never writes the folder's `.git/modules`; only
+hooks written through a hooks link (see below) land there. A fork
 or a checkout from a snapshot points every submodule `.git` at its own private
 git directory, wherever the submodule was moved, and a deinitialized submodule
 stays without one.
@@ -52,6 +53,54 @@ Each private gitdir records repo-local `ovnfs.checkout = NAME`, including
 forked checkouts with their own names. Existing checkouts gain this marker when
 the daemon next opens their registry. The marker is never written to the source
 repo.
+
+### Git hooks
+
+With `git_hooks: true` in `~/.o2/ovnfs.yml` (or `serve --git-hooks`,
+`OVNFS_GIT_HOOKS=1`), a checkout's private git directory links `hooks` to the
+folder's hooks directory (`.git/hooks`, or the common git directory's when the
+folder is a linked worktree), so `pre-commit`, `commit-msg`, `post-checkout`
+and the other hooks run in a checkout as they do in a linked worktree of the
+folder. An absorbed submodule's private git directory links to the
+submodule's own `.git/modules/<name>/hooks`. A `core.hooksPath` set globally,
+or in the repository before the checkout was opened, takes precedence, as it
+does in the folder. ovnfs tries the link for every git directory and posts one
+daemon notice per checkout listing each link it couldn't make; those git
+directories stay without hooks and the rest are linked. A git directory whose
+source hooks can't be examined (a permission or I/O error) gets no new link and
+no notice; a link it already has stays.
+
+The link works both ways: editing a hook in the folder
+changes it for every checkout, and a hook installer run in a checkout
+(`pre-commit install`, husky v4, `git lfs install`, anything writing to
+`$(git rev-parse --git-common-dir)/hooks`) writes the folder's hooks for every
+checkout, as it would from a linked worktree. Through the link, a global hook
+that chains to `$(git rev-parse --git-common-dir)/hooks/<name>` reaches the
+folder's hooks from a checkout. `rm` drops only the link: the
+private git directory moves to `trash/` and is deleted later, and neither step
+follows the link. Git commands that ovnfs runs itself run with hooks off.
+
+A folder without a hooks directory (a file in its place
+counts as none) gets no link, and an existing `hooks` entry in a private git
+directory is never replaced. Checkouts without the link, including those
+opened before the setting was on or before the folder had hooks, gain it when
+the daemon next opens their registry with the setting on, provided the folder
+is still the top of a git repository, without changing their last-touched
+time; ovnfs removes its own link the same way once the folder's hooks
+directory is gone, is not a directory, or can never resolve (a symlink loop, a
+path through a file). With the setting on, snapshots
+keep no `hooks` symlink, so `fork` and `new --from` link the new checkout to
+the folder's hooks, never to a link you made yourself; for hooks of a
+checkout's own, use a real `hooks` directory or `core.hooksPath` in its
+config.
+
+With the setting off, the default, ovnfs links nothing. A link a checkout
+already has stays, and forks and snapshots copy it as they copy any symlink in
+a private git directory (on Windows, a junction is not copied). To drop a link,
+delete `hooks` in the checkout's private git directory, which
+`git rev-parse --git-common-dir` prints inside the checkout. A submodule's link
+sits in its own private git directory, which `git rev-parse --git-dir` prints
+inside the submodule.
 
 ### Git remotes
 

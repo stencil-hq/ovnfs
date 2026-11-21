@@ -2,7 +2,11 @@
 
 package hostfile
 
-import "os"
+import (
+	"errors"
+	"os"
+	"syscall"
+)
 
 // OpenFile is [os.OpenFile]: Unix descriptors never block renames or unlinks.
 func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
@@ -23,3 +27,10 @@ func Symlink(target, link string) error { return os.Symlink(target, link) }
 
 // Linked returns info without joining its path segments: Unix has no junctions.
 func Linked(info os.FileInfo, _ ...string) os.FileInfo { return info }
+
+// Unresolvable reports whether err from a stat means the path can never resolve:
+// a symlink loop or a path through a file, as against one that is merely absent
+// or unreadable for now.
+func Unresolvable(err error) bool {
+	return errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR)
+}

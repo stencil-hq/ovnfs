@@ -8,7 +8,8 @@
 // facts (which paths are tracked or ignored, which commit is pushed), an object
 // database to read unchanged tracked content from, and a private git directory
 // that makes `git` work inside a checkout without writing to the user's
-// repository, except for checkout remotes (see SetCheckoutRemotes).
+// repository, except for checkout remotes (see SetCheckoutRemotes) and hooks
+// a checkout links to the repository's own (see LinkHooks).
 //
 // The engines under git/internal implement git's formats and protocols from
 // git's documentation: object (objects and packs), config, refs, index, merge
