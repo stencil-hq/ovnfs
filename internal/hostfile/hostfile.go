@@ -8,7 +8,8 @@
 // Windows still refuses to rename a directory while any file below it is open;
 // see [overlay.FS.CloseFiles]. [Lstat] describes Windows junctions as symlinks,
 // and [Symlink] links a directory with a junction where Windows refuses the
-// account a symlink.
+// account a symlink. [Unresolvable] tells a stat error that never clears (a
+// symlink loop) from one that may.
 package hostfile
 
 import "os"

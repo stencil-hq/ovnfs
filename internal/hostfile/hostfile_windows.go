@@ -259,3 +259,11 @@ func longPath(p string) string {
 	}
 	return `\\?\` + filepath.Clean(p)
 }
+
+// Unresolvable reports whether err from a stat means the path can never resolve:
+// a symlink loop, as against one that is merely absent or unreadable for now. A
+// path through a file is already ERROR_PATH_NOT_FOUND here, which is
+// [os.ErrNotExist].
+func Unresolvable(err error) bool {
+	return errors.Is(err, windows.ERROR_CANT_RESOLVE_FILENAME)
+}
