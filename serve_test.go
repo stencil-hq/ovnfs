@@ -11,7 +11,7 @@ func TestServeOptions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	for _, name := range []string{"OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC", "OVNFS_NFS_IO_SIZE"} {
+	for _, name := range []string{"OVNFS_MEMORY", "OVNFS_BLOB_CACHE", "OVNFS_ATIME", "OVNFS_FSYNC", "OVNFS_NFS_IO_SIZE", "OVNFS_GIT_HOOKS"} {
 		t.Setenv(name, "")
 	}
 	parse := func(args ...string) (serveCmd, error) {
@@ -89,6 +89,35 @@ func TestServeOptions(t *testing.T) {
 	if _, err := parse("--unknown-option"); err == nil {
 		t.Fatal("unknown serve flag accepted")
 	}
+
+	writeConfig("")
+	t.Setenv("OVNFS_GIT_HOOKS", "")
+	if cmd, err := parse(); err != nil || cmd.GitHooks {
+		t.Fatalf("git hooks on by default: %+v, %v", cmd, err)
+	}
+	if cmd, err := parse("--git-hooks"); err != nil || !cmd.GitHooks {
+		t.Fatalf("--git-hooks did not turn it on: %+v, %v", cmd, err)
+	}
+	t.Setenv("OVNFS_GIT_HOOKS", "1")
+	if cmd, err := parse(); err != nil || !cmd.GitHooks {
+		t.Fatalf("OVNFS_GIT_HOOKS=1 did not turn it on: %+v, %v", cmd, err)
+	}
+	if cmd, err := parse("--no-git-hooks"); err != nil || cmd.GitHooks {
+		t.Fatalf("--no-git-hooks did not win over the environment: %+v, %v", cmd, err)
+	}
+	t.Setenv("OVNFS_GIT_HOOKS", "")
+	writeConfig("git_hooks: true\n")
+	if cmd, err := parse(); err != nil || !cmd.GitHooks {
+		t.Fatalf("git_hooks: true in the user file did not turn it on: %+v, %v", cmd, err)
+	}
+	if cmd, err := parse("--no-git-hooks"); err != nil || cmd.GitHooks {
+		t.Fatalf("--no-git-hooks did not win over the user file: %+v, %v", cmd, err)
+	}
+	t.Setenv("OVNFS_GIT_HOOKS", "0")
+	if cmd, err := parse(); err != nil || cmd.GitHooks {
+		t.Fatalf("OVNFS_GIT_HOOKS=0 did not win over the user file: %+v, %v", cmd, err)
+	}
+	t.Setenv("OVNFS_GIT_HOOKS", "")
 
 	writeConfig("unknown_key: true\n")
 	if err := run([]string{"serve", "--state", filepath.Join(home, "state"), "--mount", filepath.Join(home, "mount")}); err == nil || !strings.Contains(err.Error(), "unknown") {

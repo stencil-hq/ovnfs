@@ -7,7 +7,8 @@
 // are served copy-on-write from a snapshot of the folder's that ovnfs owns
 // (see useCaches); hidden paths do not exist.
 // A checkout of a git repository also gets a private git directory, so git works
-// inside it without writing to the user's repository.
+// inside it without writing to the user's repository (with Config.GitHooks, its
+// hooks link to the repository's own, so writes to them land there).
 //
 // Every method on Registry is one admin operation (package api) with the same
 // name and argument struct as the CLI verb.
@@ -158,6 +159,18 @@ type Config struct {
 	// GitRemotes gives a source repository a git remote ovnfs/<name> for each
 	// live checkout of it (see Registry.syncRemotes); off, ovnfs removes them.
 	GitRemotes bool
+	// GitHooks links the hooks of a checkout's private git directory, and of its
+	// absorbed submodules', to those of the source repositories (see linkHooks),
+	// so git finds the hooks a linked worktree would; one notice per checkout
+	// lists every link that failed, those git directories stay without hooks
+	// and the others are linked. A source hooks directory that cannot be
+	// examined (permission or I/O error) gets no new link and no notice, and a
+	// link it already has stays. ovnfs removes its own link when the folder's
+	// hooks are gone, are not a directory, or can never resolve. Off, nothing
+	// is linked and existing links stay; forks and snapshots still copy a link
+	// a checkout has, as any symlink in its git directory (a Windows junction
+	// is not copied).
+	GitHooks bool
 	// Logf reports how long Open spent on each part of the state, so a slow
 	// start names its cause; nil is silent.
 	Logf func(format string, args ...any)

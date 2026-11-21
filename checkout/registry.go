@@ -289,7 +289,9 @@ func (r *Registry) openBases(metas []base.Meta) error {
 // openCheckouts restores the persisted checkouts into r.checkouts. Opening one
 // indexes its whole upper, which dominates the restore of many checkouts, so
 // up to openSlots open at once; the records then land in disks' order. It
-// returns the first error in disks' order, after every open has ended.
+// returns the first error in disks' order, after every open has ended. A worker
+// touches one checkout's git directory and upper; with Config.GitHooks it also
+// stats the source repositories' hooks directories (reopenGitdir).
 func (r *Registry) openCheckouts(disks []diskCheckout) error {
 	type pending struct {
 		base   *baseRecord
@@ -322,7 +324,7 @@ func (r *Registry) openCheckouts(disks []diskCheckout) error {
 			for i := next.Add(1) - 1; i < int64(len(disks)); i = next.Add(1) - 1 {
 				disk, p := disks[i], plan[i]
 				if disk.Git {
-					if errs[i] = git.MarkCheckout(r.gitdirPath(disk.dir()), disk.Name); errs[i] != nil {
+					if errs[i] = r.reopenGitdir(disk, r.gitdirPath(disk.dir()), p.base.view); errs[i] != nil {
 						continue
 					}
 				}
@@ -357,6 +359,34 @@ func (r *Registry) openCheckouts(disks []diskCheckout) error {
 	for _, h := range unslotted {
 		if err := r.addCheckoutLocked(h.meta.Name, h); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// reopenGitdir is what openCheckouts does to an existing checkout's private git
+// directory: git.MarkCheckout, whose error it returns. With Config.GitHooks off
+// that is all, as before hooks were linked. With it on, it also links the
+// directory's hooks to the source's (linkCheckoutHooks, best effort: one notice
+// per checkout lists every link that failed), and then puts the directory's
+// modification time back if the marker or the link changed it, since that time
+// is the checkout's idle time (touched). A failure to restore it is a notice
+// too. It runs in openCheckouts' workers, so it takes no registry lock.
+func (r *Registry) reopenGitdir(disk diskCheckout, gitdir string, view *base.Base) error {
+	if !r.config.GitHooks {
+		return git.MarkCheckout(gitdir, disk.Name)
+	}
+	var mtime time.Time
+	if info, err := os.Lstat(gitdir); err == nil {
+		mtime = info.ModTime()
+	}
+	if err := git.MarkCheckout(gitdir, disk.Name); err != nil {
+		return err
+	}
+	r.linkCheckoutHooks(gitdir, view, disk.Name)
+	if after, err := os.Lstat(gitdir); err == nil && !mtime.IsZero() && !after.ModTime().Equal(mtime) {
+		if err := os.Chtimes(gitdir, mtime, mtime); err != nil {
+			r.enqueueNotice(baseNotice{base: disk.Base, fault: "restore idle time of checkout " + disk.Name + ": " + err.Error()})
 		}
 	}
 	return nil

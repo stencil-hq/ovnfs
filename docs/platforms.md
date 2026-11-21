@@ -279,10 +279,13 @@ metadata cache lifetime, and realpath in tools such as tsc and Bun would
 stop seeing it.
 
 A git checkout's private git directory on the host links `objects` to its
-base's shared object directory. An account that may not create symlinks
+base's shared object directory and, with `git_hooks` on, `hooks` to the
+folder's hooks directory. An account that may not create symlinks
 (no `SeCreateSymbolicLinkPrivilege` and Developer Mode off, as for most
-standard users) gets a junction there instead; git and the daemon read it as
-the same link.
+standard users) gets junctions there instead; git and the daemon read them as
+the same links. A junction can't point at a network-share (UNC) path, so for a
+folder on a share such an account gets a daemon notice and checkouts without
+hooks.
 
 ### Unix modes and Defender
 
