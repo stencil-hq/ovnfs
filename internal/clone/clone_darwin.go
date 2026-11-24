@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -29,8 +30,9 @@ func Reflink(in *os.File, dst string, mode os.FileMode) error {
 
 // cloneHierarchy clones the regular file, directory or symlink src to the new
 // path dst in one clonefile(2) call, which takes a directory's whole hierarchy
-// along with every entry's mode and extended attributes, and every file's and
-// symlink's times; directory times are restored after it. info describes src.
+// along with every entry's mode, extended attributes and access time.
+// Populating directories may change their mtimes, so restore those after it.
+// info describes src.
 // It reports false, leaving dst absent, where the volume cannot clone.
 func cloneHierarchy(src, dst string, info fs.FileInfo) (bool, error) {
 	err := unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW)
@@ -46,10 +48,9 @@ func cloneHierarchy(src, dst string, info fs.FileInfo) (bool, error) {
 	return true, dirTimes(src, dst)
 }
 
-// dirTimes gives the cloned directory dst and every directory below it the
-// modification time of its source under src: clonefile dates them at the
-// clone. It lists the private clone rather than src, so a directory that
-// appeared or vanished in src since the clone is skipped.
+// dirTimes restores mtimes below dst without overwriting the clone's atimes.
+// It lists the private clone rather than src, so a directory that appeared
+// or vanished in src since the clone is skipped.
 func dirTimes(src, dst string) error {
 	entries, err := os.ReadDir(dst)
 	if err != nil {
@@ -69,5 +70,17 @@ func dirTimes(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+	mtime := info.ModTime()
+	if len(entries) == 0 {
+		// A clone can keep an empty directory's mtime because it adds no
+		// children. Setting even the same mtime would dirty its metadata.
+		cloned, err := os.Lstat(dst)
+		if err != nil {
+			return err
+		}
+		if mtime.Equal(cloned.ModTime()) {
+			return nil
+		}
+	}
+	return os.Chtimes(dst, time.Time{}, mtime)
 }

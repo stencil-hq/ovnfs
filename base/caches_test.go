@@ -191,7 +191,8 @@ func TestCacheRootsOnAnotherVolume(t *testing.T) {
 	c := b.newCaches("c1")
 	c.fence = fence{}
 	b.serve(c)
-	c.take(b)
+	go c.take(b)
+	c.Wait()
 	view := b.Bottom(c)
 	if info, err := view.Lstat("node_modules"); err != nil || !info.IsDir() {
 		t.Errorf("cache root = %v, %v; want an empty directory", info, err)
