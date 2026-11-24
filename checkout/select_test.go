@@ -97,7 +97,7 @@ func TestPrune(t *testing.T) {
 	}
 	s.Touch()
 	s.Done()
-	if removed, err := f.reg.remove(ctx, picked.Name, picked.Touched, false); removed || err != nil {
+	if removed, err := f.reg.remove(ctx, api.RmArgs{Checkout: picked.Name}, picked.Touched); removed || err != nil {
 		t.Fatalf("removing %s touched after it was picked = %v, %v", picked.Name, removed, err)
 	}
 	reply, err := f.reg.Prune(ctx, api.PruneArgs{Select: api.Select{Dir: app}})

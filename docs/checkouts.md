@@ -222,6 +222,16 @@ message counts those commits and names the newest; `rm --force` removes the
 checkout anyway. `prune`, the end of `run` and the socket API's `rm` without
 `keep_commits` do not check.
 
+For automation, save the checkout's `name` and `id` from `new --json`
+(`.checkout`) or `ls --json` (`.checkouts[]`) before inspecting it. Then use
+`ovnfs rm NAME --if-id ID` to remove only that instance. The id survives
+daemon restarts, and a checkout recreated under the same name has a different
+id. A mismatch refuses removal even with `--force`. A CLI connected to an
+older daemon refuses `--if-id` rather than falling back to removal by name.
+Admin clients can check for the `rm.if_id` feature and pass `if_id`; a
+mismatch returns `conflict`. This guard does not check for writes made to
+the same checkout after it was inspected.
+
 `new` (and `run`) on a checkout's own folder forks that checkout: capturing it
 would make the daemon serve the new checkout by reading through its own mount,
 which can deadlock the mount. `new` refuses the mount itself, a folder below a

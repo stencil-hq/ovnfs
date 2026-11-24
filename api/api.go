@@ -5,7 +5,11 @@
 // `fork` with ForkArgs{Checkout: "app", Name: "b"} and prints a ForkReply.
 package api
 
-import "time"
+import (
+	"encoding/json"
+	"errors"
+	"time"
+)
 
 // Ops lists every operation the daemon serves, in CLI help order.
 var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob", "apply", "land", "pull", "rm", "prune", "drop", "explain", "plan", "profile", "stats", "attach", "push", "share", "subscribe", "stop"}
@@ -18,23 +22,41 @@ var Ops = []string{"status", "ls", "new", "fork", "snap", "diff", "grep", "glob"
 // "pull.folder" (a pull of a checkout without attachments merges its folder),
 // "apply.atomic" (ApplyArgs.Atomic), "rm.keep_commits" (RmArgs.KeepCommits),
 // "diff.paths" (DiffArgs.Paths), "diff.stat" (DiffArgs.Stat),
-// "new.base_checkout" (NewArgs.Base takes a checkout's name), and
-// "glob.git_markers" (GlobArgs.GitMarkers).
+// "new.base_checkout" (NewArgs.Base takes a checkout's name),
+// "glob.git_markers" (GlobArgs.GitMarkers), and "rm.if_id" (RmArgs.IfID).
 var Features = []string{"new.base", "diff.binary", "ls.select", "rm.sticky_snapshots", "prune.sticky_snapshots", "stop.keep_mount",
-	"pull.folder", "apply.atomic", "rm.keep_commits", "diff.paths", "diff.stat", "new.base_checkout", "glob.git_markers"}
+	"pull.folder", "apply.atomic", "rm.keep_commits", "diff.paths", "diff.stat", "new.base_checkout", "glob.git_markers", "rm.if_id"}
+
+// CheckoutID identifies one checkout instance, regardless of its name.
+type CheckoutID string
+
+// UnmarshalJSON rejects null and empty IDs so a supplied removal guard
+// cannot be decoded as an omitted one.
+func (id *CheckoutID) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if value == "" {
+		return errors.New("checkout id must be a nonempty string")
+	}
+	*id = CheckoutID(value)
+	return nil
+}
 
 // Checkout is an isolated, copy-on-write copy of a source folder that an agent works in.
 type Checkout struct {
-	Name    string    `json:"name"`
-	Path    string    `json:"path"`             // folder to cd into
-	Source  string    `json:"source"`           // folder the checkout was opened from
-	Base    string    `json:"base"`             // frozen capture the checkout sits on
-	Parent  string    `json:"parent,omitempty"` // snapshot the checkout was created from
-	Git     bool      `json:"git"`              // a working .git exists inside the checkout
-	JJ      string    `json:"jj,omitempty"`     // the checkout's jj workspace in its source's repository, when it is one
-	Dirty   bool      `json:"dirty"`            // changes since the last snapshot
-	Created time.Time `json:"created"`
-	Touched time.Time `json:"touched"` // last change to its files or git state; Created until then
+	Name    string     `json:"name"`
+	ID      CheckoutID `json:"id,omitempty"`     // stable through daemon restarts
+	Path    string     `json:"path"`             // folder to cd into
+	Source  string     `json:"source"`           // folder the checkout was opened from
+	Base    string     `json:"base"`             // frozen capture the checkout sits on
+	Parent  string     `json:"parent,omitempty"` // snapshot the checkout was created from
+	Git     bool       `json:"git"`              // a working .git exists inside the checkout
+	JJ      string     `json:"jj,omitempty"`     // the checkout's jj workspace in its source's repository, when it is one
+	Dirty   bool       `json:"dirty"`            // changes since the last snapshot
+	Created time.Time  `json:"created"`
+	Touched time.Time  `json:"touched"` // last change to its files or git state; Created until then
 }
 
 // Snapshot is an immutable state of a checkout; Tree is its content id once hashed.
@@ -296,10 +318,12 @@ type LandReply struct {
 // branches hold commits made in it that nothing else keeps: no ref of its
 // folder's repository reaches them, as after a land or an apply to a branch,
 // and the checkout pushed them to no remote. The removal would lose them.
+// IfID refuses, with code "conflict", if the named checkout has a different id.
 type RmArgs struct {
-	Checkout        string `json:"checkout"`
-	StickySnapshots bool   `json:"sticky_snapshots,omitempty"`
-	KeepCommits     bool   `json:"keep_commits,omitempty"`
+	Checkout        string     `json:"checkout"`
+	StickySnapshots bool       `json:"sticky_snapshots,omitempty"`
+	KeepCommits     bool       `json:"keep_commits,omitempty"`
+	IfID            CheckoutID `json:"if_id,omitempty"`
 }
 
 // PruneArgs removes the checkouts Select picks and their unused snapshots unless

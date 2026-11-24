@@ -79,6 +79,44 @@ func TestRemoveTreeUnlocksDirsWithoutLeavingTheTree(t *testing.T) {
 	}
 }
 
+func TestRmIfID(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	dir := folder(t, map[string]string{"a": "base"})
+	first := f.newCheckout(dir, "work").Checkout
+	if first.ID == "" {
+		t.Fatal("new did not return a checkout id")
+	}
+	if err := f.reg.Rm(ctx, api.RmArgs{Checkout: first.Name, IfID: first.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := f.newCheckout(dir, first.Name).Checkout
+	f.put(replacement.Name, "keep", "replacement data")
+	if err := f.reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.open()
+
+	listed := f.ls().Checkouts
+	if len(listed) != 1 || listed[0].ID != replacement.ID {
+		t.Fatalf("ls after reopening = %+v, want checkout %s with id %q", listed, replacement.Name, replacement.ID)
+	}
+	err := f.reg.Rm(ctx, api.RmArgs{Checkout: replacement.Name, IfID: first.ID})
+	if !isCode(err, "conflict") {
+		t.Fatalf("rm with stale id = %v, want conflict", err)
+	}
+	if got := f.read(replacement.Name, "keep"); got != "replacement data" {
+		t.Fatalf("replacement data after refused rm = %q", got)
+	}
+	if err := f.reg.Rm(ctx, api.RmArgs{Checkout: replacement.Name, IfID: replacement.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if listed = f.ls().Checkouts; len(listed) != 0 {
+		t.Fatalf("checkout survived rm with its current id: %+v", listed)
+	}
+}
+
 // TestRmRemovesUnwritableDirs checks that rm of a checkout whose upper holds an
 // unwritable directory with files removes the upper and succeeds, rather than
 // failing after the checkout left the manifest and leaving the upper an orphan,

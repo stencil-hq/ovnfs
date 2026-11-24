@@ -703,19 +703,30 @@ func (c *cli) predates(err error, applies bool, name, what string) error {
 
 // rmCmd removes a checkout and says so, unless that would destroy commits.
 type rmCmd struct {
-	Checkout        string `arg:"" name:"CHECKOUT" help:"checkout to remove" completion-predictor:"checkout"`
-	Force           bool   `name:"force" short:"f" help:"remove even a checkout holding commits its folder's repository lacks"`
-	StickySnapshots bool   `name:"sticky-snapshots" help:"retain snapshots of the removed checkout"`
+	Checkout        string  `arg:"" name:"CHECKOUT" help:"checkout to remove" completion-predictor:"checkout"`
+	Force           bool    `name:"force" short:"f" help:"remove even a checkout holding commits its folder's repository lacks"`
+	StickySnapshots bool    `name:"sticky-snapshots" help:"retain snapshots of the removed checkout"`
+	IfID            *string `name:"if-id" help:"remove only the checkout instance with this id (see ls --json)"`
 }
 
 func (cmd *rmCmd) Run(c *cli) error {
 	a := api.RmArgs{Checkout: cmd.Checkout, StickySnapshots: cmd.StickySnapshots}
+	if cmd.IfID != nil {
+		if *cmd.IfID == "" {
+			return errors.New("rm: --if-id needs a nonempty checkout id")
+		}
+		a.IfID = api.CheckoutID(*cmd.IfID)
+	}
 	client, err := c.client()
 	if err != nil {
 		return err
 	}
+	features := client.Welcome().Features
+	if a.IfID != "" && !slices.Contains(features, "rm.if_id") {
+		return errors.New("rm: the running daemon does not support --if-id; restart it with this version of ovnfs")
+	}
 	// A daemon that predates the check refuses the field itself.
-	a.KeepCommits = !cmd.Force && slices.Contains(client.Welcome().Features, "rm.keep_commits")
+	a.KeepCommits = !cmd.Force && slices.Contains(features, "rm.keep_commits")
 	if _, err := call[json.RawMessage](c, "rm", a); err != nil || c.json {
 		return err
 	}

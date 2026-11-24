@@ -44,6 +44,7 @@ func (e *Error) ErrorCode() string { return e.Code }
 // checkoutMeta is the persisted description of a live checkout.
 type checkoutMeta struct {
 	Name string `json:"name"`
+	ID   string `json:"id,omitempty"` // stable identity of this checkout instance
 	// Dir names the checkout's directories below uppers and git when they are not
 	// named after the checkout: a checkout prepared before its name was known.
 	Dir     string    `json:"dir,omitempty"`

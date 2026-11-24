@@ -1390,12 +1390,7 @@ func (r *Registry) freezeLocked(ctx context.Context, h *checkoutRecord, label st
 // in between leaves files no checkout names, which reopening removes. The name
 // stays reserved until they are gone.
 func (r *Registry) Rm(ctx context.Context, args api.RmArgs) error {
-	if args.KeepCommits {
-		if err := r.keepCommits(ctx, args.Checkout); err != nil {
-			return err
-		}
-	}
-	_, err := r.remove(ctx, args.Checkout, time.Time{}, args.StickySnapshots)
+	_, err := r.remove(ctx, args, time.Time{})
 	return err
 }
 
@@ -1429,7 +1424,13 @@ func (r *Registry) keepCommits(ctx context.Context, name string) error {
 
 // remove is Rm, except that with picked set it keeps a checkout whose Touched is
 // no longer picked, one changed since prune picked it, and reports false.
-func (r *Registry) remove(ctx context.Context, name string, picked time.Time, stickySnapshots bool) (bool, error) {
+func (r *Registry) remove(ctx context.Context, args api.RmArgs, picked time.Time) (bool, error) {
+	name := args.Checkout
+	if args.KeepCommits {
+		if err := r.keepCommits(ctx, name); err != nil {
+			return false, err
+		}
+	}
 	resume, err := r.Quiesce(ctx)
 	if err != nil {
 		return false, err
@@ -1455,6 +1456,11 @@ func (r *Registry) remove(ctx context.Context, name string, picked time.Time, st
 		return false, err
 	}
 	// The freeze lock waits out file calls in flight, so none touches it from here.
+	if args.IfID != "" && args.IfID != api.CheckoutID(h.meta.ID) {
+		r.mu.Unlock()
+		h.freeze.Unlock()
+		return false, failure("conflict", "checkout %s has a different id; not removed", name)
+	}
 	if !picked.IsZero() && !r.touched(h).Equal(picked) {
 		r.mu.Unlock()
 		h.freeze.Unlock()
@@ -1486,7 +1492,7 @@ func (r *Registry) remove(ctx context.Context, name string, picked time.Time, st
 		r.mu.Lock()
 		r.intents[name] = diskIntent{Op: "removing", Checkout: name, Dir: h.meta.Dir, Layer: h.meta.Base}
 		r.mu.Unlock()
-	} else if !stickySnapshots {
+	} else if !args.StickySnapshots {
 		err = r.dropCheckoutSnapshots(name, h.meta.Life)
 	}
 	removeErr := r.removeCheckoutFiles(h.meta.dir())

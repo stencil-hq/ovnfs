@@ -31,7 +31,7 @@ func (r *Registry) Prune(ctx context.Context, args api.PruneArgs) (api.PruneRepl
 	reply := api.PruneReply{Removed: []api.Checkout{}}
 	for _, c := range picked {
 		if !args.DryRun {
-			removed, err := r.remove(ctx, c.Name, c.Touched, args.StickySnapshots)
+			removed, err := r.remove(ctx, api.RmArgs{Checkout: c.Name, StickySnapshots: args.StickySnapshots}, c.Touched)
 			if e, ok := errors.AsType[*Error](err); ok && e.Code == "not_found" {
 				continue // removed meanwhile
 			}
