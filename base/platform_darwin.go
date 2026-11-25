@@ -35,7 +35,7 @@ func birthTime(_ string, info os.FileInfo) (int64, bool) {
 }
 
 // onVolume reports whether info describes an entry of volume (see volumeID).
-func onVolume(info os.FileInfo, volume uint64) bool {
+func onVolume(_ string, info os.FileInfo, volume uint64) bool {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	return !ok || uint64(st.Dev) == volume
 }

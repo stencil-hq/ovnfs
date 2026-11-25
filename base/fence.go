@@ -60,7 +60,7 @@ type fence struct {
 // shows reports whether the view shows the folder's entry at host, which
 // info, its lstat data, describes.
 func (f fence) shows(host string, info os.FileInfo) bool {
-	if !onVolume(info, f.volume) {
+	if !onVolume(host, info, f.volume) {
 		return false
 	}
 	if info.IsDir() {

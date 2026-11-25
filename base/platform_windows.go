@@ -56,7 +56,7 @@ func birthTime(_ string, info os.FileInfo) (int64, bool) {
 
 // onVolume reports true: Windows file information names no volume, and a
 // volume mounted in a folder is a reparse point no view follows.
-func onVolume(os.FileInfo, uint64) bool { return true }
+func onVolume(string, os.FileInfo, uint64) bool { return true }
 
 // setTimes updates the symlink itself through a reparse-point handle.
 func setTimes(p string, t time.Time, symlink bool) error {
