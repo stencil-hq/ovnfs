@@ -36,6 +36,9 @@ ovnfs rm fix-auth                   # remove the checkout and unused snapshots
   session that opened it); `ovnfs ls .` lists
   only checkouts of the current folder (a folder needs `.`, `..` or a slash);
   `ovnfs ls NAME` lists one checkout's snapshots.
+- `ovnfs source [NAME]` prints the folder a checkout (default: the one you
+  are in) was opened on, for scripts and hooks; `--json` gives
+  `{checkout, source}`; a checkout attached from another machine has none.
 - `ovnfs prune [DIR] [--idle 7d] [--no-diff] [--dry-run]` removes the
   checkouts matching every criterion given; `ovnfs ls` takes the same flags
   to preview. `rm` and `prune` remove unused snapshots; add

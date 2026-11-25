@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -128,6 +129,105 @@ func (cmd *lsCmd) Run(c *cli) error {
 	}
 	table(stdout, rows)
 	return nil
+}
+
+// sourceCmd prints the folder a checkout was opened on, the source field ls
+// reports, so a script in any checkout, git repository or not, gets it without
+// parsing ls output.
+type sourceCmd struct {
+	Checkout string `arg:"" optional:"" name:"CHECKOUT" help:"checkout (default: the one the current directory is in)" completion-predictor:"checkout"`
+}
+
+func (cmd *sourceCmd) Run(c *cli) error {
+	cwd := ""
+	if cmd.Checkout == "" {
+		var err error
+		if cwd, err = os.Getwd(); err != nil {
+			return fmt.Errorf("source: %w", err)
+		}
+	}
+	raw, err := c.call("ls", api.LsArgs{})
+	r, err := decodeReply[api.LsReply]("ls", raw, err)
+	if err != nil {
+		return err
+	}
+	h, err := sourceCheckout(r, cmd.Checkout, cwd)
+	if err != nil {
+		return fmt.Errorf("source: %w", err)
+	}
+	if !c.json {
+		fmt.Fprintln(stdout, h.Source)
+		return nil
+	}
+	out, err := json.Marshal(struct {
+		Checkout string `json:"checkout"`
+		Source   string `json:"source"`
+	}{h.Name, h.Source})
+	if err != nil {
+		return fmt.Errorf("source: encoding reply: %w", err)
+	}
+	fmt.Println(string(out))
+	return nil
+}
+
+// sourceCheckout picks the checkout named name or, without a name, the one
+// whose folder holds cwd (see checkoutAt). It refuses a checkout attached from
+// another machine, which has no folder on this host.
+func sourceCheckout(r api.LsReply, name, cwd string) (api.Checkout, error) {
+	byName := name != ""
+	if !byName && len(r.Checkouts) > 0 {
+		name = checkoutAt(filepath.Dir(r.Checkouts[0].Path), cwd)
+	}
+	i := slices.IndexFunc(r.Checkouts, func(h api.Checkout) bool { return h.Name == name })
+	switch {
+	case i < 0 && byName:
+		return api.Checkout{}, fmt.Errorf("no checkout %s", name)
+	case i < 0:
+		return api.Checkout{}, fmt.Errorf("the current directory is not inside a checkout; name one")
+	}
+	h := r.Checkouts[i]
+	if !localFolder(h.Source) {
+		return h, fmt.Errorf("checkout %s is attached from another machine (%s) and has no local folder", h.Name, h.Source)
+	}
+	return h, nil
+}
+
+// checkoutAt names the first directory below mount that holds cwd, under any
+// spelling of the mount (see mountSpellings), or failing that holds cwd with its
+// symlinks resolved, which walks the mount; "" when cwd is outside it.
+func checkoutAt(mount, cwd string) string {
+	at := func(p string) string {
+		for _, s := range mountSpellings(mount) {
+			if rel, err := filepath.Rel(s, p); err == nil && rel != "." && filepath.IsLocal(rel) {
+				name, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
+				return name
+			}
+		}
+		return ""
+	}
+	if name := at(cwd); name != "" {
+		return name
+	}
+	real, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return ""
+	}
+	return at(real)
+}
+
+// localFolder reports whether a checkout's source is a folder on this host.
+// An attached checkout's source is host + ":" + dir (see Registry.Offer), so
+// on Windows a one-letter host reads as a drive, as in c:/src; a local source
+// comes from filepath.Abs and EvalSymlinks, so it continues with a backslash
+// after its volume name.
+func localFolder(source string) bool {
+	if !filepath.IsAbs(source) {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.HasPrefix(source[len(filepath.VolumeName(source)):], `\`)
+	}
+	return true
 }
 
 // scopeLsReply lists snapshots of the current checkout or, when its name is

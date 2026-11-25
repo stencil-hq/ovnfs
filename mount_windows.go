@@ -24,6 +24,18 @@ func mountRoots(mount string) []string {
 	return []string{filepath.VolumeName(mount) + "/", filepath.ToSlash(smbRemote) + "/"}
 }
 
+// mountSpellings are the names a working directory inside the mount can give
+// it: the drive as reported, the drive root and SMB share of mountRoots, and
+// WinFsp's network volume \\ovnfs\<letter>, which the VolumePrefix option in
+// winfsp's Mount sets.
+func mountSpellings(mount string) []string {
+	s := append([]string{mount}, mountRoots(mount)...)
+	if v := filepath.VolumeName(mount); len(v) == 2 && v[1] == ':' {
+		s = append(s, `\\ovnfs\`+v[:1]+`\`)
+	}
+	return s
+}
+
 // The network provider (mpr) and SSPI (sspicli) calls that map drives load on first use.
 var (
 	mpr     = windows.NewLazySystemDLL("mpr.dll")

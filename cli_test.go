@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -175,6 +176,87 @@ func TestResolveTarget(t *testing.T) {
 		}
 		if dir != tt.dir || checkout != tt.checkout {
 			t.Errorf("resolveTarget(%q) = dir %q checkout %q; want dir %q checkout %q", tt.arg, dir, checkout, tt.dir, tt.checkout)
+		}
+	}
+}
+
+// TestSourceCheckout checks that source picks a checkout by name or by the
+// current directory, through symlinks, and refuses checkouts attached from
+// another machine.
+func TestSourceCheckout(t *testing.T) {
+	tmp, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(tmp, "mnt", "checkouts")
+	for _, d := range []string{"ap/sub", "app/sub", "web/deep/er", "we", "other"} {
+		if err := os.MkdirAll(filepath.Join(mount, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(tmp, "link")
+	if err := os.Symlink(filepath.Join(tmp, "mnt"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	into := filepath.Join(tmp, "into")
+	if err := os.Symlink(filepath.Join(mount, "we"), into); err != nil {
+		t.Fatal(err)
+	}
+	src := func(n string) string { return filepath.Join(tmp, "src", n) }
+	// A Windows mount is a drive, whose parent mountSpellings does not
+	// resolve; there the link cwd cases match through the resolved cwd instead.
+	reported := filepath.Join(link, "checkouts")
+	if runtime.GOOS == "windows" {
+		reported = mount
+	}
+	r := api.LsReply{Checkouts: []api.Checkout{
+		{Name: "ap", Path: filepath.Join(reported, "ap"), Source: src("ap")},
+		{Name: "web", Path: filepath.Join(reported, "web"), Source: src("web")},
+		{Name: "we", Path: filepath.Join(reported, "we"), Source: src("we")},
+		{Name: "app", Path: filepath.Join(reported, "app"), Source: "laptop:/src/app"},
+	}}
+	tests := []struct {
+		name, cwd string
+		want      string // checkout name
+		wantErr   string // substring of the error
+	}{
+		{name: "web", want: "web"},
+		{cwd: filepath.Join(mount, "web"), want: "web"},
+		{cwd: filepath.Join(mount, "web", "deep", "er"), want: "web"},
+		{cwd: filepath.Join(link, "checkouts", "web", "deep"), want: "web"},
+		{cwd: filepath.Join(mount, "ap", "sub"), want: "ap"},
+		{cwd: filepath.Join(mount, "we"), want: "we"},
+		{cwd: into, want: "we"},
+		{cwd: filepath.Join(mount, "web", "gone"), want: "web"},
+		{cwd: filepath.Join(mount, "other"), wantErr: "not inside a checkout"},
+		{cwd: tmp, wantErr: "not inside a checkout"},
+		{name: "nope", wantErr: "no checkout nope"},
+		{name: "app", wantErr: "checkout app is attached from another machine (laptop:/src/app) and has no local folder"},
+		{cwd: filepath.Join(mount, "app", "sub"), wantErr: "attached from another machine (laptop:/src/app)"},
+	}
+	for _, tt := range tests {
+		got, err := sourceCheckout(r, tt.name, tt.cwd)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("sourceCheckout(%q, %q) error = %v; want containing %q", tt.name, tt.cwd, err, tt.wantErr)
+			}
+			continue
+		}
+		if err != nil || got.Name != tt.want {
+			t.Errorf("sourceCheckout(%q, %q) = %q, %v; want %q", tt.name, tt.cwd, got.Name, err, tt.want)
+		}
+	}
+}
+
+// TestLocalFolder checks which sources name a folder on Windows, where an
+// attached checkout's one-letter host reads as a drive.
+func TestLocalFolder(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("only Windows reads host:dir as a drive")
+	}
+	for source, want := range map[string]bool{`C:\src`: true, `\\host\share\src`: true, "c:/src": false, "c:src": false} {
+		if got := localFolder(source); got != want {
+			t.Errorf("localFolder(%q) = %v; want %v", source, got, want)
 		}
 	}
 }

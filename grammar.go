@@ -119,6 +119,7 @@ type verbs struct {
 	Pull        pullCmd                   `cmd:"" group:"checkouts" help:"merge the folder's newer files into a checkout, to resolve conflicts there (--from HOST: an attached machine's changes)"`
 	Grep        grepCmd                   `cmd:"" group:"inspect" help:"search contents in the daemon, bypassing the checkout mount"`
 	Glob        globCmd                   `cmd:"" group:"inspect" help:"list matching paths in the daemon, bypassing the checkout mount"`
+	Source      sourceCmd                 `cmd:"" group:"inspect" help:"print the folder a checkout was opened on"`
 	Explain     explainCmd                `cmd:"" group:"inspect" help:"show which class a path gets and which rule decided"`
 	Plan        planCmd                   `cmd:"" group:"inspect" help:"show what a launch elsewhere would transfer, rebuild and leave"`
 	Rm          rmCmd                     `cmd:"" group:"clean up" help:"remove a checkout and its unused snapshots, with whatever was not applied or landed"`

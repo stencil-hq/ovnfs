@@ -86,6 +86,12 @@ func unmount(dir string, force bool) error {
 	return nil
 }
 
+// mountSpellings are the names a working directory inside the mount can give
+// it: as reported and with its parent's symlinks resolved.
+func mountSpellings(mount string) []string {
+	return []string{mount, mountPath(mount)}
+}
+
 // mountPath resolves aliases in the parent without entering a possibly hung mount.
 func mountPath(dir string) string {
 	dir = filepath.Clean(dir)

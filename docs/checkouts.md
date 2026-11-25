@@ -247,6 +247,12 @@ both `P=$(ovnfs new)` and `ovnfs new 2>&1 | tail -1` yield the path. `rm`,
 `--json` prints the whole reply instead of any of this. Tables show times as
 one word (`2026-11-18T05:52`), so their columns split on blanks.
 
+`source [CHECKOUT]` prints the folder a checkout was opened on, the `source`
+field of `ls`, as one line; without a name it uses the checkout the current
+directory is in, git repository or not, so a hook or script needs no `jq`.
+`--json` prints `{"checkout": NAME, "source": PATH}`. A checkout attached from
+another machine has no folder on this machine, and `source` fails for it.
+
 ## Listing and cleanup: `ls` and `prune`
 
 `ls` shows each checkout's TOUCHED time: its last write through its folder or
