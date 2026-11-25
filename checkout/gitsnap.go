@@ -46,8 +46,9 @@ type gitCached struct {
 // saveGitdir stores dir, a checkout's private git directory, as a tree and returns
 // its id. The shared objects links (the root's and its absorbed submodules') and
 // lock files of in-flight git commands are left out; empty directories are kept,
-// since git requires refs/ to exist.
-func saveGitdir(st *store.Store, dir string, c *gitCache) (store.OID, error) {
+// since git requires refs/ to exist. With skipHooks, symlinks named hooks are
+// left out too: they point at this host's folder, and a new checkout gets its own.
+func saveGitdir(st *store.Store, dir string, c *gitCache, skipHooks bool) (store.OID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// No object is removed while held, and Build keeps the tree's objects safe from
@@ -77,7 +78,7 @@ func saveGitdir(st *store.Store, dir string, c *gitCache) (store.OID, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if rel == "objects" || (d.Name() == "objects" && d.Type()&fs.ModeSymlink != 0) {
+		if rel == "objects" || (d.Name() == "objects" || (skipHooks && d.Name() == "hooks")) && d.Type()&fs.ModeSymlink != 0 {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -164,7 +165,9 @@ func skipVanished(err error) error {
 // materializeGitdir writes the git directory stored as tree into the new path dst,
 // linking its objects, and those of the absorbed submodules' git directories it
 // holds, to the base's shared object directories (objects of a source.Repo.Module).
-func materializeGitdir(st *store.Store, tree store.OID, dst string, objects func(module string) string, modules []source.Repo) error {
+// With skipHooks it leaves out symlinks named hooks, which a snapshot taken with
+// Config.GitHooks off holds.
+func materializeGitdir(st *store.Store, tree store.OID, dst string, objects func(module string) string, modules []source.Repo, skipHooks bool) error {
 	files, err := st.Flatten(tree)
 	if err != nil {
 		return err
@@ -173,6 +176,9 @@ func materializeGitdir(st *store.Store, tree store.OID, dst string, objects func
 		return err
 	}
 	for p, f := range files {
+		if skipHooks && path.Base(p) == "hooks" && f.Mode == store.ModeSymlink {
+			continue
+		}
 		target := filepath.Join(dst, filepath.FromSlash(p))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
@@ -215,7 +221,7 @@ func (r *Registry) saveGit(h *checkoutRecord) (store.OID, error) {
 	if !h.meta.Git {
 		return "", nil
 	}
-	tree, err := saveGitdir(r.store, r.gitdirPath(h.meta.dir()), &h.git)
+	tree, err := saveGitdir(r.store, r.gitdirPath(h.meta.dir()), &h.git, r.config.GitHooks)
 	if err != nil && h.retired.Load() {
 		return "", failure("not_found", "no checkout %s", h.meta.Name)
 	}
@@ -246,7 +252,7 @@ func (r *Registry) prepareGit(ctx context.Context, tree store.OID, legacy, baseI
 		}
 		r.mu.RUnlock()
 		objects := func(module string) string { return r.objectsPath(baseID, module) }
-		err = materializeGitdir(r.store, tree, dst, objects, modules)
+		err = materializeGitdir(r.store, tree, dst, objects, modules, r.config.GitHooks)
 	} else {
 		err = git.CopyGitdir(legacy, dst, r.objectsPath(baseID, ""))
 	}

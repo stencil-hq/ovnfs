@@ -326,6 +326,7 @@ func (r *Registry) openCheckouts(disks []diskCheckout) error {
 					if errs[i] = git.MarkCheckout(r.gitdirPath(disk.dir()), disk.Name); errs[i] != nil {
 						continue
 					}
+					r.linkCheckoutHooks(r.gitdirPath(disk.dir()), p.base.view, disk.Name)
 				}
 				fss[i], errs[i] = openOverlay(p.upper, p.stack, p.base.view.Bottom(p.caches), r.config.Memory)
 			}

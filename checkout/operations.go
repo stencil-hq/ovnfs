@@ -790,6 +790,46 @@ func markGitdirs(gitdir, name string, view *base.Base) error {
 	return nil
 }
 
+// linkCheckoutHooks links the hooks of checkout name's private git directory and
+// of its absorbed submodules' to those of the repositories view captured
+// (git.Repo.LinkHooks), with Config.GitHooks on. It tries every one, and the
+// links that failed go into one notice: the checkout works without them.
+func (r *Registry) linkCheckoutHooks(gitdir string, view *base.Base, name string) {
+	if !r.config.GitHooks {
+		return
+	}
+	var errs []error
+	top := view.Meta().Dir
+	// A repository found elsewhere than the captured folder encloses it (the
+	// folder's own is gone): its hooks are another project's.
+	if repo := view.Domains().Repo(""); repo != nil && sameDir(repo.Top, top) {
+		errs = append(errs, repo.LinkHooks(gitdir))
+	}
+	for _, sub := range submodules(view) {
+		repo := view.Domains().Repo(sub.Path)
+		if repo == nil || !sameDir(repo.Top, filepath.Join(top, filepath.FromSlash(sub.Path))) {
+			continue
+		}
+		// A submodule removed in the checkout has no git directory to link.
+		if err := repo.LinkHooks(filepath.Join(gitdir, filepath.FromSlash(sub.Module))); !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		r.enqueueNotice(baseNotice{base: view.Meta().ID, fault: "link hooks of checkout " + name + ": " + err.Error()})
+	}
+}
+
+// sameDir reports whether a and b are the same directory, however either spells it.
+func sameDir(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	return err == nil && os.SameFile(ai, bi)
+}
+
 // installGitfiles points a new checkout's submodules at their private git
 // directories below its own (git/dir), as the root's .git points at that
 // directory, and returns the directories it copied up to hold the gitfiles
@@ -1006,15 +1046,24 @@ func (r *Registry) createFromSnapshotLocked(ctx context.Context, name string, s 
 	return nil, errors.Join(err, r.removeCheckoutFiles(name), r.persistLocked())
 }
 
-// created adds the checkout's git remote (syncRemotes) and notifies export
-// watchers and subscribers after publication is durable.
+// created adds the checkout's git remote (syncRemotes) and hooks link
+// (linkCheckoutHooks), and notifies export watchers and subscribers after
+// publication is durable.
 func (r *Registry) created(h api.Checkout) {
 	r.mu.RLock()
 	var repo *git.Repo
+	var gitdir string
+	var view *base.Base
 	if rec := r.checkouts[h.Name]; rec != nil {
 		repo = localRepo(rec.base)
+		if rec.meta.Git {
+			gitdir, view = r.gitdirPath(rec.meta.dir()), rec.base.view
+		}
 	}
 	r.mu.RUnlock()
+	if gitdir != "" {
+		r.linkCheckoutHooks(gitdir, view, h.Name)
+	}
 	r.syncRemotes(repo)
 	r.emit(Event{Name: "created", Payload: map[string]any{"checkout": h}})
 	if r.config.Changed != nil {

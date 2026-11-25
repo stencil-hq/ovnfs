@@ -59,6 +59,7 @@ type Daemon struct {
 	NFSNoIntr  string
 	NFSXattrs  string
 	GitRemotes string
+	GitHooks   string
 	Local      string
 }
 
@@ -75,7 +76,7 @@ type Manifest struct {
 var daemonKeys = map[string]string{
 	"state": "", "mount": "", "proto": "",
 	"memory": "!!int", "fsync": "!!bool", "blob_cache": "!!int", "atime": "!!bool",
-	"git_remotes": "!!bool", "local": "",
+	"git_remotes": "!!bool", "git_hooks": "!!bool", "local": "",
 	"nfs_io_size": "!!int", "nfs_nointr": "!!bool", "nfs_xattrs": "!!bool",
 }
 
@@ -220,6 +221,7 @@ type fileSchema struct {
 	NFSNoIntr  string           `yaml:"nfs_nointr"`
 	NFSXattrs  string           `yaml:"nfs_xattrs"`
 	GitRemotes string           `yaml:"git_remotes"`
+	GitHooks   string           `yaml:"git_hooks"`
 	Local      string           `yaml:"local"`
 }
 
@@ -240,7 +242,7 @@ func parseLayer(data []byte, display string, user bool) (layer, error) {
 	if root.Kind != yaml.MappingNode {
 		return layer{}, fmt.Errorf("%s:%d: expected a mapping with rules, cache and env", display, root.Line)
 	}
-	if err := checkKeys(root, display, "", "rules", "cache", "env", "state", "mount", "proto", "memory", "fsync", "blob_cache", "atime", "git_remotes", "nfs_io_size", "nfs_nointr", "nfs_xattrs", "local"); err != nil {
+	if err := checkKeys(root, display, "", "rules", "cache", "env", "state", "mount", "proto", "memory", "fsync", "blob_cache", "atime", "git_remotes", "git_hooks", "nfs_io_size", "nfs_nointr", "nfs_xattrs", "local"); err != nil {
 		return layer{}, err
 	}
 	for i := 0; i+1 < len(root.Content); i += 2 {
@@ -253,7 +255,7 @@ func parseLayer(data []byte, display string, user bool) (layer, error) {
 			if p := v.Value; v.Kind == yaml.ScalarNode && p != "" && !strings.HasPrefix(p, "~/") && !filepath.IsAbs(p) && !(k == "mount" && driveLetter(p)) {
 				return layer{}, fmt.Errorf("%s:%d: %s must be an absolute path or start with ~/", display, v.Line, k)
 			}
-		case "proto", "memory", "fsync", "blob_cache", "atime", "git_remotes", "nfs_io_size", "nfs_nointr", "nfs_xattrs", "local":
+		case "proto", "memory", "fsync", "blob_cache", "atime", "git_remotes", "git_hooks", "nfs_io_size", "nfs_nointr", "nfs_xattrs", "local":
 			if !user {
 				return layer{}, fmt.Errorf("%s:%d: %q is read only from %s", display, root.Content[i].Line, k, userFile)
 			}
@@ -288,7 +290,7 @@ func parseLayer(data []byte, display string, user bool) (layer, error) {
 	}
 	l := layer{env: f.Env, daemon: Daemon{
 		State: f.State, Mount: f.Mount, Proto: f.Proto, Memory: f.Memory,
-		Fsync: f.Fsync, BlobCache: f.BlobCache, Atime: f.Atime, GitRemotes: f.GitRemotes, NFSIOSize: f.NFSIOSize,
+		Fsync: f.Fsync, BlobCache: f.BlobCache, Atime: f.Atime, GitRemotes: f.GitRemotes, GitHooks: f.GitHooks, NFSIOSize: f.NFSIOSize,
 		NFSNoIntr: f.NFSNoIntr, NFSXattrs: f.NFSXattrs, Local: f.Local,
 	}}
 	for k, c := range f.Cache {

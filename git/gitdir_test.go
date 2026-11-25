@@ -238,3 +238,72 @@ func TestMakeGitdirConfig(t *testing.T) {
 		}
 	}
 }
+
+// TestLinkHooks checks that LinkHooks links a git directory's hooks to the
+// repository's when that is a directory, and changes nothing otherwise or when the
+// git directory already has a hooks entry.
+func TestLinkHooks(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, hooks, gitdir string)
+		check func(t *testing.T, hooks, link string)
+	}{
+		{"hooks directory", func(t *testing.T, hooks, gitdir string) {}, func(t *testing.T, hooks, link string) {
+			if got, err := os.Readlink(link); err != nil || got != hooks {
+				t.Fatalf("link = %q, %v; want %s", got, err, hooks)
+			}
+		}},
+		{"missing", func(t *testing.T, hooks, gitdir string) {
+			if err := os.RemoveAll(hooks); err != nil {
+				t.Fatal(err)
+			}
+		}, absent},
+		{"a file", func(t *testing.T, hooks, gitdir string) {
+			if err := os.RemoveAll(hooks); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(hooks, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, absent},
+		{"existing directory", func(t *testing.T, hooks, gitdir string) {
+			if err := os.Mkdir(filepath.Join(gitdir, "hooks"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, func(t *testing.T, hooks, link string) {
+			if info, err := os.Lstat(link); err != nil || !info.IsDir() {
+				t.Fatalf("existing hooks directory replaced: %v, %v", info, err)
+			}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// A linked worktree's own git directory holds no hooks: they are
+			// the common directory's.
+			wt := filepath.Join(t.TempDir(), "wt")
+			testGit(t, testRepo(t).Top, "worktree", "add", "-q", wt)
+			repo, err := Open(wt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hooks := filepath.Join(repo.CommonDir, "hooks")
+			if err := os.MkdirAll(hooks, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			gitdir := t.TempDir()
+			c.setup(t, hooks, gitdir)
+			if err := repo.LinkHooks(gitdir); err != nil {
+				t.Fatal(err)
+			}
+			c.check(t, hooks, filepath.Join(gitdir, "hooks"))
+		})
+	}
+}
+
+// absent checks that no hooks entry exists at link.
+func absent(t *testing.T, _, link string) {
+	t.Helper()
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("hooks entry exists: %v", err)
+	}
+}

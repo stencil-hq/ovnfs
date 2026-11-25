@@ -109,7 +109,9 @@ directory: commit freely, then `land` the commits on the folder's branch,
 `apply --branch NAME` to bring them back as another branch, or
 `git fetch ovnfs/NAME` them from its git remote. In a
 [jj](https://jj-vcs.github.io/jj/) repository each checkout is also a jj
-workspace of it.
+workspace of it. With `git_hooks` on, a checkout shares the folder's git hooks,
+so a hook written in it lands in the folder (see
+[checkouts](docs/checkouts.md#git-hooks)).
 
 ovnfs isolates files, not processes: it is not a sandbox.
 

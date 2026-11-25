@@ -88,7 +88,10 @@ forces a new mount rather than retaining one that speaks the old protocol.
 
 By default a repository gets a git remote per checkout of it;
 `serve --no-git-remotes` (`OVNFS_GIT_REMOTES=0`) turns that off, see
-[checkouts](checkouts.md#git-remotes).
+[checkouts](checkouts.md#git-remotes). A checkout's private git directory has
+no hooks by default; `serve --git-hooks` (`OVNFS_GIT_HOOKS=1`) links it to the
+folder's hooks, as a linked worktree uses them, see
+[checkouts](checkouts.md#git-hooks).
 
 ## Classes
 
@@ -275,6 +278,7 @@ env:
 | `nfs_nointr` | boolean | user file only: disable signal interruption on macOS NFS (default false) |
 | `nfs_xattrs` | boolean | user file only: keep the `._` files macOS NFS clients store extended attributes in (default false) |
 | `git_remotes` | boolean | user file only: give a repository a git remote `ovnfs/NAME` per checkout (default true) |
+| `git_hooks` | boolean | user file only: link each checkout's private git directory to the repository's hooks (default false) |
 | `local` | string | user file only: how new checkouts serve `local` paths — `virtual` (default, read live from the folder until written) or `frozen` (clone/copy at open) |
 
 `rules` is a block scalar (`rules: |`) with one `<class> <predicate>` per line.
@@ -302,13 +306,14 @@ fsync: true
 blob_cache: 64M
 atime: false
 git_remotes: true
+git_hooks: false
 ```
 
 For each setting, the explicit `serve` flag wins over its environment variable,
 which wins over the user file, which wins over the built-in default. The
 environment variables are `OVNFS_MEMORY`, `OVNFS_FSYNC`, `OVNFS_BLOB_CACHE`,
 `OVNFS_ATIME`, `OVNFS_NFS_IO_SIZE`, `OVNFS_NFS_NOINTR`, `OVNFS_NFS_XATTRS`,
-`OVNFS_GIT_REMOTES` and `OVNFS_IDLE_EXIT`;
+`OVNFS_GIT_REMOTES`, `OVNFS_GIT_HOOKS` and `OVNFS_IDLE_EXIT`;
 `proto` has no environment variable.
 Serve settings take effect the next time the daemon starts.
 
@@ -331,7 +336,7 @@ ovnfs config edit --global
 The keys are `rules`, `cache.ROOT.rebuild`, `cache.ROOT.key`, `env.image`,
 `env.setup` and the daemon settings `state`, `mount`, `proto`, `memory`,
 `fsync`, `blob_cache`, `atime`, `nfs_io_size`, `nfs_nointr`, `nfs_xattrs`,
-`git_remotes` and `local`.
+`git_remotes`, `git_hooks` and `local`.
 A cache root may hold dots (`cache.web/.next.key`) and matches its entry
 however it is spelled (`cache.web/dist.rebuild` finds `./web/dist`).
 `rules`, `env.setup` and

@@ -7,7 +7,8 @@
 // are served copy-on-write from a snapshot of the folder's that ovnfs owns
 // (see useCaches); hidden paths do not exist.
 // A checkout of a git repository also gets a private git directory, so git works
-// inside it without writing to the user's repository.
+// inside it without writing to the user's repository (with Config.GitHooks, its
+// hooks link to the repository's own, so writes to them land there).
 //
 // Every method on Registry is one admin operation (package api) with the same
 // name and argument struct as the CLI verb.
@@ -159,6 +160,11 @@ type Config struct {
 	// GitRemotes gives a source repository a git remote ovnfs/<name> for each
 	// live checkout of it (see Registry.syncRemotes); off, ovnfs removes them.
 	GitRemotes bool
+	// GitHooks links the hooks of each checkout's private git directories to
+	// those of the source repositories when it is created or reopened (see
+	// Registry.linkCheckoutHooks), so git finds the hooks a linked worktree
+	// would, and snapshots keep no hooks symlink. Off, nothing is linked.
+	GitHooks bool
 	// FrozenLocal clones or copies local roots of new checkouts at open
 	// instead of forwarding reads directly to the folder.
 	FrozenLocal bool

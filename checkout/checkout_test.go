@@ -29,6 +29,7 @@ type fixture struct {
 	mu           sync.Mutex
 	invalidated  []invalidation  // Config.Invalidate calls, in order
 	gitRemotes   bool            // Config.GitRemotes at the next open
+	gitHooks     bool            // Config.GitHooks at the next open
 	frozenLocal  bool            // Config.FrozenLocal at the next open
 	stats        *stats.Recorder // Config.Stats at the next open
 }
@@ -85,9 +86,19 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
+// newHooksFixture is newFixture with Config.GitHooks on, reopened as TestGitRemotes does.
+func newHooksFixture(t *testing.T) *fixture {
+	t.Helper()
+	f := newFixture(t)
+	f.reg.Close()
+	f.gitHooks = true
+	f.open()
+	return f
+}
+
 // config is the registry configuration of the fixture's state.
 func (f *fixture) config() Config {
-	return Config{State: f.state, Mount: f.mount, Node: "n_" + filepath.Base(filepath.Dir(f.state)), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, GitRemotes: f.gitRemotes, FrozenLocal: f.frozenLocal, Stats: f.stats,
+	return Config{State: f.state, Mount: f.mount, Node: "n_" + filepath.Base(filepath.Dir(f.state)), Memory: overlay.NewMemory(64<<20, 1<<20, 0), BlobCache: 64 << 20, GitRemotes: f.gitRemotes, GitHooks: f.gitHooks, FrozenLocal: f.frozenLocal, Stats: f.stats,
 		Invalidate: func(checkout string, paths, trees []string) {
 			f.mu.Lock()
 			f.invalidated = append(f.invalidated, invalidation{checkout: checkout, paths: slices.Clone(paths), trees: slices.Clone(trees)})
