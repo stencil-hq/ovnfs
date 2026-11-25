@@ -83,12 +83,37 @@ func newIgnoreRule(line string, domain []string) ignoreRule {
 	if include {
 		line = line[1:]
 	}
-	if !strings.HasSuffix(line, "\\ ") {
-		line = strings.TrimRight(line, " ")
-	}
+	line = trimTrailingSpaces(line)
 	rule := newPatternRule(line, domain)
 	rule.include = include
 	return rule
+}
+
+// trimTrailingSpaces drops a line's unescaped trailing spaces, keeping the one
+// a backslash quotes, as git's trim_trailing_spaces does: every space after the
+// escaped one is unescaped, so only that one stays.
+func trimTrailingSpaces(line string) string {
+	last := -1
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case ' ':
+			if last < 0 {
+				last = i
+			}
+		case '\\':
+			// Skip the quoted byte; a line ending in a backslash keeps it.
+			if i++; i == len(line) {
+				return line
+			}
+			last = -1
+		default:
+			last = -1
+		}
+	}
+	if last >= 0 {
+		return line[:last]
+	}
+	return line
 }
 
 // newPatternRule compiles a wildcard pattern with gitignore's scope rules

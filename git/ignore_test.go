@@ -15,7 +15,7 @@ func TestIgnoreMatchesGit(t *testing.T) {
 	testWrite(t, global, "*.global\nglobal-dir/\n")
 	testGit(t, r.Top, "config", "core.excludesFile", global)
 	testWrite(t, filepath.Join(r.CommonDir, "info", "exclude"), "*.info\nshared-only\n")
-	testWrite(t, filepath.Join(r.Top, ".gitignore"), "\ufeff# comment\n*.log\n!root.keep.log\n/root-only\nbuild/\n!build/keep\nonly-dir/\nnegated/*\n!negated/keep\nanchored/path\n**/generated/**\n\\#literal\n\\!literal\nspace\\ \nreinclude.global\n!reinclude.global\n")
+	testWrite(t, filepath.Join(r.Top, ".gitignore"), "\ufeff# comment\n*.log\n!root.keep.log\n/root-only\nbuild/\n!build/keep\nonly-dir/\nnegated/*\n!negated/keep\nanchored/path\n**/generated/**\n\\#literal\n\\!literal\nspace\\ \npadded\\  \nreinclude.global\n!reinclude.global\n")
 	testWrite(t, filepath.Join(r.Top, "sub", ".gitignore"), "!keep.log\n/local-only\nlocal-dir/\n*.tmp\n!keep.tmp\n")
 	testWrite(t, filepath.Join(r.Top, "build", ".gitignore"), "!keep\n")
 	testWrite(t, filepath.Join(r.Top, "trailing", ".gitignore"), "!keep\n")
@@ -43,6 +43,7 @@ func TestIgnoreMatchesGit(t *testing.T) {
 		{"anchored/path", false}, {"sub/anchored/path", false},
 		{"generated/root", false}, {"sub/generated/deep/file", false},
 		{"#literal", false}, {"!literal", false}, {"space ", false},
+		{"padded ", false}, {"padded  ", false},
 		{"x.global", false}, {"sub/x.global", false}, {"reinclude.global", false},
 		{"x.info", false}, {"sub/x.info", false}, {"shared-only", false},
 		{"global-dir/file", false}, {"sub/global-dir/file", false},
