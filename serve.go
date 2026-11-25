@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -686,10 +687,37 @@ func attach(proto string, addr net.Addr, mount, user, password string, settings 
 	if err := makeMountPoint(mount); err != nil {
 		return fmt.Errorf("mount directory: %w", err)
 	}
-	if err := mountServer(proto, addr, mount, user, password, settings); err != nil {
+	err := mountServer(proto, addr, mount, user, password, settings)
+	if err != nil && runtime.GOOS == "darwin" && proto == "nfs" && strandedMountPoint(mount, err) {
+		moved := mount + ".busy-" + time.Now().UTC().Format("20060102T150405Z")
+		if rerr := os.Rename(mount, moved); rerr != nil {
+			log.Printf("move busy mount point %s: %v", mount, rerr)
+			return fmt.Errorf("mount: %w", err)
+		}
+		if err := makeMountPoint(mount); err != nil {
+			return fmt.Errorf("mount directory: %w", err)
+		}
+		if err = mountServer(proto, addr, mount, user, password, settings); err == nil {
+			log.Printf("mount point %s was busy with no mount; moved it to %s and mounted again", mount, moved)
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
 	return nil
+}
+
+// strandedMountPoint reports an empty directory that the mount command found
+// busy (exit status 16) although no mount covers it: a forced unmount hung in
+// the kernel still holds it. The caller moves it aside and leaves it there,
+// because the hung unmount can hold it until a reboot.
+func strandedMountPoint(mount string, err error) bool {
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 16 || mounted(mount) {
+		return false
+	}
+	entries, err := os.ReadDir(mount)
+	return err == nil && len(entries) == 0
 }
 
 // removeNodeLogs deletes STATE/nodes.log and the files named after it
