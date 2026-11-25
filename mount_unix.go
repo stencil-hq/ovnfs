@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -78,6 +79,10 @@ func unmount(dir string, force bool) error {
 		args = []string{"umount", "-f", dir}
 	}
 	if _, err := mountOutput(context.Background(), args); err != nil {
+		var hung *hungCommand
+		if errors.As(err, &hung) && hung.pid > 0 {
+			log.Printf("%s of %s passed its deadline; pid %d can still hold the mount point", hung.name, dir, hung.pid)
+		}
 		return err
 	}
 	if mounted(dir) {

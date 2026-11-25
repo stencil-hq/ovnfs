@@ -21,6 +21,10 @@ func TestMountCommandDeadline(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("deadline waited for the child: %s", elapsed)
 	}
+	var hung *hungCommand
+	if !errors.As(err, &hung) || hung.pid <= 0 || err.Error() != "sh: context deadline exceeded" {
+		t.Fatalf("deadline error lost the child pid: %v", err)
+	}
 }
 
 func TestMountCommandFailure(t *testing.T) {
