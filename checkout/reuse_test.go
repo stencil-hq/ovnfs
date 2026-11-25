@@ -161,6 +161,9 @@ func TestFolderCreatesReuseUnchangedCapture(t *testing.T) {
 	if got := gitRun(t, f.t.TempDir(), "--git-dir", f.gitdir("later"), "config", "ovnfs.checkout"); got != "later" {
 		t.Fatalf("checkout marker = %q", got)
 	}
+	if got := gitRun(t, f.t.TempDir(), "--git-dir", f.gitdir("later"), "config", "ovnfs.source"); got != edited.Source {
+		t.Fatalf("checkout source = %q, want %q", got, edited.Source)
+	}
 
 	gitRun(t, dir, "commit", "-q", "--allow-empty", "-m", "later")
 	committed := f.newCheckout(dir, "committed").Checkout
@@ -286,6 +289,9 @@ func TestNewOnCaptureStartsAsCaptured(t *testing.T) {
 	}
 	if got := gitRun(t, f.t.TempDir(), "--git-dir", f.gitdir("twin"), "config", "ovnfs.checkout"); got != "twin" {
 		t.Fatalf("twin marker = %q", got)
+	}
+	if got := gitRun(t, f.t.TempDir(), "--git-dir", f.gitdir("twin"), "config", "ovnfs.source"); got != first.Source {
+		t.Fatalf("twin source = %q, want %q", got, first.Source)
 	}
 	if got := gitRun(t, f.t.TempDir(), "--git-dir", f.gitdir("twin"), "cat-file", "-t", "HEAD^{tree}"); got != "tree" {
 		t.Fatalf("twin cannot read its objects: %q", got)

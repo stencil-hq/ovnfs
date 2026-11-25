@@ -149,7 +149,7 @@ func TestSubmoduleGitdirs(t *testing.T) {
 	app := submoduleRepo(t)
 	orig := filepath.Join(app, ".git", "modules", "vendor", "sub")
 	head := gitRun(t, app, "--git-dir", orig, "rev-parse", "HEAD")
-	f.newCheckout(app, "app")
+	source := f.newCheckout(app, "app").Checkout.Source
 	module := filepath.Join(f.gitdir("app"), "modules", "vendor", "sub")
 	exported := f.export("app")
 	assertSubmodule(t, exported, "vendor/sub", module)
@@ -162,6 +162,9 @@ func TestSubmoduleGitdirs(t *testing.T) {
 	}
 	if got := gitRun(t, sub, "config", "--get", "ovnfs.checkout"); got != "app" {
 		t.Fatalf("submodule marker = %q", got)
+	}
+	if got := gitRun(t, sub, "config", "--get", "ovnfs.source"); got != source {
+		t.Fatalf("submodule source = %q, want %q", got, source)
 	}
 	gitRun(t, sub, "commit", "--allow-empty", "-qm", "agent")
 	agent := gitRun(t, sub, "rev-parse", "HEAD")

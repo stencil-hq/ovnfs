@@ -10,8 +10,9 @@ import (
 	"time"
 )
 
-// TestMarkCheckout rewrites the marker of a copied private git config as git would
-// read it, keeping every other line, and leaves a correct marker file untouched.
+// TestMarkCheckout rewrites the marker and source of a copied private git config
+// as git would read them, removes a source when there is none, keeps every other
+// line, and leaves a correctly marked file untouched.
 func TestMarkCheckout(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
@@ -28,7 +29,7 @@ func TestMarkCheckout(t *testing.T) {
 	}
 	cases := map[string]string{
 		"no section, no final newline": "[core]\n\tbare = false\n# trailing comment",
-		"inherited marker":             "[core]\n\tbare = false\n[ovnfs]\n\tcheckout = parent\n[user]\n\tname = me\n",
+		"inherited marker":             "[core]\n\tbare = false\n[ovnfs]\n\tcheckout = parent\n\tsource = /parent/folder\n[user]\n\tname = me\n",
 		"inline and continued marker":  "[OVNFS] Checkout = parent\n[core]\n\tbare = false\n[ovnfs]\n\tcheckout = par\\\nent\n\tother = kept\n",
 		"subsection kept":              "[ovnfs \"sub\"]\n\tcheckout = other\n[ovnfs]\n\t; checkout = commented\n\tcheckout = parent\n",
 		"comment ending in backslash":  "[ovnfs]\n\tcheckout = /x ; old \\\n\tfoo = keep\n",
@@ -49,7 +50,12 @@ func TestMarkCheckout(t *testing.T) {
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {
-			for _, marker := range []string{"child", `odd "name"; #x\`} {
+			marks := []struct{ name, source string }{
+				{"child", "/home/me/app"},
+				{`odd "name"; #x\`, `C:\Users\me\my app; #1 "x"\`},
+				{"remote", ""},
+			}
+			for _, mark := range marks {
 				dir := t.TempDir()
 				file := filepath.Join(dir, "config")
 				if err := os.WriteFile(file, []byte(config), 0o640); err != nil {
@@ -61,16 +67,25 @@ func TestMarkCheckout(t *testing.T) {
 					t.Fatal(err)
 				}
 				before := get(t, file, "--list")
-				if err := MarkCheckout(dir, marker); err != nil {
+				if err := MarkCheckout(dir, mark.name, mark.source); err != nil {
 					t.Fatal(err)
 				}
-				if got := get(t, file, "--get-all", "ovnfs.checkout"); got != marker {
-					t.Fatalf("marker = %q, want %q", got, marker)
+				if got := get(t, file, "--get-all", "ovnfs.checkout"); got != mark.name {
+					t.Fatalf("marker = %q, want %q", got, mark.name)
+				}
+				if mark.source == "" {
+					// git config exits 1 when the key is missing.
+					out, err := exec.Command("git", "config", "--file", file, "--get-all", "ovnfs.source").CombinedOutput()
+					if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
+						t.Fatalf("source %q kept without a source: %v", out, err)
+					}
+				} else if got := get(t, file, "--get-all", "ovnfs.source"); got != mark.source {
+					t.Fatalf("source = %q, want %q", got, mark.source)
 				}
 				withoutMarker := func(list string) []string {
 					var rest []string
 					for line := range strings.SplitSeq(list, "\n") {
-						if !strings.HasPrefix(line, "ovnfs.checkout=") {
+						if !strings.HasPrefix(line, "ovnfs.checkout=") && !strings.HasPrefix(line, "ovnfs.source=") {
 							rest = append(rest, line)
 						}
 					}
@@ -89,7 +104,7 @@ func TestMarkCheckout(t *testing.T) {
 				if err := os.Chtimes(file, old, old); err != nil {
 					t.Fatal(err)
 				}
-				if err := MarkCheckout(dir, marker); err != nil {
+				if err := MarkCheckout(dir, mark.name, mark.source); err != nil {
 					t.Fatal(err)
 				}
 				if info, err := os.Stat(file); err != nil || !info.ModTime().Equal(old) {

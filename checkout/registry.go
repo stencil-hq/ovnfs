@@ -323,7 +323,7 @@ func (r *Registry) openCheckouts(disks []diskCheckout) error {
 			for i := next.Add(1) - 1; i < int64(len(disks)); i = next.Add(1) - 1 {
 				disk, p := disks[i], plan[i]
 				if disk.Git {
-					if errs[i] = git.MarkCheckout(r.gitdirPath(disk.dir()), disk.Name); errs[i] != nil {
+					if errs[i] = git.MarkCheckout(r.gitdirPath(disk.dir()), disk.Name, p.base.view.Meta().Dir); errs[i] != nil {
 						continue
 					}
 				}

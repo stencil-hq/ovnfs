@@ -197,26 +197,32 @@ func CopyGitdir(src, dst, objects string) error {
 	return hostfile.Symlink(objects, filepath.Join(dst, "objects"))
 }
 
-// MarkCheckout sets ovnfs.checkout to name in a private git directory's own config, so
-// only this directory identifies as an ovnfs checkout (inherited user config and the
-// source repo stay unmarked). The registry calls it whenever it creates or reopens a
-// checkout; it keeps every other line and leaves the file untouched when the marker
-// already names the checkout.
-func MarkCheckout(gitdir, name string) error {
-	return rewriteConfig(gitdir, func(config string) string { return markConfig(config, name) })
+// MarkCheckout sets ovnfs.checkout to name and ovnfs.source to source, the folder
+// of the capture the checkout sits on, in a private git directory's own config,
+// so only this directory identifies as an ovnfs checkout (inherited user config
+// and the source repo stay unmarked). An empty source (a remote base has no local
+// folder) removes ovnfs.source. The registry calls it whenever it creates or
+// reopens a checkout; it keeps every other line and leaves the file untouched
+// when nothing changes.
+func MarkCheckout(gitdir, name, source string) error {
+	return rewriteConfig(gitdir, func(config string) string { return markConfig(config, name, source) })
 }
 
-// MarkNew writes config, with ovnfs.checkout set to name as MarkCheckout sets it,
+// MarkNew writes config, marked with name and source as MarkCheckout marks it,
 // as the config of git directory gitdir, which nothing reads yet: in one write,
 // not atomically.
-func MarkNew(gitdir, config, name string) error {
-	return os.WriteFile(filepath.Join(gitdir, "config"), []byte(markConfig(config, name)), 0o644)
+func MarkNew(gitdir, config, name, source string) error {
+	return os.WriteFile(filepath.Join(gitdir, "config"), []byte(markConfig(config, name, source)), 0o644)
 }
 
 // markConfig rewrites git config text so its [ovnfs] section holds exactly one
-// checkout = name (see editConfig).
-func markConfig(config, name string) string {
-	return editConfig(config, "ovnfs", []configEntry{{"checkout", name}})
+// checkout = name and one source = source, or no source when source is empty
+// (see editConfig).
+func markConfig(config, name, source string) string {
+	if source == "" {
+		return editConfig(config, "ovnfs", []configEntry{{"checkout", name}}, "source")
+	}
+	return editConfig(config, "ovnfs", []configEntry{{"checkout", name}, {"source", source}})
 }
 
 // rewriteConfig replaces gitdir's config file with edit's result, atomically and

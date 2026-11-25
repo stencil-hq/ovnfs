@@ -49,9 +49,14 @@ checkout starts with empty submodule directories; `git submodule update --init`
 inside it clones them into its private git directory.
 
 Each private gitdir records repo-local `ovnfs.checkout = NAME`, including
-forked checkouts with their own names. Existing checkouts gain this marker when
-the daemon next opens their registry. The marker is never written to the source
-repo.
+forked checkouts with their own names, and `ovnfs.source = FOLDER`, the folder
+of the capture the checkout sits on as `ovnfs ls` reports it (symlinks
+resolved), so a git hook finds that folder with `git config --get
+ovnfs.source`. A checkout on a remote capture has no local folder and no
+`ovnfs.source`. The git directories of submodules absorbed in the folder carry
+the same two keys; one that git clones inside the checkout has neither.
+Existing checkouts gain both on their root git directory when the daemon next
+opens their registry. Neither key is ever written to the source repo.
 
 ### Git remotes
 

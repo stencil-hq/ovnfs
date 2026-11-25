@@ -33,7 +33,7 @@ import (
 // A create on the warm capture takes a checkout prepared on it ahead of time (the
 // pool): upper, private git directory and overlay, below directories named by a
 // random key instead of a checkout name (checkoutMeta.Dir). Naming it writes only
-// the git directory's marker. The pool holds as many as the most creates of the
+// the git directory's marker and source. The pool holds as many as the most creates of the
 // folder seen running at once, at least poolMin, as far as their git directories
 // fit poolBudget. It is refilled in the background and goes with the warm capture,
 // or moves onto the next one while the repository's git state stays the same; that
@@ -503,7 +503,7 @@ func (r *Registry) namePrepared(h *checkoutRecord, name, config string) error {
 		}
 	}
 	if len(submodules(h.base.view)) == 0 {
-		return git.MarkNew(gitdir, config, name)
+		return git.MarkNew(gitdir, config, name, h.base.view.Meta().Dir)
 	}
 	return markGitdirs(gitdir, name, h.base.view)
 }

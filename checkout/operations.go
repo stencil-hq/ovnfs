@@ -776,13 +776,15 @@ func (r *Registry) makeGitdirs(gitdir, baseID string, gs gitSource) error {
 }
 
 // markGitdirs marks a checkout's private git directory and those of its absorbed
-// submodules that it still has as belonging to checkout name (git.MarkCheckout).
+// submodules that it still has as belonging to checkout name, opened on view's
+// folder (git.MarkCheckout).
 func markGitdirs(gitdir, name string, view *base.Base) error {
-	if err := git.MarkCheckout(gitdir, name); err != nil {
+	source := view.Meta().Dir
+	if err := git.MarkCheckout(gitdir, name, source); err != nil {
 		return err
 	}
 	for _, sub := range submodules(view) {
-		err := git.MarkCheckout(filepath.Join(gitdir, filepath.FromSlash(sub.Module)), name)
+		err := git.MarkCheckout(filepath.Join(gitdir, filepath.FromSlash(sub.Module)), name, source)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

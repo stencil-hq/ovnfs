@@ -447,6 +447,9 @@ func TestNewCheckoutRevisionOwnsParentCommit(t *testing.T) {
 	if c := child.Checkout; c.Source != parent.Source || c.Parent != "" || c.Base == parent.Base || child.Capture == nil || child.Capture.Root != parent.Source {
 		t.Fatalf("nested revision = %+v, want an independent capture of %s", child, parent.Source)
 	}
+	if got := gitRun(t, dir, "--git-dir", f.gitdir("child"), "config", "ovnfs.source"); got != parent.Source {
+		t.Fatalf("nested revision source = %q, want %q", got, parent.Source)
+	}
 	if got := gitRun(t, dir, "rev-parse", "HEAD"); got != host {
 		t.Fatalf("host HEAD = %q, want %s", got, host)
 	}
@@ -542,7 +545,7 @@ func TestCheckoutMarkersAndMigration(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
 	dir := revisionRepo(t)
-	f.newCheckout(dir, "parent")
+	source := f.newCheckout(dir, "parent").Checkout.Source
 	fork, err := f.reg.Fork(ctx, api.ForkArgs{Checkout: "parent", Name: "child"})
 	if err != nil {
 		t.Fatal(err)
@@ -554,18 +557,26 @@ func TestCheckoutMarkersAndMigration(t *testing.T) {
 		if got := gitRun(t, dir, "--git-dir", f.gitdir(name), "config", "--local", "--get", "ovnfs.checkout"); got != name {
 			t.Fatalf("%s marker = %q", name, got)
 		}
+		if got := gitRun(t, dir, "--git-dir", f.gitdir(name), "config", "--local", "--get", "ovnfs.source"); got != source {
+			t.Fatalf("%s source = %q, want %q", name, got, source)
+		}
 	}
 	config, err := os.ReadFile(filepath.Join(dir, ".git", "config"))
 	if err != nil || strings.Contains(string(config), "[ovnfs]") {
 		t.Fatalf("source config changed: %s, %v", config, err)
 	}
-	gitRun(t, dir, "--git-dir", f.gitdir("parent"), "config", "--local", "--unset", "ovnfs.checkout")
+	gitdir := f.gitdir("parent")
+	gitRun(t, dir, "--git-dir", gitdir, "config", "--local", "--unset", "ovnfs.checkout")
+	gitRun(t, dir, "--git-dir", gitdir, "config", "--local", "--unset", "ovnfs.source")
 	if err := f.reg.Close(); err != nil {
 		t.Fatal(err)
 	}
 	f.open()
-	if got := gitRun(t, dir, "--git-dir", f.gitdir("parent"), "config", "--local", "--get", "ovnfs.checkout"); got != "parent" {
+	if got := gitRun(t, dir, "--git-dir", gitdir, "config", "--local", "--get", "ovnfs.checkout"); got != "parent" {
 		t.Fatalf("reopened checkout marker = %q", got)
+	}
+	if got := gitRun(t, dir, "--git-dir", gitdir, "config", "--local", "--get", "ovnfs.source"); got != source {
+		t.Fatalf("reopened checkout source = %q, want %q", got, source)
 	}
 }
 

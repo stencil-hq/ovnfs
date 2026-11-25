@@ -213,7 +213,8 @@ Omit `--type` to find both directories and gitfiles.
   human tables, which pad and colour by terminal width.
 - To tell whether you are in a checkout, run `git config --get ovnfs.checkout`
   inside it (it prints the name; the folder's repository never gets this key),
-  or check `$OVNFS_CHECKOUT` under `ovnfs run`.
+  or check `$OVNFS_CHECKOUT` under `ovnfs run`. `git config --get ovnfs.source`
+  prints the SOURCE folder `ovnfs ls` shows for it (none for a remote capture).
 - In a folder other agents share (the user's main checkout), don't run git
   commands that discard work or move HEAD: `stash`, `reset --hard`,
   `switch`/`checkout BRANCH`, or `restore`/`checkout -- PATHS`. Do that in a
