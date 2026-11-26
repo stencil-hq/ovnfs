@@ -15,6 +15,7 @@ import (
 // Server is an active FUSE mount of the export root.
 type Server struct {
 	srv        *gofuse.Server
+	fs         *exportFS
 	mountpoint string
 	abort      *os.File // this connection's fusectl abort file; nil without fusectl
 }
@@ -41,7 +42,8 @@ func Mount(e *export.Export, mountpoint string, opts Options) (*Server, error) {
 	if !opts.Atime {
 		options = append(options, "noatime")
 	}
-	srv, err := gofuse.NewServer(newExportFS(e.Nodes()), mountpoint, &gofuse.MountOptions{
+	fs := newExportFS(e.Nodes())
+	srv, err := gofuse.NewServer(fs, mountpoint, &gofuse.MountOptions{
 		AllowOther: opts.AllowOther,
 		FsName:     fsName,
 		Name:       "ovnfs",
@@ -67,7 +69,7 @@ func Mount(e *export.Export, mountpoint string, opts Options) (*Server, error) {
 	if err := unix.Statx(unix.AT_FDCWD, mountpoint, unix.AT_STATX_DONT_SYNC, 0, &stx); err == nil {
 		abort, _ = os.OpenFile(fmt.Sprintf("/sys/fs/fuse/connections/%d/abort", stx.Dev_major<<20|stx.Dev_minor), os.O_WRONLY, 0)
 	}
-	return &Server{srv: srv, mountpoint: mountpoint, abort: abort}, nil
+	return &Server{srv: srv, fs: fs, mountpoint: mountpoint, abort: abort}, nil
 }
 
 // detachDead lazily unmounts mountpoint when it is a FUSE mount whose server
@@ -129,7 +131,9 @@ func (s *Server) Unmount(force bool) error {
 // changed behind the mount, and of the roots of trees; see
 // [checkout.Config.Invalidate]. The caller must hold no lock a FUSE request
 // takes.
-func (s *Server) Invalidate(checkout string, paths, trees []string) {}
+func (s *Server) Invalidate(checkout string, paths, trees []string) {
+	s.fs.invalidate(checkout, paths, trees)
+}
 
 // Wait blocks until the mount is gone, by Unmount or an external umount.
 func (s *Server) Wait() { s.srv.Wait() }

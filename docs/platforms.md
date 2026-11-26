@@ -183,16 +183,19 @@ libraries on a local filesystem; writes there are not checkout-isolated.
 
 ## FUSE
 
-`serve --proto fuse` (the Linux default) mounts through `fusermount3`, with the
-export's file ids as inode numbers and one-second entry and attribute
+`serve --proto fuse` (the Linux default) mounts through `fusermount3`, with
+the export's file ids as inode numbers and one-second entry and attribute
 timeouts. A directory's names are fixed when it is opened, so offsets stay
 stable, but READDIRPLUS stats each entry as it answers: the kernel keeps the
 attributes it gets for the attribute timeout, so attributes from the time of
-opening would hide a file written meanwhile. A mount left behind by a daemon
-that died without unmounting (`kill -9`, the OOM killer) is detached when the
-next one starts. The `stop` that forces a busy mount aborts its connection
-through fusectl (`/sys/fs/fuse/connections`) and then detaches it, so
-processes still inside get `ENOTCONN` (`EIO` on reads of uncached data)
+opening would hide a file written meanwhile. What the daemon itself changes in
+a checkout behind the mount, as a pull does, is dropped from the kernel's
+caches before its call returns, so it reads back at once rather than within
+the timeouts; a reattach drops only the checkout root's. A mount left behind
+by a daemon that died without unmounting (`kill -9`, the OOM killer) is
+detached when the next one starts. The `stop` that forces a busy mount aborts
+its connection through fusectl (`/sys/fs/fuse/connections`) and then detaches
+it, so processes still inside get `ENOTCONN` (`EIO` on reads of uncached data)
 instead of keeping the daemon running. Where fusectl was not mounted when the
 daemon mounted (some unprivileged containers), the forced `stop` cannot abort
 and fails while the mount stays busy, like the first.
