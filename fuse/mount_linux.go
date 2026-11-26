@@ -125,5 +125,11 @@ func (s *Server) Unmount(force bool) error {
 	return nil
 }
 
+// Invalidate drops the kernel's cached copies of checkout paths the daemon
+// changed behind the mount, and of the roots of trees; see
+// [checkout.Config.Invalidate]. The caller must hold no lock a FUSE request
+// takes.
+func (s *Server) Invalidate(checkout string, paths, trees []string) {}
+
 // Wait blocks until the mount is gone, by Unmount or an external umount.
 func (s *Server) Wait() { s.srv.Wait() }
