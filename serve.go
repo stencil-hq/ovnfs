@@ -231,6 +231,7 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 	// The system client's connections, from listenAndMount on; nil for in-process mounts.
 	var files atomic.Pointer[fileListener]
 	var smbServer atomic.Pointer[smb.Server]
+	var fuseServer atomic.Pointer[ovnfuse.Server] // the in-process FUSE mount; nil otherwise
 	var checkoutShares *shares
 	userHome, _ := os.UserHomeDir()
 	lk := newLinks(hub.emit)
@@ -268,6 +269,9 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 			}
 			if l, rt := files.Load(), router.Load(); l != nil && rt != nil && proto == "nfs" {
 				l.serving(func() { refreshPaths(mount, name, paths, trees, rt.Lstat) })
+			}
+			if s := fuseServer.Load(); s != nil {
+				s.Invalidate(name, paths, trees)
 			}
 		},
 		Changed: func(name string, added bool) {
@@ -311,6 +315,9 @@ func (cmd *serveCmd) Run(c *cli) (err error) {
 			return mountErr
 		}
 		release = srv.Unmount
+		if s, ok := srv.(*ovnfuse.Server); ok {
+			fuseServer.Store(s)
+		}
 		go func() { srv.Wait(); served <- fmt.Errorf("%s mount at %s ended", proto, mount) }()
 		if err = reg.SetListen(proto, 0); err != nil {
 			_ = release(true)

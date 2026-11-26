@@ -82,6 +82,46 @@ func newExportFS(nodes *export.Nodes) *exportFS {
 // Init keeps the server for kernel cache invalidations.
 func (x *exportFS) Init(s *gofuse.Server) { x.kernel = s }
 
+// invalidate drops what the kernel caches of the paths of checkout the daemon
+// changed behind the mount (checkout.Config.Invalidate: pull, reattach), so a
+// caller sees them as soon as the daemon's call returns rather than within
+// TTL: until then the kernel answers stat from attributes it cached and cuts
+// reads off at the size they hold, though open drops the pages themselves.
+// Each changed file loses its attributes and pages; its name, which may now
+// be missing or another entry's, is dropped from its directory, whose
+// attributes go with it. A directory's name is kept: dropping it unhashes the
+// dentry, and a process inside it would find its working directory deleted.
+// Of a tree only the root's attributes and listing are dropped: the kernel's
+// other nodes in it are not known here, and keep theirs for up to TTL.
+//
+// It runs outside any FUSE request, as the notifications block until the
+// kernel has applied them. Errors are ignored: ENOENT means the kernel caches
+// nothing for the node.
+func (x *exportFS) invalidate(checkout string, paths, trees []string) {
+	if x.kernel == nil {
+		return
+	}
+	for _, t := range trees {
+		if id := x.nodes.ID(path.Join(checkout, t)); id != 0 {
+			x.kernel.InodeNotify(id, 0, 0)
+		}
+	}
+	for _, p := range paths {
+		full := path.Join(checkout, p)
+		if info, err := x.nodes.Lstat(full); err == nil {
+			if info.IsDir() {
+				continue
+			}
+			if id := x.nodes.IDOf(full, info); id != 0 {
+				x.kernel.InodeNotify(id, 0, 0)
+			}
+		}
+		if parent := x.nodes.ID(path.Dir(full)); parent != 0 {
+			x.kernel.EntryNotify(parent, path.Base(full))
+		}
+	}
+}
+
 // String names the filesystem in go-fuse debug output.
 func (x *exportFS) String() string { return "ovnfs" }
 
